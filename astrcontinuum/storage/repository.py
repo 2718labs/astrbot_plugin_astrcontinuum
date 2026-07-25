@@ -9,6 +9,8 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from astrcontinuum.domain import (
+    CompactionJobEnvelope,
+    CompactionJobState,
     ContextCapsuleEnvelope,
     EventEnvelope,
     EventRole,
@@ -23,6 +25,34 @@ from astrcontinuum.domain import (
 from .sqlite import SQLiteConnectionFactory
 
 FaultInjector = Callable[[str], None]
+
+_NONTERMINAL_JOB_STATES = (
+    CompactionJobState.PENDING,
+    CompactionJobState.LEASED,
+    CompactionJobState.COMPILING,
+    CompactionJobState.AUDITING,
+    CompactionJobState.READY_TO_COMMIT,
+    CompactionJobState.RETRY_WAIT,
+)
+_WORKING_JOB_STATES = frozenset(
+    {
+        CompactionJobState.LEASED,
+        CompactionJobState.COMPILING,
+        CompactionJobState.AUDITING,
+        CompactionJobState.READY_TO_COMMIT,
+    }
+)
+_ALLOWED_WORKER_TRANSITIONS = {
+    CompactionJobState.LEASED: frozenset({CompactionJobState.COMPILING}),
+    CompactionJobState.COMPILING: frozenset(
+        {
+            CompactionJobState.AUDITING,
+            CompactionJobState.READY_TO_COMMIT,
+        }
+    ),
+    CompactionJobState.AUDITING: frozenset({CompactionJobState.READY_TO_COMMIT}),
+    CompactionJobState.READY_TO_COMMIT: frozenset(),
+}
 
 
 class RepositoryError(RuntimeError):
@@ -47,6 +77,14 @@ class EventIdentityConflict(RepositoryConflict):
 
 class RepositoryInvariantError(RepositoryError):
     """Raised when durable rows cannot form a valid canonical view."""
+
+
+class JobTransitionError(RepositoryError):
+    """Raised when a requested Job transition is not in the frozen state machine."""
+
+
+class StaleLeaseError(RepositoryError):
+    """Raised when a worker mutation does not own a live matching fence."""
 
 
 @dataclass(frozen=True, slots=True)
@@ -189,6 +227,327 @@ class SQLiteRepository:
             else:
                 connection.commit()
                 return view
+
+    def raise_compaction_intent(
+        self,
+        *,
+        job_id: str,
+        session_key: SessionKey,
+        target_high_water_mark: int,
+        now: datetime,
+    ) -> CompactionJobEnvelope | None:
+        """Run ``TX_RAISE_COMPACTION_INTENT``."""
+
+        if not job_id.strip():
+            raise ValueError("job_id must be non-empty")
+        if target_high_water_mark < 1:
+            raise ValueError("target_high_water_mark must be positive")
+        now_text = _normalize_datetime(now)
+
+        with self._factory.transaction(immediate=True) as connection:
+            session_row = connection.execute(
+                """
+                SELECT canonical_session_key_json, next_event_sequence
+                FROM sessions
+                WHERE session_key_hash = ?
+                """,
+                (session_key.session_key_hash,),
+            ).fetchone()
+            if session_row is None:
+                raise RepositoryInvariantError(
+                    "compaction intent requires a durable session with Journal events"
+                )
+            if session_row["canonical_session_key_json"] != session_key.canonical_json():
+                raise SessionIdentityConflict(
+                    "session hash does not resolve to the exact canonical SessionKey"
+                )
+            high_water_mark = int(session_row["next_event_sequence"]) - 1
+            if target_high_water_mark > high_water_mark:
+                raise RepositoryInvariantError(
+                    "compaction intent exceeds the durable Journal high-water mark"
+                )
+
+            base_snapshot_id, base_pointer_version, base_coverage = self._active_base(
+                connection,
+                session_key.session_key_hash,
+            )
+            if target_high_water_mark <= base_coverage:
+                return None
+
+            existing = connection.execute(
+                """
+                SELECT job_id, intent_target_high_water_mark
+                FROM compaction_jobs
+                WHERE session_key_hash = ?
+                  AND state IN (
+                      'PENDING',
+                      'LEASED',
+                      'COMPILING',
+                      'AUDITING',
+                      'READY_TO_COMMIT',
+                      'RETRY_WAIT'
+                  )
+                """,
+                (session_key.session_key_hash,),
+            ).fetchone()
+            if existing is not None:
+                if target_high_water_mark > int(existing["intent_target_high_water_mark"]):
+                    connection.execute(
+                        """
+                        UPDATE compaction_jobs
+                        SET intent_target_high_water_mark = ?,
+                            updated_at = ?
+                        WHERE job_id = ?
+                        """,
+                        (target_high_water_mark, now_text, existing["job_id"]),
+                    )
+                    self._inject("intent.after_fold")
+                return self._job_by_id(connection, str(existing["job_id"]))
+
+            try:
+                connection.execute(
+                    """
+                    INSERT INTO compaction_jobs (
+                        job_id,
+                        session_key_hash,
+                        state,
+                        target_high_water_mark,
+                        intent_target_high_water_mark,
+                        base_snapshot_id,
+                        base_pointer_version,
+                        candidate_snapshot_id,
+                        lease_owner,
+                        lease_epoch,
+                        lease_expires_at,
+                        attempt_count,
+                        next_retry_at,
+                        error_stage,
+                        error_code,
+                        error_message,
+                        created_at,
+                        updated_at,
+                        committed_at
+                    ) VALUES (
+                        ?, ?, 'PENDING', ?, ?, ?, ?, NULL, NULL, 0, NULL, 0,
+                        NULL, NULL, NULL, NULL, ?, ?, NULL
+                    )
+                    """,
+                    (
+                        job_id,
+                        session_key.session_key_hash,
+                        target_high_water_mark,
+                        target_high_water_mark,
+                        base_snapshot_id,
+                        base_pointer_version,
+                        now_text,
+                        now_text,
+                    ),
+                )
+            except sqlite3.IntegrityError as error:
+                raise RepositoryConflict(
+                    "compaction Job identity conflicts with durable state"
+                ) from error
+            self._inject("intent.after_insert")
+            return self._job_by_id(connection, job_id)
+
+    def claim_job(
+        self,
+        *,
+        worker_id: str,
+        now: datetime,
+        lease_expires_at: datetime,
+    ) -> CompactionJobEnvelope | None:
+        """Run ``TX_CLAIM_JOB`` and return the single eligible winner."""
+
+        if not worker_id.strip():
+            raise ValueError("worker_id must be non-empty")
+        now_text = _normalize_datetime(now)
+        lease_text = _normalize_datetime(lease_expires_at)
+        if lease_text <= now_text:
+            raise ValueError("lease_expires_at must be later than now")
+
+        with self._factory.transaction(immediate=True) as connection:
+            while True:
+                row = connection.execute(
+                    """
+                    SELECT *
+                    FROM compaction_jobs
+                    WHERE state = 'PENDING'
+                       OR (state = 'RETRY_WAIT' AND next_retry_at <= ?)
+                    ORDER BY created_at, job_id
+                    LIMIT 1
+                    """,
+                    (now_text,),
+                ).fetchone()
+                if row is None:
+                    return None
+
+                base_snapshot_id, base_pointer_version, base_coverage = self._active_base(
+                    connection, row["session_key_hash"]
+                )
+                target = int(row["intent_target_high_water_mark"])
+                if target <= base_coverage:
+                    connection.execute(
+                        """
+                        UPDATE compaction_jobs
+                        SET state = 'CANCELLED',
+                            next_retry_at = NULL,
+                            updated_at = ?
+                        WHERE job_id = ?
+                        """,
+                        (now_text, row["job_id"]),
+                    )
+                    continue
+
+                cursor = connection.execute(
+                    """
+                    UPDATE compaction_jobs
+                    SET state = 'LEASED',
+                        target_high_water_mark = intent_target_high_water_mark,
+                        base_snapshot_id = ?,
+                        base_pointer_version = ?,
+                        candidate_snapshot_id = NULL,
+                        lease_owner = ?,
+                        lease_epoch = lease_epoch + 1,
+                        lease_expires_at = ?,
+                        attempt_count = attempt_count + 1,
+                        next_retry_at = NULL,
+                        error_stage = NULL,
+                        error_code = NULL,
+                        error_message = NULL,
+                        updated_at = ?,
+                        committed_at = NULL
+                    WHERE job_id = ?
+                      AND (
+                          state = 'PENDING'
+                          OR (state = 'RETRY_WAIT' AND next_retry_at <= ?)
+                      )
+                    """,
+                    (
+                        base_snapshot_id,
+                        base_pointer_version,
+                        worker_id,
+                        lease_text,
+                        now_text,
+                        row["job_id"],
+                        now_text,
+                    ),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                self._inject("claim.after_update")
+                return self._job_by_id(connection, str(row["job_id"]))
+
+    def transition_job(
+        self,
+        *,
+        job_id: str,
+        owner: str,
+        lease_epoch: int,
+        to_state: CompactionJobState,
+        now: datetime,
+        candidate_snapshot_id: str | None = None,
+    ) -> CompactionJobEnvelope:
+        """Apply one repository-private fenced worker transition."""
+
+        now_text = _normalize_datetime(now)
+        with self._factory.transaction(immediate=True) as connection:
+            row = self._require_live_fence(
+                connection,
+                job_id=job_id,
+                owner=owner,
+                lease_epoch=lease_epoch,
+                now=now_text,
+            )
+            current_state = CompactionJobState(row["state"])
+            if to_state not in _ALLOWED_WORKER_TRANSITIONS[current_state]:
+                raise JobTransitionError(
+                    f"transition {current_state.value} -> {to_state.value} is not allowed"
+                )
+            if to_state == CompactionJobState.READY_TO_COMMIT:
+                if candidate_snapshot_id is None or not candidate_snapshot_id.strip():
+                    raise JobTransitionError(
+                        "READY_TO_COMMIT requires a non-empty candidate_snapshot_id"
+                    )
+            elif candidate_snapshot_id is not None:
+                raise JobTransitionError(
+                    "candidate_snapshot_id is allowed only for READY_TO_COMMIT"
+                )
+
+            cursor = connection.execute(
+                """
+                UPDATE compaction_jobs
+                SET state = ?,
+                    candidate_snapshot_id = ?,
+                    updated_at = ?
+                WHERE job_id = ?
+                  AND lease_owner = ?
+                  AND lease_epoch = ?
+                  AND lease_expires_at > ?
+                """,
+                (
+                    to_state.value,
+                    candidate_snapshot_id,
+                    now_text,
+                    job_id,
+                    owner,
+                    lease_epoch,
+                    now_text,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StaleLeaseError("worker transition lost its lease fence")
+            self._inject("transition.after_update")
+            return self._job_by_id(connection, job_id)
+
+    def renew_job_lease(
+        self,
+        *,
+        job_id: str,
+        owner: str,
+        lease_epoch: int,
+        now: datetime,
+        lease_expires_at: datetime,
+    ) -> CompactionJobEnvelope:
+        """Renew one live worker lease without changing its fencing epoch."""
+
+        now_text = _normalize_datetime(now)
+        lease_text = _normalize_datetime(lease_expires_at)
+        if lease_text <= now_text:
+            raise ValueError("lease_expires_at must be later than now")
+        with self._factory.transaction(immediate=True) as connection:
+            row = self._require_live_fence(
+                connection,
+                job_id=job_id,
+                owner=owner,
+                lease_epoch=lease_epoch,
+                now=now_text,
+            )
+            if lease_text <= str(row["lease_expires_at"]):
+                raise JobTransitionError("lease renewal must strictly extend the lease")
+            cursor = connection.execute(
+                """
+                UPDATE compaction_jobs
+                SET lease_expires_at = ?,
+                    updated_at = ?
+                WHERE job_id = ?
+                  AND lease_owner = ?
+                  AND lease_epoch = ?
+                  AND lease_expires_at > ?
+                """,
+                (
+                    lease_text,
+                    now_text,
+                    job_id,
+                    owner,
+                    lease_epoch,
+                    now_text,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StaleLeaseError("lease renewal lost its fencing predicate")
+            self._inject("lease.after_renew")
+            return self._job_by_id(connection, job_id)
 
     def _read_request_view(
         self,
@@ -469,6 +828,133 @@ class SQLiteRepository:
             raise SessionIdentityConflict(
                 "session hash does not resolve to the exact canonical SessionKey"
             )
+
+    @staticmethod
+    def _active_base(
+        connection: sqlite3.Connection,
+        session_key_hash: str,
+    ) -> tuple[str | None, int, int]:
+        row = connection.execute(
+            """
+            SELECT
+                active.snapshot_id,
+                active.pointer_version,
+                snapshot.covered_event_end,
+                snapshot.session_key_hash AS snapshot_session_key_hash
+            FROM active_snapshots AS active
+            JOIN snapshots AS snapshot
+              ON snapshot.snapshot_id = active.snapshot_id
+            WHERE active.session_key_hash = ?
+            """,
+            (session_key_hash,),
+        ).fetchone()
+        if row is None:
+            return None, 0, 0
+        if row["snapshot_session_key_hash"] != session_key_hash:
+            raise RepositoryInvariantError(
+                "active pointer resolves to a Snapshot from another session"
+            )
+        return (
+            str(row["snapshot_id"]),
+            int(row["pointer_version"]),
+            int(row["covered_event_end"]),
+        )
+
+    @staticmethod
+    def _job_by_id(
+        connection: sqlite3.Connection,
+        job_id: str,
+    ) -> CompactionJobEnvelope:
+        row = connection.execute(
+            """
+            SELECT
+                job.*,
+                session.canonical_session_key_json
+            FROM compaction_jobs AS job
+            JOIN sessions AS session
+              ON session.session_key_hash = job.session_key_hash
+            WHERE job.job_id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        if row is None:
+            raise RepositoryInvariantError("durable compaction Job is missing")
+        return SQLiteRepository._job_from_row(row)
+
+    @staticmethod
+    def _job_from_row(row: sqlite3.Row) -> CompactionJobEnvelope:
+        try:
+            session_key = SessionKey.model_validate_json(row["canonical_session_key_json"])
+            job = CompactionJobEnvelope(
+                job_id=row["job_id"],
+                session_key=session_key,
+                state=CompactionJobState(row["state"]),
+                target_high_water_mark=row["target_high_water_mark"],
+                intent_target_high_water_mark=row["intent_target_high_water_mark"],
+                base_snapshot_id=row["base_snapshot_id"],
+                base_pointer_version=row["base_pointer_version"],
+                candidate_snapshot_id=row["candidate_snapshot_id"],
+                attempt_count=row["attempt_count"],
+                lease_owner=row["lease_owner"],
+                lease_epoch=row["lease_epoch"],
+                lease_expires_at=(
+                    _parse_datetime(row["lease_expires_at"])
+                    if row["lease_expires_at"] is not None
+                    else None
+                ),
+                next_retry_at=(
+                    _parse_datetime(row["next_retry_at"])
+                    if row["next_retry_at"] is not None
+                    else None
+                ),
+                error_stage=row["error_stage"],
+                error_code=row["error_code"],
+                error_message=row["error_message"],
+                created_at=_parse_datetime(row["created_at"]),
+                updated_at=_parse_datetime(row["updated_at"]),
+                committed_at=(
+                    _parse_datetime(row["committed_at"])
+                    if row["committed_at"] is not None
+                    else None
+                ),
+            )
+        except (TypeError, ValueError) as error:
+            raise RepositoryInvariantError(
+                "compaction Job row does not form a canonical envelope"
+            ) from error
+        if row["session_key_hash"] != session_key.session_key_hash:
+            raise RepositoryInvariantError(
+                "compaction Job physical session identity does not round-trip"
+            )
+        return job
+
+    @staticmethod
+    def _require_live_fence(
+        connection: sqlite3.Connection,
+        *,
+        job_id: str,
+        owner: str,
+        lease_epoch: int,
+        now: str,
+    ) -> sqlite3.Row:
+        row = connection.execute(
+            """
+            SELECT *
+            FROM compaction_jobs
+            WHERE job_id = ?
+            """,
+            (job_id,),
+        ).fetchone()
+        if (
+            row is None
+            or CompactionJobState(row["state"]) not in _WORKING_JOB_STATES
+            or row["lease_owner"] != owner
+            or int(row["lease_epoch"]) != lease_epoch
+            or row["lease_expires_at"] is None
+            or str(row["lease_expires_at"]) <= now
+        ):
+            raise StaleLeaseError("worker does not own a matching unexpired lease")
+        return row
 
     @staticmethod
     def _find_idempotent_event(

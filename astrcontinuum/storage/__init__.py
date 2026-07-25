@@ -12,6 +12,7 @@ from .migrations import (
 from .repository import (
     EventIdentityConflict,
     IdempotencyConflict,
+    JobTransitionError,
     RepositoryConflict,
     RepositoryError,
     RepositoryInvariantError,
@@ -19,6 +20,7 @@ from .repository import (
     SessionIdentityConflict,
     SnapshotCapsuleMembership,
     SQLiteRepository,
+    StaleLeaseError,
 )
 from .sqlite import (
     DATABASE_FILENAME,
@@ -34,6 +36,7 @@ __all__ = [
     "MIGRATIONS",
     "EventIdentityConflict",
     "IdempotencyConflict",
+    "JobTransitionError",
     "Migration",
     "MigrationApplyError",
     "MigrationChecksumError",
@@ -48,4 +51,5 @@ __all__ = [
     "SQLiteRepository",
     "SessionIdentityConflict",
     "SnapshotCapsuleMembership",
+    "StaleLeaseError",
 ]

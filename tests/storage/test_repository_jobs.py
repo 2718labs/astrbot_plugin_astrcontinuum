@@ -100,9 +100,7 @@ def test_concurrent_intents_converge_on_one_job_and_maximum_target(
     barrier = Barrier(len(targets))
 
     def trigger(target: int) -> ac.CompactionJobEnvelope | None:
-        store = ac.SQLiteRepository(
-            ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000)
-        )
+        store = ac.SQLiteRepository(ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000))
         barrier.wait()
         return raise_intent(
             store,
@@ -134,9 +132,7 @@ def test_claim_freezes_intent_and_only_one_connection_wins(tmp_path: Path) -> No
     barrier = Barrier(count)
 
     def claim(index: int) -> ac.CompactionJobEnvelope | None:
-        store = ac.SQLiteRepository(
-            ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000)
-        )
+        store = ac.SQLiteRepository(ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000))
         barrier.wait()
         return store.claim_job(
             worker_id=f"worker-{index}",

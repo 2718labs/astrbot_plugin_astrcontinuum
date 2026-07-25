@@ -41,6 +41,7 @@ from .storage import (
     MIGRATIONS,
     EventIdentityConflict,
     IdempotencyConflict,
+    JobTransitionError,
     Migration,
     MigrationApplyError,
     MigrationChecksumError,
@@ -55,6 +56,7 @@ from .storage import (
     SQLiteConnectionFactory,
     SQLiteMigrator,
     SQLiteRepository,
+    StaleLeaseError,
 )
 
 __all__ = [
@@ -83,6 +85,7 @@ __all__ = [
     "EventType",
     "ExactAnchor",
     "IdempotencyConflict",
+    "JobTransitionError",
     "Migration",
     "MigrationApplyError",
     "MigrationChecksumError",
@@ -107,5 +110,6 @@ __all__ = [
     "SnapshotEnvelope",
     "SnapshotState",
     "SourceHook",
+    "StaleLeaseError",
     "validate_permanent",
 ]
