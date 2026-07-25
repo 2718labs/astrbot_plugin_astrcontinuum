@@ -37,9 +37,19 @@ from .models import (
     ExactAnchor,
     Snapshot,
 )
-from .storage import SQLiteConnectionFactory
+from .storage import (
+    MIGRATIONS,
+    Migration,
+    MigrationApplyError,
+    MigrationChecksumError,
+    MigrationError,
+    MigrationPlanError,
+    SQLiteConnectionFactory,
+    SQLiteMigrator,
+)
 
 __all__ = [
+    "MIGRATIONS",
     "AnchorStatus",
     "AnchorType",
     "AssemblyTrace",
@@ -62,9 +72,15 @@ __all__ = [
     "EventRole",
     "EventType",
     "ExactAnchor",
+    "Migration",
+    "MigrationApplyError",
+    "MigrationChecksumError",
+    "MigrationError",
+    "MigrationPlanError",
     "PermanentFailureCode",
     "PermanentValidationReport",
     "SQLiteConnectionFactory",
+    "SQLiteMigrator",
     "SemanticAuditStatus",
     "SemanticStatus",
     "SessionKey",

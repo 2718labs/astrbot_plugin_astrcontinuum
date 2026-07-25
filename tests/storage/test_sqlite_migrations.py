@@ -3,7 +3,9 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+from collections.abc import Iterator
 from concurrent.futures import ThreadPoolExecutor
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Any
 
@@ -25,6 +27,38 @@ SESSION_KEY_JSON = json.dumps(
     },
     separators=(",", ":"),
 )
+
+
+def _canonical_capsule_json() -> str:
+    return ac.ContextCapsuleEnvelope(
+        capsule_id="capsule-1",
+        schema_version="1.0.0",
+        level=ac.CapsuleLevel.MICRO,
+        session_key=ac.SessionKey(**json.loads(SESSION_KEY_JSON)),
+        covered_event_start=1,
+        covered_event_end=1,
+        source_event_ids=("event-1",),
+        goals=(),
+        constraints=(),
+        decisions=(),
+        progress=(),
+        open_loops=(),
+        preferences=(),
+        entities=(),
+        emotional_context=(),
+        exact_anchors=(),
+        dependencies=(),
+        narrative_summary="context",
+        token_cost=4,
+        quality=ac.CapsuleQuality(
+            mechanical_passed=True,
+            source_coverage=1.0,
+            anchor_recall=1.0,
+            unsupported_critical_claims=0,
+            coverage_gap=0,
+        ),
+        created_at=NOW,
+    ).model_dump_json()
 
 
 def _migration_api() -> tuple[Any, Any, Any, Any]:
@@ -140,7 +174,17 @@ def _insert_capsule_snapshot_membership(connection: sqlite3.Connection) -> None:
             created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
-        ("capsule-1", SESSION_HASH, "micro", 1, 1, "{}", 4, 1.0, NOW),
+        (
+            "capsule-1",
+            SESSION_HASH,
+            "micro",
+            1,
+            1,
+            _canonical_capsule_json(),
+            4,
+            1.0,
+            NOW,
+        ),
     )
     connection.execute(
         """
@@ -298,6 +342,29 @@ def test_initial_migration_creates_complete_versioned_schema(tmp_path: Path) -> 
     assert ledger["checksum"] == migrations[0].checksum
     assert migrations[0].checksum == hashlib.sha256(migrations[0].sql.encode("utf-8")).hexdigest()
     assert user_version == 1
+
+
+def test_text_primary_identity_columns_are_explicitly_not_null(tmp_path: Path) -> None:
+    factory = _migrated_factory(tmp_path)
+    identity_columns = {
+        "active_snapshots": "session_key_hash",
+        "capsules": "capsule_id",
+        "compaction_jobs": "job_id",
+        "journal_events": "event_id",
+        "sessions": "session_key_hash",
+        "snapshots": "snapshot_id",
+    }
+
+    with factory.connection(read_only=True) as connection:
+        nullable_primary_keys = []
+        for table, column in identity_columns.items():
+            columns = {
+                row["name"]: row for row in connection.execute(f"PRAGMA table_info({table})")
+            }
+            if columns[column]["notnull"] != 1:
+                nullable_primary_keys.append(f"{table}.{column}")
+
+    assert nullable_primary_keys == []
 
 
 def test_foreign_keys_identity_and_event_triples_are_enforced(tmp_path: Path) -> None:
@@ -483,6 +550,50 @@ def test_concurrent_initializers_converge_on_one_ledger_row(tmp_path: Path) -> N
     assert ledger_count == 1
 
 
+def test_migrator_retries_transient_busy_before_initialization(tmp_path: Path) -> None:
+    _, _, _, migrator_type = _migration_api()
+    real_factory = ac.SQLiteConnectionFactory(tmp_path)
+
+    class TransientBusyFactory:
+        attempts = 0
+
+        @contextmanager
+        def transaction(self, *, immediate: bool = False) -> Iterator[Any]:
+            self.attempts += 1
+            if self.attempts < 3:
+                raise sqlite3.OperationalError("database is locked")
+            with real_factory.transaction(immediate=immediate) as connection:
+                yield connection
+
+    transient_factory = TransientBusyFactory()
+
+    assert migrator_type(transient_factory).migrate() == 1
+    assert transient_factory.attempts == 3
+
+
+def test_missing_json_functions_raise_a_diagnostic_migration_error(tmp_path: Path) -> None:
+    _, _, _, migrator_type = _migration_api()
+    real_factory = ac.SQLiteConnectionFactory(tmp_path)
+
+    class MissingJsonConnection:
+        def __init__(self, connection: sqlite3.Connection) -> None:
+            self._connection = connection
+
+        def execute(self, sql: str, parameters: object = ()) -> Any:
+            if "json_valid('{}')" in sql and "json_array_length" in sql:
+                raise sqlite3.OperationalError("no such function: json_valid")
+            return self._connection.execute(sql, parameters)
+
+    class MissingJsonFactory:
+        @contextmanager
+        def transaction(self, *, immediate: bool = False) -> Iterator[Any]:
+            with real_factory.transaction(immediate=immediate) as connection:
+                yield MissingJsonConnection(connection)
+
+    with pytest.raises(ac.MigrationApplyError, match="JSON functions"):
+        migrator_type(MissingJsonFactory()).migrate()
+
+
 def test_applied_migration_checksum_drift_is_rejected(tmp_path: Path) -> None:
     migrations, migration_type, checksum_error, migrator_type = _migration_api()
     factory = _migrated_factory(tmp_path)
@@ -529,6 +640,41 @@ def test_failed_migration_rolls_back_its_ddl_and_ledger_entry(tmp_path: Path) ->
     assert versions == [1]
     assert rolled_back_table is None
     assert user_version == 1
+
+
+def test_sql_splitter_preserves_semicolons_and_trailing_comments(tmp_path: Path) -> None:
+    migrations, migration_type, _, migrator_type = _migration_api()
+    factory = _migrated_factory(tmp_path)
+    syntax_edges = migration_type(
+        version=2,
+        name="sql_syntax_edges",
+        sql="""
+        -- A line-comment semicolon must not split a statement;
+        CREATE TABLE "edge;table" ("value;column" TEXT NOT NULL);
+        /* A block-comment semicolon must not split a statement; */
+        INSERT INTO "edge;table" VALUES ('before;trigger');
+        CREATE TABLE trigger_audit (value TEXT NOT NULL);
+        CREATE TRIGGER edge_table_audit
+        AFTER INSERT ON "edge;table"
+        BEGIN
+            INSERT INTO trigger_audit VALUES (NEW."value;column" || ';trigger');
+        END;
+        INSERT INTO "edge;table" VALUES ('after;trigger');
+        -- A trailing comment is not an incomplete SQL statement.
+        """,
+    )
+
+    assert migrator_type(factory, migrations=(*migrations, syntax_edges)).migrate() == 2
+
+    with factory.connection(read_only=True) as connection:
+        values = [
+            row[0]
+            for row in connection.execute('SELECT "value;column" FROM "edge;table" ORDER BY rowid')
+        ]
+        audit_values = [row[0] for row in connection.execute("SELECT value FROM trigger_audit")]
+
+    assert values == ["before;trigger", "after;trigger"]
+    assert audit_values == ["after;trigger;trigger"]
 
 
 def test_migration_plan_must_be_contiguous_and_start_at_one(tmp_path: Path) -> None:
