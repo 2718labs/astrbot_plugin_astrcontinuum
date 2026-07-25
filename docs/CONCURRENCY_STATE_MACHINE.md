@@ -16,8 +16,8 @@ SQLite transactions, uniqueness constraints, active-pointer CAS, and monotonical
 | `AUDITING` | audit accepts | `READY_TO_COMMIT` | persist preallocated candidate id |
 | working | retryable exception | `RETRY_WAIT` | `TX_FAIL_JOB` persists error/backoff and clears lease |
 | working | fatal/exhausted exception | `FAILED` | `TX_FAIL_JOB` persists error and clears lease |
-| `READY_TO_COMMIT` | fence and bootstrap-create/existing-update CAS succeed | `COMMITTED` | `TX_PUBLISH_SNAPSHOT` commits Snapshot, strictly advanced pointer, and job |
-| `READY_TO_COMMIT` | fence valid; same-prefix insert uniqueness or pointer CAS conflicts | `SUPERSEDED` | roll back only unpublished insert; retain candidate id; persist terminal conflict and any higher-intent follow-up |
+| `READY_TO_COMMIT` | fence and bootstrap-create/existing-update CAS succeed | `COMMITTED` | `TX_PUBLISH_SNAPSHOT` commits candidate Capsules, ordered membership, Snapshot, strictly advanced pointer, and job |
+| `READY_TO_COMMIT` | fence valid; same-prefix insert uniqueness or pointer CAS conflicts | `SUPERSEDED` | roll back every new candidate Capsule, membership, and Snapshot row; retain candidate id; persist terminal conflict and any higher-intent follow-up |
 | `PENDING`/`RETRY_WAIT` | administrative cancellation | `CANCELLED` | conditional terminal update |
 | expired working | recovery scan | `PENDING` | `TX_RECOVER_EXPIRED_LEASES` clears owner/expiry, keeps epoch; from `READY_TO_COMMIT` also clears candidate id |
 
@@ -37,9 +37,28 @@ An expired worker may continue computing in memory, but its next database mutati
 
 ## Concurrent Publication
 
-A worker records expected `base_snapshot_id` and `base_pointer_version`. `TX_PUBLISH_SNAPSHOT` verifies fencing and permanent target/coverage/audit conditions, including strict coverage advance, then opens an inner savepoint inside the outer publish transaction. For bootstrap null/`0`, CAS conditionally creates the absent pointer at version `1`. For an existing non-null base/version `>=1`, CAS conditionally updates the matching row and increments its version. Snapshot insert, pointer change, and job `COMMITTED` transition MUST commit as one success branch.
+A worker records expected `base_snapshot_id` and `base_pointer_version`.
+`TX_PUBLISH_SNAPSHOT` verifies fencing and permanent
+identity/source/coverage/audit conditions, including strict coverage advance, then opens
+an inner savepoint inside the outer publish transaction. New immutable `capsules`, the
+committed Snapshot, and ordered `snapshot_capsules` membership are inserted in the same
+savepoint before pointer CAS. Existing immutable base Capsules may be referenced but are
+not rewritten. For bootstrap null/`0`, CAS conditionally creates the absent pointer at
+version `1`. For an existing non-null base/version `>=1`, CAS conditionally updates the
+matching row and increments its version. Capsule insert, membership, Snapshot insert,
+pointer change, and job `COMMITTED` transition MUST commit as one success branch.
 
-If another worker wins the same coverage prefix, the loser may hit `UNIQUE(session_key_hash, covered_event_end)` during Snapshot insert before reaching pointer CAS; a bootstrap create or existing-pointer update may instead fail at CAS. All three are the same expected publish-conflict path, not an unhandled worker exception. The worker MUST roll back only to the inner savepoint so the unpublished Snapshot insert is removed, then retain `candidate_snapshot_id`, transition its job to `SUPERSEDED`, and clear the lease. Before committing the outer transaction it MUST read the winner; if durable intent exceeds winning coverage, it MUST create or retain `PENDING` follow-up work using the winning base/version. It MUST NOT retry the old candidate because it used a stale base.
+If another worker wins the same coverage prefix, the loser may hit
+`UNIQUE(session_key_hash, covered_event_end)` during Snapshot insert before reaching
+pointer CAS; a bootstrap create or existing-pointer update may instead fail at CAS. All
+three are the same expected publish-conflict path, not an unhandled worker exception.
+The worker MUST roll back to the inner savepoint so every new candidate Capsule,
+membership, and unpublished Snapshot row is removed, then retain
+`candidate_snapshot_id`, transition its fenced job to `SUPERSEDED`, and clear the lease.
+Before committing the outer transaction it MUST read the winner; if durable intent
+exceeds winning coverage, it MUST create or retain `PENDING` follow-up work using the
+winning base/version. It MUST NOT retry the old candidate because it used a stale base.
+A stale owner/epoch rejects the entire transition and MUST NOT persist `SUPERSEDED`.
 
 ## Event Concurrency
 
@@ -51,7 +70,11 @@ The only valid event/role/hook triples are `USER_MESSAGE/USER/ON_LLM_REQUEST`, `
 
 `TX_READ_REQUEST_VIEW` fixes the active pointer and Journal high-water `H` in one read transaction. Its normal view is the pointed committed Snapshot plus events `covered_event_end < sequence <= H`. Before the first publish it observes no active pointer and uses logical `EMPTY_BASE` with `C=0` plus events `1..H`; `EMPTY_BASE` is not a Snapshot row. A concurrent append above `H` waits for the next view; a concurrent publish is observed wholly before or wholly after, never as a mixed Snapshot/Delta boundary.
 
-Worker-local candidate data has wire `state=CANDIDATE` and is not inserted into the COMMITTED-only `snapshots` table. `TX_PUBLISH_SNAPSHOT` inserts `state=COMMITTED` only after mechanical validation, and readers resolve Snapshots only through `active_snapshots`. Partial or rolled-back candidates are invisible.
+Worker-local candidate data has wire `state=CANDIDATE` and is not reader-visible.
+`TX_PUBLISH_SNAPSHOT` inserts validated Capsules, ordered membership, and
+`state=COMMITTED` Snapshot rows only inside the publication savepoint. Readers resolve
+Snapshots only through `active_snapshots` and load Capsule ids through committed
+`snapshot_capsules`; partial or rolled-back candidates are invisible.
 
 ## Scheduler Isolation and Recovery
 

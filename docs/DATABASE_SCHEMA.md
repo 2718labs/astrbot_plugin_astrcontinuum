@@ -50,6 +50,65 @@ The database or repository validation MUST enforce exactly these triples:
 
 `ON_LLM_RESPONSE` MUST NOT be accepted as a `source_hook`. Required uniqueness constraints are `UNIQUE(session_key_hash, sequence)` and `UNIQUE(session_key_hash, source_hook, idempotency_key)`. Rows are append-only. Capture transactions MUST allocate `sessions.next_event_sequence` and insert atomically; an idempotency conflict returns the existing row without advancing sequence. Repository projection maps physical `session_key_hash` back to the required embedded wire `session_key`.
 
+## `capsules`
+
+The logical table contract is:
+
+```sql
+CREATE TABLE capsules (
+    capsule_id TEXT PRIMARY KEY,
+    session_key_hash TEXT NOT NULL,
+    level TEXT NOT NULL,
+    covered_event_start INTEGER NOT NULL CHECK (covered_event_start >= 1),
+    covered_event_end INTEGER NOT NULL CHECK (covered_event_end >= covered_event_start),
+    canonical_capsule_json TEXT NOT NULL,
+    token_cost INTEGER NOT NULL CHECK (token_cost >= 0),
+    source_coverage REAL NOT NULL CHECK (source_coverage BETWEEN 0 AND 1),
+    created_at TEXT NOT NULL,
+    FOREIGN KEY (session_key_hash) REFERENCES sessions(session_key_hash)
+);
+```
+
+`canonical_capsule_json` MUST validate against the closed v1 Capsule Schema before
+insertion and MUST round-trip the complete embedded SessionKey and every structured
+semantic record. `source_coverage` is a physical index projection of
+`quality.source_coverage`; it is not an extra wire field.
+
+Capsule rows are immutable. A permanent validator MUST reject a Capsule when any
+top-level or nested source event id is missing, belongs to another session, or lies
+outside the Capsule coverage. Sylanne memory content is not an admissible source event.
+
+## `snapshot_capsules`
+
+The ordered membership contract is:
+
+```sql
+CREATE TABLE snapshot_capsules (
+    snapshot_id TEXT NOT NULL,
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    capsule_id TEXT NOT NULL,
+    slot TEXT NOT NULL,
+    PRIMARY KEY (snapshot_id, ordinal),
+    UNIQUE (snapshot_id, capsule_id),
+    FOREIGN KEY (snapshot_id) REFERENCES snapshots(snapshot_id),
+    FOREIGN KEY (capsule_id) REFERENCES capsules(capsule_id)
+);
+```
+
+The normative relational constraints are:
+
+```text
+PRIMARY KEY (`snapshot_id`, `ordinal`)
+UNIQUE (`snapshot_id`, `capsule_id`)
+```
+
+Membership rows are immutable and authoritative for the Snapshot wire `capsule_ids`
+order. Before insertion, a permanent validator MUST prove that the Capsule and Snapshot
+have the same `session_key_hash`, every Capsule source event exists in that session, and
+the Snapshot exact-anchor membership is consistent with the ordered Capsule content.
+Cross-session membership and dangling Capsule, source-event, or anchor references MUST
+be rejected.
+
 ## `snapshots`
 
 Snapshot wire-to-SQLite mapping is normative:
@@ -57,7 +116,7 @@ Snapshot wire-to-SQLite mapping is normative:
 | Wire field | SQLite representation |
 | --- | --- |
 | `session_key` | Join `session_key_hash` to `sessions.canonical_session_key_json` and reconstruct the embedded object |
-| `capsule_ids` | `capsule_ids_json` canonical JSON array; at least one unique non-empty id |
+| `capsule_ids` | Join `snapshot_capsules` ordered by `ordinal`; at least one unique non-empty id |
 | `exact_anchor_ids` | `exact_anchor_ids_json` canonical JSON array of unique non-empty ids; empty is allowed |
 | `audit_outcome` | `audit_outcome` canonical JSON object |
 | `state` | `lifecycle_state`; the table admits only `COMMITTED` |
@@ -69,7 +128,6 @@ Snapshot wire-to-SQLite mapping is normative:
 | `base_snapshot_id` | TEXT NULL REFERENCES `snapshots(snapshot_id)` |
 | `covered_event_end` | INTEGER NOT NULL CHECK `>= 1` |
 | `source_high_water_mark` | INTEGER NOT NULL CHECK `>= covered_event_end` |
-| `capsule_ids_json` | TEXT NOT NULL, canonical JSON array |
 | `exact_anchor_ids_json` | TEXT NOT NULL, canonical JSON array |
 | `rendered_context` | TEXT NOT NULL, non-empty |
 | `token_cost` | INTEGER NOT NULL CHECK `>= 0` |
@@ -77,7 +135,7 @@ Snapshot wire-to-SQLite mapping is normative:
 | `lifecycle_state` | TEXT NOT NULL CHECK value is `COMMITTED` |
 | `created_at`, `committed_at` | TEXT NOT NULL, UTC RFC 3339 |
 
-The wire `state` enum is exactly `CANDIDATE` or `COMMITTED`. A `CANDIDATE` envelope MUST have `committed_at=null`; a `COMMITTED` envelope MUST have a non-null UTC RFC 3339 `committed_at`. Rows are immutable after insertion. Worker-local `CANDIDATE` envelopes are closed Schema objects but are not inserted in Phase 0; `candidate_snapshot_id` is preallocated on the job, and `TX_PUBLISH_SNAPSHOT` inserts the final row directly as `COMMITTED`. Every inserted row MUST have `audit_outcome.mechanical_passed=true`, `semantic_status` equal to `NOT_RUN` or `PASSED`, and empty `failure_codes`. For compaction output, the permanent validator MUST establish `source_high_water_mark = covered_event_end = compaction_jobs.target_high_water_mark`. `UNIQUE(session_key_hash, covered_event_end)` prevents two committed representations of one prefix; violation during publish MUST enter the same isolated `SUPERSEDED` path as pointer CAS conflict.
+The wire `state` enum is exactly `CANDIDATE` or `COMMITTED`. A `CANDIDATE` envelope MUST have `committed_at=null`; a `COMMITTED` envelope MUST have a non-null UTC RFC 3339 `committed_at`. Rows are immutable after insertion. Worker-local `CANDIDATE` envelopes are closed Schema objects but are not inserted in Phase 0; `candidate_snapshot_id` is preallocated on the job, and `TX_PUBLISH_SNAPSHOT` inserts the final row directly as `COMMITTED`. Ordered `snapshot_capsules` rows are the sole durable authority for wire `capsule_ids`; no denormalized id array may compete with them. Every inserted row MUST have `audit_outcome.mechanical_passed=true`, `semantic_status` equal to `NOT_RUN` or `PASSED`, and empty `failure_codes`. For compaction output, the permanent validator MUST establish `source_high_water_mark = covered_event_end = compaction_jobs.target_high_water_mark`. `UNIQUE(session_key_hash, covered_event_end)` prevents two committed representations of one prefix; violation during publish MUST enter the same isolated `SUPERSEDED` path as pointer CAS conflict.
 
 ## `active_snapshots`
 
@@ -134,7 +192,20 @@ The database MUST enforce at most one nonterminal intent chain per session, for 
 | `TX_RAISE_COMPACTION_INTENT` | Create/coalesce nonterminal work and monotonically raise intent target |
 | `TX_CLAIM_JOB` | Select eligible job, increment fencing epoch, freeze target, set lease, enter `LEASED` |
 | `TX_FAIL_JOB` | Fence by owner/epoch, persist redacted error, enter `RETRY_WAIT` or `FAILED`, clear lease |
-| `TX_PUBLISH_SNAPSHOT` | Fence and mechanically validate strict coverage advance; open savepoint; insert committed Snapshot; bootstrap CAS-create or existing-pointer CAS-update; on same-prefix uniqueness or pointer conflict roll back only insert and persist `SUPERSEDED`; in either branch preserve higher intent as follow-up against winning base |
+| `TX_PUBLISH_SNAPSHOT` | Fence and mechanically validate strict coverage advance; open one savepoint; insert new candidate Capsules, committed Snapshot, and ordered membership; bootstrap CAS-create or existing-pointer CAS-update; on same-prefix uniqueness or pointer conflict roll back every new candidate row and persist `SUPERSEDED`; in either branch preserve higher intent as follow-up against winning base |
 | `TX_RECOVER_EXPIRED_LEASES` | Requeue expired working jobs and clear owner/expiry; for expired `READY_TO_COMMIT` also clear candidate id so the next claim recompiles |
 
-If Snapshot insert violates `UNIQUE(session_key_hash, covered_event_end)`, bootstrap CAS-create conflicts, or existing-pointer CAS-update affects zero rows, `TX_PUBLISH_SNAPSHOT` MUST use the same isolated publish-conflict path. It MUST roll back to an inner savepoint (or use equivalent statement-level rollback) so only the unpublished Snapshot insert is removed. The outer transaction MUST retain `candidate_snapshot_id`, record the fenced job as `SUPERSEDED`, and clear its lease. Before commit it MUST read the winning active Snapshot and pointer version; when durable `intent_target_high_water_mark` exceeds winning coverage, it MUST leave or create `PENDING` follow-up work using that winning base. A stale fencing predicate MUST reject the entire attempted transition.
+`TX_PUBLISH_SNAPSHOT` MUST insert all newly compiled `capsules`, the committed Snapshot,
+and its ordered `snapshot_capsules` rows inside the same savepoint before active-pointer
+CAS. Existing immutable base Capsules may be referenced but are never rewritten.
+
+If Capsule or membership validation fails, Snapshot insert violates
+`UNIQUE(session_key_hash, covered_event_end)`, bootstrap CAS-create conflicts, or
+existing-pointer CAS-update affects zero rows, publication MUST use the isolated conflict
+path. It MUST roll back to the inner savepoint so every new candidate Capsule,
+membership, and Snapshot row is removed. The outer transaction MUST retain
+`candidate_snapshot_id`, record the fenced job as `SUPERSEDED`, and clear its lease.
+Before commit it MUST read the winning active Snapshot and pointer version; when durable
+`intent_target_high_water_mark` exceeds winning coverage, it MUST leave or create
+`PENDING` follow-up work using that winning base. A stale fencing predicate MUST reject
+the entire attempted transition and MUST NOT record `SUPERSEDED`.
