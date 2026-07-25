@@ -108,11 +108,14 @@ def test_fail_job_enters_retry_wait_then_reclaim_increments_fence(
         retrying.error_code,
         retrying.error_message,
     ) == ("compiler", "provider_timeout", "provider timed out")
-    assert store.claim_job(
-        worker_id="worker-2",
-        now=retry_at - timedelta(microseconds=1),
-        lease_expires_at=retry_at + timedelta(minutes=5),
-    ) is None
+    assert (
+        store.claim_job(
+            worker_id="worker-2",
+            now=retry_at - timedelta(microseconds=1),
+            lease_expires_at=retry_at + timedelta(minutes=5),
+        )
+        is None
+    )
 
     reclaimed = store.claim_job(
         worker_id="worker-2",
@@ -302,9 +305,7 @@ def test_concurrent_recovery_has_one_effective_winner(tmp_path: Path) -> None:
     barrier = Barrier(2)
 
     def recover() -> tuple[ac.CompactionJobEnvelope, ...]:
-        store = ac.SQLiteRepository(
-            ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000)
-        )
+        store = ac.SQLiteRepository(ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000))
         barrier.wait()
         return store.recover_expired_leases(now=NOW + timedelta(minutes=2))
 

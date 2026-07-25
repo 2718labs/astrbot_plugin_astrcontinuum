@@ -549,6 +549,135 @@ class SQLiteRepository:
             self._inject("lease.after_renew")
             return self._job_by_id(connection, job_id)
 
+    def fail_job(
+        self,
+        *,
+        job_id: str,
+        owner: str,
+        lease_epoch: int,
+        now: datetime,
+        error_stage: str,
+        error_code: str,
+        error_message: str,
+        retry_at: datetime | None,
+    ) -> CompactionJobEnvelope:
+        """Run ``TX_FAIL_JOB`` under the worker's live fence."""
+
+        error_values = (error_stage, error_code, error_message)
+        if any(not value.strip() for value in error_values):
+            raise ValueError("failure error tuple must contain non-empty strings")
+        if len(error_message) > 512 or any(
+            character in error_message for character in ("\r", "\n", "\x00")
+        ):
+            raise ValueError("error_message must be one bounded redacted line")
+
+        now_text = _normalize_datetime(now)
+        if retry_at is None:
+            next_state = CompactionJobState.FAILED
+            retry_text = None
+        else:
+            next_state = CompactionJobState.RETRY_WAIT
+            retry_text = _normalize_datetime(retry_at)
+            if retry_text <= now_text:
+                raise ValueError("retry_at must be later than now")
+
+        with self._factory.transaction(immediate=True) as connection:
+            self._require_live_fence(
+                connection,
+                job_id=job_id,
+                owner=owner,
+                lease_epoch=lease_epoch,
+                now=now_text,
+            )
+            cursor = connection.execute(
+                """
+                UPDATE compaction_jobs
+                SET state = ?,
+                    candidate_snapshot_id = NULL,
+                    lease_owner = NULL,
+                    lease_expires_at = NULL,
+                    next_retry_at = ?,
+                    error_stage = ?,
+                    error_code = ?,
+                    error_message = ?,
+                    updated_at = ?,
+                    committed_at = NULL
+                WHERE job_id = ?
+                  AND lease_owner = ?
+                  AND lease_epoch = ?
+                  AND lease_expires_at > ?
+                """,
+                (
+                    next_state.value,
+                    retry_text,
+                    error_stage,
+                    error_code,
+                    error_message,
+                    now_text,
+                    job_id,
+                    owner,
+                    lease_epoch,
+                    now_text,
+                ),
+            )
+            if cursor.rowcount != 1:
+                raise StaleLeaseError("failure transition lost its fencing predicate")
+            self._inject("failure.after_update")
+            return self._job_by_id(connection, job_id)
+
+    def recover_expired_leases(
+        self,
+        *,
+        now: datetime,
+    ) -> tuple[CompactionJobEnvelope, ...]:
+        """Run ``TX_RECOVER_EXPIRED_LEASES`` as one atomic recovery scan."""
+
+        now_text = _normalize_datetime(now)
+        with self._factory.transaction(immediate=True) as connection:
+            rows = connection.execute(
+                """
+                SELECT job_id
+                FROM compaction_jobs
+                WHERE state IN (
+                    'LEASED',
+                    'COMPILING',
+                    'AUDITING',
+                    'READY_TO_COMMIT'
+                )
+                  AND lease_expires_at <= ?
+                ORDER BY created_at, job_id
+                """,
+                (now_text,),
+            ).fetchall()
+            recovered_ids: list[str] = []
+            for row in rows:
+                cursor = connection.execute(
+                    """
+                    UPDATE compaction_jobs
+                    SET state = 'PENDING',
+                        candidate_snapshot_id = NULL,
+                        lease_owner = NULL,
+                        lease_expires_at = NULL,
+                        next_retry_at = NULL,
+                        updated_at = ?,
+                        committed_at = NULL
+                    WHERE job_id = ?
+                      AND state IN (
+                          'LEASED',
+                          'COMPILING',
+                          'AUDITING',
+                          'READY_TO_COMMIT'
+                      )
+                      AND lease_expires_at <= ?
+                    """,
+                    (now_text, row["job_id"], now_text),
+                )
+                if cursor.rowcount != 1:
+                    continue
+                recovered_ids.append(str(row["job_id"]))
+                self._inject("recovery.after_update")
+            return tuple(self._job_by_id(connection, job_id) for job_id in recovered_ids)
+
     def _read_request_view(
         self,
         connection: sqlite3.Connection,
