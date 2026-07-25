@@ -72,11 +72,7 @@ class CompactionJobEnvelope(FrozenEnvelope):
             raise ValueError("non-null base_snapshot_id requires positive base_pointer_version")
 
         if self.state in WORKING_STATES:
-            if (
-                self.lease_owner is None
-                or self.lease_epoch < 1
-                or self.lease_expires_at is None
-            ):
+            if self.lease_owner is None or self.lease_epoch < 1 or self.lease_expires_at is None:
                 raise ValueError("working job state requires an effective lease")
         elif self.lease_owner is not None or self.lease_expires_at is not None:
             raise ValueError("non-working job state must not expose an effective lease")

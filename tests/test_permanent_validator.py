@@ -1,12 +1,13 @@
 from __future__ import annotations
 
 import inspect
+from collections.abc import Callable
 from datetime import datetime, timezone
-from typing import Any, Callable
+from typing import Any
 
-import astrcontinuum as ac
 import pytest
 
+import astrcontinuum as ac
 
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
 
@@ -114,7 +115,9 @@ def capsule(
         preferences=(),
         entities=(),
         emotional_context=(),
-        exact_anchors=anchors if anchors is not None else (anchor("anchor-1", source_event_ids[0]),),
+        exact_anchors=anchors
+        if anchors is not None
+        else (anchor("anchor-1", source_event_ids[0]),),
         dependencies=(),
         narrative_summary=f"capsule {capsule_id}",
         token_cost=token_cost,
@@ -217,9 +220,7 @@ def test_valid_candidate_passes_with_exact_metrics() -> None:
                     covered_event_end=3,
                     source_high_water_mark=3,
                 ),
-                "candidate_capsules": (
-                    capsule(end=3, source_event_ids=("event-1", "event-3")),
-                ),
+                "candidate_capsules": (capsule(end=3, source_event_ids=("event-1", "event-3")),),
             },
             "COVERAGE_GAP",
         ),
@@ -237,9 +238,7 @@ def test_valid_candidate_passes_with_exact_metrics() -> None:
         ),
         (
             {
-                "candidate_capsules": (
-                    capsule(key=session_key("other-session")),
-                ),
+                "candidate_capsules": (capsule(key=session_key("other-session")),),
             },
             "SESSION_KEY_MISMATCH",
         ),

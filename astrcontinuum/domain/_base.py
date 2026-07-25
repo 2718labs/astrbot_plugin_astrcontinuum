@@ -4,7 +4,6 @@ from typing import Annotated, TypeVar
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints
 
-
 NonEmptyStr = Annotated[str, StringConstraints(min_length=1)]
 PositiveInt = Annotated[int, Field(ge=1)]
 NonNegativeInt = Annotated[int, Field(ge=0)]

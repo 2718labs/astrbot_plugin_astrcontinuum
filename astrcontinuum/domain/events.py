@@ -53,9 +53,7 @@ class EventEnvelope(FrozenEnvelope):
     def validate_authoritative_mapping(self) -> EventEnvelope:
         expected_role, expected_hook = self._MAPPINGS[self.event_type]
         if self.role != expected_role or self.source_hook != expected_hook:
-            raise ValueError(
-                "event_type, role, and source_hook must use an authoritative mapping"
-            )
+            raise ValueError("event_type, role, and source_hook must use an authoritative mapping")
         return self
 
     @classmethod

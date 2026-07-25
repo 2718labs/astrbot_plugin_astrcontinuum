@@ -27,7 +27,16 @@ from .domain import (
     SourceHook,
     validate_permanent,
 )
-from .models import AssemblyTrace, AuditReport, Claim, ClaimStatus, ContextCapsule, ContextEvent, ExactAnchor, Snapshot
+from .models import (
+    AssemblyTrace,
+    AuditReport,
+    Claim,
+    ClaimStatus,
+    ContextCapsule,
+    ContextEvent,
+    ExactAnchor,
+    Snapshot,
+)
 
 __all__ = [
     "AnchorStatus",

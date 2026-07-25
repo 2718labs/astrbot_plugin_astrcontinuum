@@ -6,10 +6,10 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-import astrcontinuum as ac
 import pytest
 from pydantic import ValidationError
 
+import astrcontinuum as ac
 
 ROOT = Path(__file__).resolve().parents[1]
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
@@ -234,9 +234,7 @@ def test_event_envelope_accepts_only_the_four_authoritative_mappings() -> None:
         token_count=1,
         created_at=NOW,
     )
-    assert event.model_dump(mode="json")["session_key"] == session_key().model_dump(
-        mode="json"
-    )
+    assert event.model_dump(mode="json")["session_key"] == session_key().model_dump(mode="json")
 
     with pytest.raises(ValidationError):
         event_envelope(
@@ -271,9 +269,7 @@ def test_snapshot_state_rules_match_frozen_schema() -> None:
     semantic_audit_status = domain_type("SemanticAuditStatus")
     candidate = snapshot()
 
-    assert set(candidate.model_dump(mode="json")) == set(
-        schema("snapshot.schema.json")["required"]
-    )
+    assert set(candidate.model_dump(mode="json")) == set(schema("snapshot.schema.json")["required"])
 
     with pytest.raises(ValidationError):
         snapshot(committed_at=NOW)

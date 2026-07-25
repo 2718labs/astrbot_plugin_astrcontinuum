@@ -67,9 +67,7 @@ def _active_semantics(
             if item.status == SemanticStatus.ACTIVE
         )
         records.extend((item.entity_id, item.source_event_ids) for item in capsule.entities)
-        records.extend(
-            (item.dependency_id, item.source_event_ids) for item in capsule.dependencies
-        )
+        records.extend((item.dependency_id, item.source_event_ids) for item in capsule.dependencies)
     return records
 
 
@@ -138,10 +136,7 @@ def validate_permanent(
     if (
         any(capsule.session_key != session_key for capsule in candidate_capsules)
         or any(event.session_key != session_key for event in source_events)
-        or (
-            previous_snapshot is not None
-            and previous_snapshot.session_key != session_key
-        )
+        or (previous_snapshot is not None and previous_snapshot.session_key != session_key)
         or any(capsule.session_key != session_key for capsule in previous_capsules)
     ):
         failures.add(PermanentFailureCode.SESSION_KEY_MISMATCH)
@@ -154,9 +149,7 @@ def validate_permanent(
         failures.add(PermanentFailureCode.INVALID_CAPSULE_COVERAGE)
 
     previous_source_ids = {
-        source_id
-        for capsule in previous_capsules
-        for source_id in capsule.source_event_ids
+        source_id for capsule in previous_capsules for source_id in capsule.source_event_ids
     }
     current_source_ids = {event.event_id for event in source_events}
     valid_source_ids = previous_source_ids | current_source_ids
@@ -175,22 +168,16 @@ def validate_permanent(
     if unsupported_records or capsule_source_mismatch:
         failures.add(PermanentFailureCode.UNSUPPORTED_ACTIVE_SEMANTIC)
 
-    previous_semantic_ids = {
-        item_id for item_id, _ in _active_semantics(previous_capsules)
-    }
+    previous_semantic_ids = {item_id for item_id, _ in _active_semantics(previous_capsules)}
     candidate_semantic_ids = {item_id for item_id, _ in semantic_records}
     if not previous_semantic_ids.issubset(candidate_semantic_ids):
         failures.add(PermanentFailureCode.MISSING_PRIOR_SEMANTIC)
 
-    previous_anchor_ids = {
-        item_id for item_id, _ in _active_anchors(previous_capsules)
-    }
+    previous_anchor_ids = {item_id for item_id, _ in _active_anchors(previous_capsules)}
     candidate_anchor_id_set = {item_id for item_id, _ in candidate_anchor_records}
     preserved_anchor_count = len(previous_anchor_ids & candidate_anchor_id_set)
     computed_anchor_recall = (
-        preserved_anchor_count / len(previous_anchor_ids)
-        if previous_anchor_ids
-        else 1.0
+        preserved_anchor_count / len(previous_anchor_ids) if previous_anchor_ids else 1.0
     )
     if computed_anchor_recall < 1.0:
         failures.add(PermanentFailureCode.MISSING_REQUIRED_ANCHOR)
@@ -211,12 +198,9 @@ def validate_permanent(
         default=0.0,
     )
     declared_unsupported = sum(
-        capsule.quality.unsupported_critical_claims
-        for capsule in candidate_capsules
+        capsule.quality.unsupported_critical_claims for capsule in candidate_capsules
     )
-    declared_coverage_gap = sum(
-        capsule.quality.coverage_gap for capsule in candidate_capsules
-    )
+    declared_coverage_gap = sum(capsule.quality.coverage_gap for capsule in candidate_capsules)
 
     source_coverage = min(computed_source_coverage, declared_source_coverage)
     anchor_recall = min(computed_anchor_recall, declared_anchor_recall)
@@ -226,9 +210,8 @@ def validate_permanent(
     )
     coverage_gap = max(len(missing_sequences), declared_coverage_gap)
 
-    if (
-        not candidate_snapshot.audit_outcome.mechanical_passed
-        or any(not capsule.quality.mechanical_passed for capsule in candidate_capsules)
+    if not candidate_snapshot.audit_outcome.mechanical_passed or any(
+        not capsule.quality.mechanical_passed for capsule in candidate_capsules
     ):
         failures.add(PermanentFailureCode.MECHANICAL_NOT_PASSED)
     if source_coverage < 1.0:
