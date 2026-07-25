@@ -21,8 +21,8 @@
 | `V1-101` | done | `V1-001` | Repair Capsule Schema and persistence documents with observed RED tests |
 | `V1-201` | done | `V1-101` | Immutable domain envelopes and permanent validators |
 | `V1-202` | done | `V1-201` | SQLite migrations and connection policy |
-| `V1-203` | ready | `V1-202` | Nine repository transactions, concurrency, and recovery |
-| `V1-301` | pending | `V1-203` | Standalone read view, retrieval, budget, and assembly trace |
+| `V1-203` | done | `V1-202` | Nine repository transactions, concurrency, and recovery |
+| `V1-301` | ready | `V1-203` | Standalone read view, retrieval, budget, and assembly trace |
 | `V1-302` | pending | `V1-301` | Reversible AstrBot projection and unique Hook writers |
 | `V1-401` | pending | `V1-203` | Segmenter, compiler, permanent validator, and optional auditor |
 | `V1-402` | pending | `V1-301`, `V1-401` | Query-aware reconstruction and FTS fallback |
@@ -35,13 +35,13 @@ their direct contracts and dependencies are green.
 
 ## Dispatch
 
-- Current wave: `V1-203`
-- Current card: `tasks/V1-203.md`
-- Write owner: one repository implementation agent
+- Current wave: `V1-301`
+- Current card: `tasks/V1-301.md`
+- Write owner: one runtime read/assembly implementation agent
 - Write scope: the exact paths listed in the task card
 - Write conflicts: none
-- Next gate: observe capture RED before adding repository code, then close each remaining
-  transaction family with focused RED/GREEN and real multi-connection evidence
+- Next gate: observe standalone read-view RED before adding canonical runtime code, then
+  close retrieval and budget assembly with focused RED/GREEN evidence
 
 ## Operating Rules
 
