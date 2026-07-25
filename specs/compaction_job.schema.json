@@ -1,0 +1,413 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AstrContinuum Compaction Job",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "job_id",
+    "session_key",
+    "state",
+    "target_high_water_mark",
+    "intent_target_high_water_mark",
+    "base_snapshot_id",
+    "base_pointer_version",
+    "candidate_snapshot_id",
+    "attempt_count",
+    "lease_owner",
+    "lease_epoch",
+    "lease_expires_at",
+    "next_retry_at",
+    "error_stage",
+    "error_code",
+    "error_message",
+    "created_at",
+    "updated_at",
+    "committed_at"
+  ],
+  "properties": {
+    "job_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "session_key": {
+      "$ref": "#/$defs/sessionKey"
+    },
+    "state": {
+      "enum": [
+        "PENDING",
+        "LEASED",
+        "COMPILING",
+        "AUDITING",
+        "READY_TO_COMMIT",
+        "RETRY_WAIT",
+        "COMMITTED",
+        "SUPERSEDED",
+        "FAILED",
+        "CANCELLED"
+      ]
+    },
+    "target_high_water_mark": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "intent_target_high_water_mark": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "base_snapshot_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "base_pointer_version": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "candidate_snapshot_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "attempt_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "lease_owner": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "lease_epoch": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "lease_expires_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "next_retry_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    },
+    "error_stage": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "error_code": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "error_message": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "minLength": 1
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "updated_at": {
+      "type": "string",
+      "format": "date-time"
+    },
+    "committed_at": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "format": "date-time"
+    }
+  },
+  "allOf": [
+    {
+      "oneOf": [
+        {
+          "properties": {
+            "error_stage": {
+              "type": "null"
+            },
+            "error_code": {
+              "type": "null"
+            },
+            "error_message": {
+              "type": "null"
+            }
+          }
+        },
+        {
+          "properties": {
+            "error_stage": {
+              "type": "string",
+              "minLength": 1
+            },
+            "error_code": {
+              "type": "string",
+              "minLength": 1
+            },
+            "error_message": {
+              "type": "string",
+              "minLength": 1
+            }
+          }
+        }
+      ]
+    },
+    {
+      "if": {
+        "properties": {
+          "base_snapshot_id": {
+            "type": "null"
+          }
+        },
+        "required": [
+          "base_snapshot_id"
+        ]
+      },
+      "then": {
+        "properties": {
+          "base_pointer_version": {
+            "const": 0
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "base_pointer_version": {
+            "type": "integer",
+            "minimum": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "enum": [
+              "LEASED",
+              "COMPILING",
+              "AUDITING",
+              "READY_TO_COMMIT"
+            ]
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "lease_owner": {
+            "type": "string",
+            "minLength": 1
+          },
+          "lease_epoch": {
+            "type": "integer",
+            "minimum": 1
+          },
+          "lease_expires_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "lease_owner": {
+            "type": "null"
+          },
+          "lease_expires_at": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "enum": [
+              "READY_TO_COMMIT",
+              "COMMITTED",
+              "SUPERSEDED"
+            ]
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "candidate_snapshot_id": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "candidate_snapshot_id": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "enum": [
+              "RETRY_WAIT",
+              "FAILED"
+            ]
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "error_stage": {
+            "type": "string",
+            "minLength": 1
+          },
+          "error_code": {
+            "type": "string",
+            "minLength": 1
+          },
+          "error_message": {
+            "type": "string",
+            "minLength": 1
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "RETRY_WAIT"
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "next_retry_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "next_retry_at": {
+            "type": "null"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "state": {
+            "const": "COMMITTED"
+          }
+        },
+        "required": [
+          "state"
+        ]
+      },
+      "then": {
+        "properties": {
+          "committed_at": {
+            "type": "string",
+            "format": "date-time"
+          }
+        }
+      },
+      "else": {
+        "properties": {
+          "committed_at": {
+            "type": "null"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sessionKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "platform_instance_id",
+        "message_type",
+        "session_id",
+        "group_id",
+        "user_id",
+        "conversation_id",
+        "persona_id"
+      ],
+      "properties": {
+        "platform_instance_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "session_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "group_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "user_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "conversation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "persona_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        }
+      }
+    }
+  }
+}

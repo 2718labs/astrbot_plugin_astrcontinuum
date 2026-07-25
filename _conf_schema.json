@@ -1,0 +1,42 @@
+{
+  "enabled": {
+    "description": "启用 AstrContinuum",
+    "type": "bool",
+    "default": true
+  },
+  "model_context_limit": {
+    "description": "模型总上下文窗口 Token",
+    "type": "int",
+    "default": 200000
+  },
+  "target_input_budget": {
+    "description": "普通请求目标输入 Token",
+    "type": "int",
+    "default": 130000
+  },
+  "hard_input_ceiling": {
+    "description": "硬输入上限 Token",
+    "type": "int",
+    "default": 150000
+  },
+  "delta_trigger_tokens": {
+    "description": "Delta 达到多少 Token 后安排后台压缩",
+    "type": "int",
+    "default": 12000
+  },
+  "delta_trigger_turns": {
+    "description": "Delta 达到多少轮后安排后台压缩",
+    "type": "int",
+    "default": 24
+  },
+  "strict_audit": {
+    "description": "候选快照必须通过严格损失审计",
+    "type": "bool",
+    "default": true
+  },
+  "enable_sylanne_adapter": {
+    "description": "检测并只读接入 Sylanne 长期记忆",
+    "type": "bool",
+    "default": true
+  }
+}

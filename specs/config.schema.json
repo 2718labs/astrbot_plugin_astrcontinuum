@@ -1,0 +1,67 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AstrContinuum Config",
+  "type": "object",
+  "additionalProperties": false,
+  "properties": {
+    "enabled": {
+      "type": "boolean",
+      "default": true
+    },
+    "model_context_limit": {
+      "type": "integer",
+      "minimum": 4096,
+      "default": 200000
+    },
+    "target_input_budget": {
+      "type": "integer",
+      "minimum": 2048,
+      "default": 130000
+    },
+    "hard_input_ceiling": {
+      "type": "integer",
+      "minimum": 4096,
+      "default": 150000
+    },
+    "delta_trigger_tokens": {
+      "type": "integer",
+      "minimum": 512,
+      "default": 12000
+    },
+    "delta_trigger_turns": {
+      "type": "integer",
+      "minimum": 1,
+      "default": 24
+    },
+    "recent_raw_budget": {
+      "type": "integer",
+      "minimum": 512,
+      "default": 50000
+    },
+    "retrieval_budget": {
+      "type": "integer",
+      "minimum": 0,
+      "default": 25000
+    },
+    "snapshot_budget": {
+      "type": "integer",
+      "minimum": 512,
+      "default": 20000
+    },
+    "compaction_provider_id": {
+      "type": [
+        "string",
+        "null"
+      ],
+      "default": null
+    },
+    "enable_sylanne_adapter": {
+      "type": "boolean",
+      "default": true
+    },
+    "strict_audit": {
+      "type": "boolean",
+      "default": true
+    }
+  }
+}

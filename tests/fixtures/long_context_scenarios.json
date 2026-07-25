@@ -1,0 +1,27 @@
+{
+  "scenarios": [
+    {
+      "id": "early_constraint",
+      "seed": "以后压缩绝对不能卡住聊天。",
+      "later_query": "我们对压缩延迟的硬约束是什么？",
+      "must_recall_exact": "不能卡住聊天"
+    },
+    {
+      "id": "repository_anchor",
+      "seed": "仓库名是 Ayleovelle/SylannEngine。",
+      "later_query": "我那个引擎仓库的完整名字是什么？",
+      "must_recall_exact": "Ayleovelle/SylannEngine"
+    },
+    {
+      "id": "decision_reversal",
+      "events": [
+        "采用达到阈值后同步摘要。",
+        "不行，这会阻塞，把同步方案废弃。",
+        "采用 stable snapshot + delta 的 shadow compaction。"
+      ],
+      "later_query": "当前有效方案是什么？",
+      "must_include": "shadow compaction",
+      "must_not_treat_as_active": "同步摘要"
+    }
+  ]
+}

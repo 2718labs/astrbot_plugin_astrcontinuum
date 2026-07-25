@@ -1,0 +1,26 @@
+version: 1
+priority:
+  current_input: 100
+  fixed_system: 95
+  active_constraints: 92
+  active_goal: 90
+  uncompacted_delta: 88
+  exact_anchors: 85
+  recent_raw: 75
+  active_task_capsules: 70
+  query_relevant_evidence: 65
+  episode_background: 35
+  global_background: 20
+
+defaults:
+  model_context_limit: 200000
+  target_input_budget: 130000
+  hard_input_ceiling: 150000
+  emergency_budget: 110000
+
+invariants:
+  preserve_turn_boundaries: true
+  preserve_current_user_message: true
+  preserve_active_constraints: true
+  never_use_candidate_snapshot: true
+  never_wait_for_compaction: true

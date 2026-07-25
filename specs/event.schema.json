@@ -1,0 +1,210 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "AstrContinuum Journal Event",
+  "type": "object",
+  "additionalProperties": false,
+  "required": [
+    "event_id",
+    "session_key",
+    "sequence",
+    "event_type",
+    "role",
+    "content",
+    "source_hook",
+    "idempotency_key",
+    "token_count",
+    "created_at"
+  ],
+  "properties": {
+    "event_id": {
+      "type": "string",
+      "minLength": 1
+    },
+    "session_key": {
+      "$ref": "#/$defs/sessionKey"
+    },
+    "sequence": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "event_type": {
+      "enum": [
+        "USER_MESSAGE",
+        "ASSISTANT_MESSAGE",
+        "TOOL_CALL",
+        "TOOL_RESULT"
+      ]
+    },
+    "role": {
+      "enum": [
+        "USER",
+        "ASSISTANT",
+        "TOOL"
+      ]
+    },
+    "content": {
+      "type": "string"
+    },
+    "source_hook": {
+      "enum": [
+        "ON_LLM_REQUEST",
+        "ON_AGENT_DONE",
+        "ON_USING_LLM_TOOL",
+        "ON_LLM_TOOL_RESPOND"
+      ]
+    },
+    "idempotency_key": {
+      "type": "string",
+      "minLength": 1
+    },
+    "token_count": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "created_at": {
+      "type": "string",
+      "format": "date-time"
+    }
+  },
+  "allOf": [
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "const": "USER_MESSAGE"
+          }
+        },
+        "required": [
+          "event_type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "role": {
+            "const": "USER"
+          },
+          "source_hook": {
+            "const": "ON_LLM_REQUEST"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "const": "ASSISTANT_MESSAGE"
+          }
+        },
+        "required": [
+          "event_type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "role": {
+            "const": "ASSISTANT"
+          },
+          "source_hook": {
+            "const": "ON_AGENT_DONE"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "const": "TOOL_CALL"
+          }
+        },
+        "required": [
+          "event_type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "role": {
+            "const": "TOOL"
+          },
+          "source_hook": {
+            "const": "ON_USING_LLM_TOOL"
+          }
+        }
+      }
+    },
+    {
+      "if": {
+        "properties": {
+          "event_type": {
+            "const": "TOOL_RESULT"
+          }
+        },
+        "required": [
+          "event_type"
+        ]
+      },
+      "then": {
+        "properties": {
+          "role": {
+            "const": "TOOL"
+          },
+          "source_hook": {
+            "const": "ON_LLM_TOOL_RESPOND"
+          }
+        }
+      }
+    }
+  ],
+  "$defs": {
+    "sessionKey": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": [
+        "platform_instance_id",
+        "message_type",
+        "session_id",
+        "group_id",
+        "user_id",
+        "conversation_id",
+        "persona_id"
+      ],
+      "properties": {
+        "platform_instance_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "message_type": {
+          "type": "string",
+          "minLength": 1
+        },
+        "session_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "group_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        },
+        "user_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "conversation_id": {
+          "type": "string",
+          "minLength": 1
+        },
+        "persona_id": {
+          "type": [
+            "string",
+            "null"
+          ],
+          "minLength": 1
+        }
+      }
+    }
+  }
+}
