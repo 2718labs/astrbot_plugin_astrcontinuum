@@ -19,8 +19,8 @@
 | --- | --- | --- | --- |
 | `V1-001` | done | none | Freeze architecture, contracts, risks, and first patch plan |
 | `V1-101` | done | `V1-001` | Repair Capsule Schema and persistence documents with observed RED tests |
-| `V1-201` | ready | `V1-101` | Immutable domain envelopes and permanent validators |
-| `V1-202` | pending | `V1-201` | SQLite migrations and connection policy |
+| `V1-201` | done | `V1-101` | Immutable domain envelopes and permanent validators |
+| `V1-202` | ready | `V1-201` | SQLite migrations and connection policy |
 | `V1-203` | pending | `V1-202` | Nine repository transactions, concurrency, and recovery |
 | `V1-301` | pending | `V1-203` | Standalone read view, retrieval, budget, and assembly trace |
 | `V1-302` | pending | `V1-301` | Reversible AstrBot projection and unique Hook writers |
@@ -35,13 +35,13 @@ their direct contracts and dependencies are green.
 
 ## Dispatch
 
-- Current wave: `V1-201`
-- Current card: `tasks/V1-201.md`
-- Write owner: one domain-implementation agent
+- Current wave: `V1-202`
+- Current card: `tasks/V1-202.md`
+- Write owner: one storage-foundation implementation agent
 - Write scope: the exact paths listed in the task card
 - Write conflicts: none
-- Next gate: observe the domain-envelope suite RED before adding canonical types, then
-  observe the permanent-validator suite RED before adding validator behavior
+- Next gate: observe connection-policy RED before adding the SQLite factory, then observe
+  migration RED before adding the initial schema and migration runner
 
 ## Operating Rules
 
