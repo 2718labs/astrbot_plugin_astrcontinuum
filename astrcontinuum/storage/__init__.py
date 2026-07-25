@@ -14,7 +14,10 @@ from .repository import (
     IdempotencyConflict,
     RepositoryConflict,
     RepositoryError,
+    RepositoryInvariantError,
+    RequestView,
     SessionIdentityConflict,
+    SnapshotCapsuleMembership,
     SQLiteRepository,
 )
 from .sqlite import (
@@ -38,8 +41,11 @@ __all__ = [
     "MigrationPlanError",
     "RepositoryConflict",
     "RepositoryError",
+    "RepositoryInvariantError",
+    "RequestView",
     "SQLiteConnectionFactory",
     "SQLiteMigrator",
     "SQLiteRepository",
     "SessionIdentityConflict",
+    "SnapshotCapsuleMembership",
 ]

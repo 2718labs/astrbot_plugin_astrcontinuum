@@ -2,15 +2,21 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from collections.abc import Callable
+from dataclasses import dataclass
 from datetime import datetime, timezone
 
 from astrcontinuum.domain import (
+    ContextCapsuleEnvelope,
     EventEnvelope,
     EventRole,
     EventType,
     SessionKey,
+    SnapshotAuditOutcome,
+    SnapshotEnvelope,
+    SnapshotState,
     SourceHook,
 )
 
@@ -37,6 +43,40 @@ class IdempotencyConflict(RepositoryConflict):
 
 class EventIdentityConflict(RepositoryConflict):
     """Raised when an event id is reused outside its exact idempotent replay."""
+
+
+class RepositoryInvariantError(RepositoryError):
+    """Raised when durable rows cannot form a valid canonical view."""
+
+
+@dataclass(frozen=True, slots=True)
+class SnapshotCapsuleMembership:
+    """One ordered durable Snapshot-to-Capsule relation."""
+
+    ordinal: int
+    slot: str
+    capsule: ContextCapsuleEnvelope
+
+    @property
+    def capsule_id(self) -> str:
+        return self.capsule.capsule_id
+
+
+@dataclass(frozen=True, slots=True)
+class RequestView:
+    """One consistent committed Snapshot plus its bounded Journal Delta."""
+
+    session_key: SessionKey
+    snapshot: SnapshotEnvelope | None
+    memberships: tuple[SnapshotCapsuleMembership, ...]
+    pointer_version: int
+    covered_event_end: int
+    high_water_mark: int
+    delta: tuple[EventEnvelope, ...]
+
+    @property
+    def capsules(self) -> tuple[ContextCapsuleEnvelope, ...]:
+        return tuple(membership.capsule for membership in self.memberships)
 
 
 def _normalize_datetime(value: datetime) -> str:
@@ -134,6 +174,125 @@ class SQLiteRepository:
             idempotency_key=idempotency_key,
             token_count=token_count,
             created_at=created_at,
+        )
+
+    def read_request_view(self, session_key: SessionKey) -> RequestView:
+        """Run ``TX_READ_REQUEST_VIEW`` in one read transaction."""
+
+        with self._factory.connection(read_only=True) as connection:
+            connection.execute("BEGIN")
+            try:
+                view = self._read_request_view(connection, session_key)
+            except BaseException:
+                connection.rollback()
+                raise
+            else:
+                connection.commit()
+                return view
+
+    def _read_request_view(
+        self,
+        connection: sqlite3.Connection,
+        session_key: SessionKey,
+    ) -> RequestView:
+        session_row = connection.execute(
+            """
+            SELECT canonical_session_key_json, next_event_sequence
+            FROM sessions
+            WHERE session_key_hash = ?
+            """,
+            (session_key.session_key_hash,),
+        ).fetchone()
+        if session_row is None:
+            return RequestView(
+                session_key=session_key,
+                snapshot=None,
+                memberships=(),
+                pointer_version=0,
+                covered_event_end=0,
+                high_water_mark=0,
+                delta=(),
+            )
+        if session_row["canonical_session_key_json"] != session_key.canonical_json():
+            raise SessionIdentityConflict(
+                "session hash does not resolve to the exact canonical SessionKey"
+            )
+
+        high_water_mark = int(session_row["next_event_sequence"]) - 1
+        self._inject("read.after_high_water")
+        active_row = connection.execute(
+            """
+            SELECT
+                active.pointer_version,
+                snapshot.*
+            FROM active_snapshots AS active
+            JOIN snapshots AS snapshot
+              ON snapshot.snapshot_id = active.snapshot_id
+            WHERE active.session_key_hash = ?
+            """,
+            (session_key.session_key_hash,),
+        ).fetchone()
+        self._inject("read.after_pointer")
+
+        if active_row is None:
+            snapshot = None
+            memberships: tuple[SnapshotCapsuleMembership, ...] = ()
+            pointer_version = 0
+            covered_event_end = 0
+        else:
+            memberships = self._memberships_for_snapshot(
+                connection,
+                snapshot_id=active_row["snapshot_id"],
+                session_key=session_key,
+            )
+            snapshot = self._snapshot_from_row(
+                active_row,
+                session_key=session_key,
+                capsule_ids=tuple(item.capsule_id for item in memberships),
+            )
+            pointer_version = int(active_row["pointer_version"])
+            covered_event_end = snapshot.covered_event_end
+            self._validate_snapshot_memberships(snapshot, memberships)
+
+        if covered_event_end > high_water_mark:
+            raise RepositoryInvariantError(
+                "active Snapshot coverage exceeds the Journal high-water mark"
+            )
+
+        rows = connection.execute(
+            """
+            SELECT
+                event.*,
+                session.canonical_session_key_json
+            FROM journal_events AS event
+            JOIN sessions AS session
+              ON session.session_key_hash = event.session_key_hash
+            WHERE event.session_key_hash = ?
+              AND event.sequence > ?
+              AND event.sequence <= ?
+            ORDER BY event.sequence
+            """,
+            (
+                session_key.session_key_hash,
+                covered_event_end,
+                high_water_mark,
+            ),
+        ).fetchall()
+        delta = tuple(self._event_from_row(row) for row in rows)
+        expected_sequences = tuple(range(covered_event_end + 1, high_water_mark + 1))
+        if tuple(event.sequence for event in delta) != expected_sequences:
+            raise RepositoryInvariantError(
+                "request Delta is not contiguous through the fixed high-water mark"
+            )
+
+        return RequestView(
+            session_key=session_key,
+            snapshot=snapshot,
+            memberships=memberships,
+            pointer_version=pointer_version,
+            covered_event_end=covered_event_end,
+            high_water_mark=high_water_mark,
+            delta=delta,
         )
 
     def _capture_event(
@@ -349,6 +508,109 @@ class SQLiteRepository:
             token_count=row["token_count"],
             created_at=_parse_datetime(row["created_at"]),
         )
+
+    @staticmethod
+    def _memberships_for_snapshot(
+        connection: sqlite3.Connection,
+        *,
+        snapshot_id: str,
+        session_key: SessionKey,
+    ) -> tuple[SnapshotCapsuleMembership, ...]:
+        rows = connection.execute(
+            """
+            SELECT
+                membership.ordinal,
+                membership.slot,
+                capsule.*
+            FROM snapshot_capsules AS membership
+            JOIN capsules AS capsule
+              ON capsule.capsule_id = membership.capsule_id
+            WHERE membership.snapshot_id = ?
+            ORDER BY membership.ordinal
+            """,
+            (snapshot_id,),
+        ).fetchall()
+        memberships: list[SnapshotCapsuleMembership] = []
+        for expected_ordinal, row in enumerate(rows):
+            capsule = ContextCapsuleEnvelope.model_validate_json(row["canonical_capsule_json"])
+            if (
+                int(row["ordinal"]) != expected_ordinal
+                or row["capsule_id"] != capsule.capsule_id
+                or row["session_key_hash"] != session_key.session_key_hash
+                or capsule.session_key != session_key
+                or row["level"] != capsule.level.value
+                or int(row["covered_event_start"]) != capsule.covered_event_start
+                or int(row["covered_event_end"]) != capsule.covered_event_end
+                or int(row["token_cost"]) != capsule.token_cost
+                or float(row["source_coverage"]) != capsule.quality.source_coverage
+                or row["created_at"] != _normalize_datetime(capsule.created_at)
+            ):
+                raise RepositoryInvariantError(
+                    "Snapshot membership does not round-trip its canonical Capsule"
+                )
+            memberships.append(
+                SnapshotCapsuleMembership(
+                    ordinal=expected_ordinal,
+                    slot=str(row["slot"]),
+                    capsule=capsule,
+                )
+            )
+        return tuple(memberships)
+
+    @staticmethod
+    def _snapshot_from_row(
+        row: sqlite3.Row,
+        *,
+        session_key: SessionKey,
+        capsule_ids: tuple[str, ...],
+    ) -> SnapshotEnvelope:
+        try:
+            exact_anchor_ids = tuple(json.loads(row["exact_anchor_ids_json"]))
+            audit_outcome = SnapshotAuditOutcome.model_validate(json.loads(row["audit_outcome"]))
+            snapshot = SnapshotEnvelope(
+                snapshot_id=row["snapshot_id"],
+                session_key=session_key,
+                base_snapshot_id=row["base_snapshot_id"],
+                covered_event_end=row["covered_event_end"],
+                source_high_water_mark=row["source_high_water_mark"],
+                capsule_ids=capsule_ids,
+                exact_anchor_ids=exact_anchor_ids,
+                rendered_context=row["rendered_context"],
+                token_cost=row["token_cost"],
+                audit_outcome=audit_outcome,
+                state=SnapshotState(row["lifecycle_state"]),
+                created_at=_parse_datetime(row["created_at"]),
+                committed_at=_parse_datetime(row["committed_at"]),
+            )
+        except (TypeError, ValueError, json.JSONDecodeError) as error:
+            raise RepositoryInvariantError(
+                "committed Snapshot row does not form a canonical envelope"
+            ) from error
+        if row["session_key_hash"] != session_key.session_key_hash:
+            raise RepositoryInvariantError("active Snapshot belongs to a different durable session")
+        return snapshot
+
+    @staticmethod
+    def _validate_snapshot_memberships(
+        snapshot: SnapshotEnvelope,
+        memberships: tuple[SnapshotCapsuleMembership, ...],
+    ) -> None:
+        if not memberships or snapshot.capsule_ids != tuple(
+            item.capsule_id for item in memberships
+        ):
+            raise RepositoryInvariantError(
+                "committed Snapshot has invalid ordered Capsule membership"
+            )
+        active_anchor_ids = tuple(
+            anchor.anchor_id
+            for membership in memberships
+            for anchor in membership.capsule.exact_anchors
+            if anchor.status.value == "active"
+        )
+        if snapshot.exact_anchor_ids != active_anchor_ids:
+            raise RepositoryInvariantError(
+                "committed Snapshot exact anchors disagree with Capsule membership"
+            )
 
     @staticmethod
     def _is_exact_replay(

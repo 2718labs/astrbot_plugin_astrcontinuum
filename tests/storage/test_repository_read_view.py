@@ -292,9 +292,7 @@ def test_read_transaction_fixes_high_water_before_concurrent_append(
         pending = pool.submit(reader.read_request_view, key)
         assert reached_high_water.wait(timeout=5)
         third = capture(
-            ac.SQLiteRepository(
-                ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000)
-            ),
+            ac.SQLiteRepository(ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000)),
             3,
             key=key,
         )
