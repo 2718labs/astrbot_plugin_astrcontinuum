@@ -37,6 +37,7 @@ from .models import (
     ExactAnchor,
     Snapshot,
 )
+from .storage import SQLiteConnectionFactory
 
 __all__ = [
     "AnchorStatus",
@@ -63,6 +64,7 @@ __all__ = [
     "ExactAnchor",
     "PermanentFailureCode",
     "PermanentValidationReport",
+    "SQLiteConnectionFactory",
     "SemanticAuditStatus",
     "SemanticStatus",
     "SessionKey",

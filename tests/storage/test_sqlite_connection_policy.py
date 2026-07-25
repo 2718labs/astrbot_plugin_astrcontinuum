@@ -59,10 +59,9 @@ def test_transaction_commits_on_success_and_rolls_back_on_exception(tmp_path: Pa
         connection.execute("CREATE TABLE records (value TEXT NOT NULL)")
         connection.execute("INSERT INTO records VALUES ('committed')")
 
-    with pytest.raises(RuntimeError, match="boom"):
-        with factory.transaction() as connection:
-            connection.execute("INSERT INTO records VALUES ('rolled-back')")
-            raise RuntimeError("boom")
+    with pytest.raises(RuntimeError, match="boom"), factory.transaction() as connection:
+        connection.execute("INSERT INTO records VALUES ('rolled-back')")
+        raise RuntimeError("boom")
 
     with factory.connection(read_only=True) as connection:
         values = [
