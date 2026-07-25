@@ -459,15 +459,24 @@ def test_same_prefix_conflict_rolls_back_candidates_then_supersedes_job(
     assert result.winner == winner
     assert result.pointer_version == 1
     with store.factory.connection(read_only=True) as connection:
-        assert connection.execute(
-            "SELECT count(*) FROM capsules WHERE capsule_id = 'capsule-1'"
-        ).fetchone()[0] == 0
-        assert connection.execute(
-            "SELECT count(*) FROM snapshots WHERE snapshot_id = 'snapshot-loser'"
-        ).fetchone()[0] == 0
-        assert connection.execute(
-            "SELECT count(*) FROM snapshot_capsules WHERE snapshot_id = 'snapshot-loser'"
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM capsules WHERE capsule_id = 'capsule-1'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM snapshots WHERE snapshot_id = 'snapshot-loser'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM snapshot_capsules WHERE snapshot_id = 'snapshot-loser'"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_stale_fence_rejects_whole_publish_without_superseding(tmp_path: Path) -> None:
@@ -510,7 +519,7 @@ def test_success_preserves_higher_intent_as_pending_follow_up(tmp_path: Path) ->
     item = capsule(1)
     members = memberships(item)
     snapshot = candidate_snapshot("snapshot-1", members, target=1)
-    job = ready_job(
+    ready_job(
         store,
         target=1,
         candidate_snapshot_id=snapshot.snapshot_id,
@@ -592,12 +601,18 @@ def test_pointer_cas_loss_rolls_back_candidate_and_uses_winner_for_follow_up(
     assert result.winner == first_result.winner
     assert result.pointer_version == 2
     with store.factory.connection(read_only=True) as connection:
-        assert connection.execute(
-            "SELECT count(*) FROM snapshots WHERE snapshot_id = 'snapshot-loser'"
-        ).fetchone()[0] == 0
-        assert connection.execute(
-            "SELECT count(*) FROM capsules WHERE capsule_id = 'capsule-2'"
-        ).fetchone()[0] == 0
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM snapshots WHERE snapshot_id = 'snapshot-loser'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM capsules WHERE capsule_id = 'capsule-2'"
+            ).fetchone()[0]
+            == 0
+        )
         follow_up = connection.execute(
             """
             SELECT state, target_high_water_mark, base_snapshot_id, base_pointer_version

@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
-from collections.abc import Callable
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from enum import Enum
 
 from astrcontinuum.domain import (
     CompactionJobEnvelope,
@@ -15,11 +17,13 @@ from astrcontinuum.domain import (
     EventEnvelope,
     EventRole,
     EventType,
+    PermanentValidationReport,
     SessionKey,
     SnapshotAuditOutcome,
     SnapshotEnvelope,
     SnapshotState,
     SourceHook,
+    validate_permanent,
 )
 
 from .sqlite import SQLiteConnectionFactory
@@ -87,6 +91,20 @@ class StaleLeaseError(RepositoryError):
     """Raised when a worker mutation does not own a live matching fence."""
 
 
+class PublicationRejected(RepositoryError):
+    """Raised when the permanent validator rejects a publication candidate."""
+
+    def __init__(self, report: PermanentValidationReport) -> None:
+        self.report = report
+        codes = ", ".join(code.value for code in report.failure_codes)
+        super().__init__(f"publication candidate failed permanent validation: {codes}")
+
+
+class PublishOutcome(str, Enum):
+    COMMITTED = "COMMITTED"
+    SUPERSEDED = "SUPERSEDED"
+
+
 @dataclass(frozen=True, slots=True)
 class SnapshotCapsuleMembership:
     """One ordered durable Snapshot-to-Capsule relation."""
@@ -117,6 +135,20 @@ class RequestView:
         return tuple(membership.capsule for membership in self.memberships)
 
 
+@dataclass(frozen=True, slots=True)
+class PublishResult:
+    """Terminal publication branch and the active winning Snapshot."""
+
+    outcome: PublishOutcome
+    job: CompactionJobEnvelope
+    winner: SnapshotEnvelope
+    pointer_version: int
+
+
+class _PublishConflict(Exception):
+    pass
+
+
 def _normalize_datetime(value: datetime) -> str:
     if value.tzinfo is None or value.utcoffset() is None:
         raise ValueError("timestamp must be timezone-aware")
@@ -125,6 +157,16 @@ def _normalize_datetime(value: datetime) -> str:
 
 def _parse_datetime(value: str) -> datetime:
     return datetime.fromisoformat(value.replace("Z", "+00:00"))
+
+
+def _canonical_model_json(
+    value: ContextCapsuleEnvelope | SnapshotAuditOutcome,
+) -> str:
+    return json.dumps(
+        value.model_dump(mode="json"),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
 
 
 class SQLiteRepository:
@@ -678,6 +720,179 @@ class SQLiteRepository:
                 self._inject("recovery.after_update")
             return tuple(self._job_by_id(connection, job_id) for job_id in recovered_ids)
 
+    def publish_snapshot(
+        self,
+        *,
+        job_id: str,
+        owner: str,
+        lease_epoch: int,
+        candidate_snapshot: SnapshotEnvelope,
+        memberships: Sequence[SnapshotCapsuleMembership],
+        token_ceiling: int,
+        now: datetime,
+    ) -> PublishResult:
+        """Run ``TX_PUBLISH_SNAPSHOT`` with savepoint-isolated CAS conflict."""
+
+        if token_ceiling < 0:
+            raise ValueError("token_ceiling must be non-negative")
+        now_text = _normalize_datetime(now)
+        membership_tuple = tuple(memberships)
+        self._validate_candidate_memberships(candidate_snapshot, membership_tuple)
+
+        with self._factory.transaction(immediate=True) as connection:
+            fence_row = self._require_live_fence(
+                connection,
+                job_id=job_id,
+                owner=owner,
+                lease_epoch=lease_epoch,
+                now=now_text,
+            )
+            if CompactionJobState(fence_row["state"]) != (CompactionJobState.READY_TO_COMMIT):
+                raise JobTransitionError("publication requires a READY_TO_COMMIT Job")
+            if fence_row["candidate_snapshot_id"] != candidate_snapshot.snapshot_id:
+                raise JobTransitionError("candidate Snapshot id does not match the fenced Job")
+            if candidate_snapshot.state != SnapshotState.CANDIDATE:
+                raise JobTransitionError(
+                    "publication accepts only a worker-local CANDIDATE envelope"
+                )
+
+            job = self._job_by_id(connection, job_id)
+            if candidate_snapshot.session_key != job.session_key:
+                raise JobTransitionError("candidate Snapshot belongs to a different Job session")
+
+            if job.base_snapshot_id is None:
+                previous_snapshot = None
+                previous_memberships: tuple[SnapshotCapsuleMembership, ...] = ()
+            else:
+                previous_snapshot, previous_memberships = self._snapshot_bundle_by_id(
+                    connection,
+                    job.base_snapshot_id,
+                )
+            source_events = self._events_between(
+                connection,
+                session_key=job.session_key,
+                start_exclusive=(
+                    previous_snapshot.covered_event_end if previous_snapshot is not None else 0
+                ),
+                end_inclusive=job.target_high_water_mark,
+            )
+            candidate_capsules = tuple(membership.capsule for membership in membership_tuple)
+            report = validate_permanent(
+                previous_snapshot=previous_snapshot,
+                previous_capsules=tuple(membership.capsule for membership in previous_memberships),
+                candidate_snapshot=candidate_snapshot,
+                candidate_capsules=candidate_capsules,
+                source_events=source_events,
+                target_high_water_mark=job.target_high_water_mark,
+                token_ceiling=token_ceiling,
+            )
+            if not report.passed:
+                raise PublicationRejected(report)
+
+            committed_snapshot = SnapshotEnvelope.model_validate(
+                {
+                    **candidate_snapshot.model_dump(),
+                    "state": SnapshotState.COMMITTED,
+                    "committed_at": _parse_datetime(now_text),
+                }
+            )
+            self._inject("publish.before_savepoint")
+            connection.execute("SAVEPOINT publish_candidate")
+            conflict = False
+            try:
+                for membership in membership_tuple:
+                    self._insert_or_verify_capsule(
+                        connection,
+                        membership.capsule,
+                    )
+                    self._inject("publish.after_capsule")
+                self._insert_committed_snapshot(connection, committed_snapshot)
+                self._inject("publish.after_snapshot")
+                for membership in membership_tuple:
+                    connection.execute(
+                        """
+                        INSERT INTO snapshot_capsules (
+                            snapshot_id,
+                            ordinal,
+                            capsule_id,
+                            slot
+                        ) VALUES (?, ?, ?, ?)
+                        """,
+                        (
+                            committed_snapshot.snapshot_id,
+                            membership.ordinal,
+                            membership.capsule_id,
+                            membership.slot,
+                        ),
+                    )
+                    self._inject("publish.after_membership")
+                conflict = not self._cas_active_pointer(
+                    connection,
+                    job=job,
+                    snapshot=committed_snapshot,
+                    updated_at=now_text,
+                )
+            except sqlite3.IntegrityError:
+                conflict = True
+
+            if conflict:
+                connection.execute("ROLLBACK TO SAVEPOINT publish_candidate")
+                connection.execute("RELEASE SAVEPOINT publish_candidate")
+                superseded = self._finish_publish_job(
+                    connection,
+                    job=job,
+                    owner=owner,
+                    lease_epoch=lease_epoch,
+                    now=now_text,
+                    outcome=PublishOutcome.SUPERSEDED,
+                )
+                self._inject("publish.after_terminal")
+                winner, pointer_version, _ = self._active_snapshot_bundle(
+                    connection,
+                    job.session_key,
+                )
+                self._preserve_follow_up(
+                    connection,
+                    terminal_job=superseded,
+                    winner=winner,
+                    pointer_version=pointer_version,
+                    now=now_text,
+                )
+                self._inject("publish.after_follow_up")
+                return PublishResult(
+                    outcome=PublishOutcome.SUPERSEDED,
+                    job=superseded,
+                    winner=winner,
+                    pointer_version=pointer_version,
+                )
+
+            pointer_version = job.base_pointer_version + 1
+            self._inject("publish.after_pointer")
+            committed_job = self._finish_publish_job(
+                connection,
+                job=job,
+                owner=owner,
+                lease_epoch=lease_epoch,
+                now=now_text,
+                outcome=PublishOutcome.COMMITTED,
+            )
+            self._inject("publish.after_terminal")
+            self._preserve_follow_up(
+                connection,
+                terminal_job=committed_job,
+                winner=committed_snapshot,
+                pointer_version=pointer_version,
+                now=now_text,
+            )
+            self._inject("publish.after_follow_up")
+            connection.execute("RELEASE SAVEPOINT publish_candidate")
+            return PublishResult(
+                outcome=PublishOutcome.COMMITTED,
+                job=committed_job,
+                winner=committed_snapshot,
+                pointer_version=pointer_version,
+            )
+
     def _read_request_view(
         self,
         connection: sqlite3.Connection,
@@ -1084,6 +1299,399 @@ class SQLiteRepository:
         ):
             raise StaleLeaseError("worker does not own a matching unexpired lease")
         return row
+
+    @staticmethod
+    def _validate_candidate_memberships(
+        snapshot: SnapshotEnvelope,
+        memberships: tuple[SnapshotCapsuleMembership, ...],
+    ) -> None:
+        if not memberships:
+            raise RepositoryInvariantError("publication requires at least one Capsule membership")
+        if tuple(item.ordinal for item in memberships) != tuple(range(len(memberships))):
+            raise RepositoryInvariantError(
+                "candidate Capsule ordinals must be contiguous from zero"
+            )
+        if any(not item.slot.strip() for item in memberships):
+            raise RepositoryInvariantError("candidate Capsule membership slot must be non-empty")
+        capsule_ids = tuple(item.capsule_id for item in memberships)
+        if len(set(capsule_ids)) != len(capsule_ids):
+            raise RepositoryInvariantError("candidate Capsule membership ids must be unique")
+        if snapshot.capsule_ids != capsule_ids:
+            raise RepositoryInvariantError(
+                "candidate Snapshot ids disagree with ordered membership"
+            )
+
+    @staticmethod
+    def _snapshot_bundle_by_id(
+        connection: sqlite3.Connection,
+        snapshot_id: str,
+    ) -> tuple[SnapshotEnvelope, tuple[SnapshotCapsuleMembership, ...]]:
+        row = connection.execute(
+            """
+            SELECT
+                snapshot.*,
+                session.canonical_session_key_json
+            FROM snapshots AS snapshot
+            JOIN sessions AS session
+              ON session.session_key_hash = snapshot.session_key_hash
+            WHERE snapshot.snapshot_id = ?
+            """,
+            (snapshot_id,),
+        ).fetchone()
+        if row is None:
+            raise RepositoryInvariantError("Job base Snapshot is missing")
+        try:
+            session_key = SessionKey.model_validate_json(row["canonical_session_key_json"])
+        except ValueError as error:
+            raise RepositoryInvariantError("Snapshot SessionKey cannot be reconstructed") from error
+        memberships = SQLiteRepository._memberships_for_snapshot(
+            connection,
+            snapshot_id=snapshot_id,
+            session_key=session_key,
+        )
+        snapshot = SQLiteRepository._snapshot_from_row(
+            row,
+            session_key=session_key,
+            capsule_ids=tuple(item.capsule_id for item in memberships),
+        )
+        SQLiteRepository._validate_snapshot_memberships(snapshot, memberships)
+        return snapshot, memberships
+
+    @staticmethod
+    def _active_snapshot_bundle(
+        connection: sqlite3.Connection,
+        session_key: SessionKey,
+    ) -> tuple[
+        SnapshotEnvelope,
+        int,
+        tuple[SnapshotCapsuleMembership, ...],
+    ]:
+        row = connection.execute(
+            """
+            SELECT snapshot_id, pointer_version
+            FROM active_snapshots
+            WHERE session_key_hash = ?
+            """,
+            (session_key.session_key_hash,),
+        ).fetchone()
+        if row is None:
+            raise RepositoryInvariantError("publish conflict has no durable active winner")
+        snapshot, memberships = SQLiteRepository._snapshot_bundle_by_id(
+            connection,
+            str(row["snapshot_id"]),
+        )
+        if snapshot.session_key != session_key:
+            raise RepositoryInvariantError("publish winner belongs to another durable session")
+        return snapshot, int(row["pointer_version"]), memberships
+
+    @staticmethod
+    def _events_between(
+        connection: sqlite3.Connection,
+        *,
+        session_key: SessionKey,
+        start_exclusive: int,
+        end_inclusive: int,
+    ) -> tuple[EventEnvelope, ...]:
+        rows = connection.execute(
+            """
+            SELECT
+                event.*,
+                session.canonical_session_key_json
+            FROM journal_events AS event
+            JOIN sessions AS session
+              ON session.session_key_hash = event.session_key_hash
+            WHERE event.session_key_hash = ?
+              AND event.sequence > ?
+              AND event.sequence <= ?
+            ORDER BY event.sequence
+            """,
+            (
+                session_key.session_key_hash,
+                start_exclusive,
+                end_inclusive,
+            ),
+        ).fetchall()
+        return tuple(SQLiteRepository._event_from_row(row) for row in rows)
+
+    @staticmethod
+    def _insert_or_verify_capsule(
+        connection: sqlite3.Connection,
+        capsule: ContextCapsuleEnvelope,
+    ) -> None:
+        canonical_json = _canonical_model_json(capsule)
+        row = connection.execute(
+            """
+            SELECT *
+            FROM capsules
+            WHERE capsule_id = ?
+            """,
+            (capsule.capsule_id,),
+        ).fetchone()
+        if row is not None:
+            if (
+                row["session_key_hash"] != capsule.session_key.session_key_hash
+                or row["level"] != capsule.level.value
+                or int(row["covered_event_start"]) != capsule.covered_event_start
+                or int(row["covered_event_end"]) != capsule.covered_event_end
+                or row["canonical_capsule_json"] != canonical_json
+                or int(row["token_cost"]) != capsule.token_cost
+                or float(row["source_coverage"]) != capsule.quality.source_coverage
+                or row["created_at"] != _normalize_datetime(capsule.created_at)
+            ):
+                raise sqlite3.IntegrityError(
+                    "Capsule id conflicts with different immutable content"
+                )
+            return
+
+        connection.execute(
+            """
+            INSERT INTO capsules (
+                capsule_id,
+                session_key_hash,
+                level,
+                covered_event_start,
+                covered_event_end,
+                canonical_capsule_json,
+                token_cost,
+                source_coverage,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                capsule.capsule_id,
+                capsule.session_key.session_key_hash,
+                capsule.level.value,
+                capsule.covered_event_start,
+                capsule.covered_event_end,
+                canonical_json,
+                capsule.token_cost,
+                capsule.quality.source_coverage,
+                _normalize_datetime(capsule.created_at),
+            ),
+        )
+
+    @staticmethod
+    def _insert_committed_snapshot(
+        connection: sqlite3.Connection,
+        snapshot: SnapshotEnvelope,
+    ) -> None:
+        if snapshot.committed_at is None:
+            raise RepositoryInvariantError("committed Snapshot insert requires committed_at")
+        connection.execute(
+            """
+            INSERT INTO snapshots (
+                snapshot_id,
+                session_key_hash,
+                base_snapshot_id,
+                covered_event_end,
+                source_high_water_mark,
+                exact_anchor_ids_json,
+                rendered_context,
+                token_cost,
+                audit_outcome,
+                lifecycle_state,
+                created_at,
+                committed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMMITTED', ?, ?)
+            """,
+            (
+                snapshot.snapshot_id,
+                snapshot.session_key.session_key_hash,
+                snapshot.base_snapshot_id,
+                snapshot.covered_event_end,
+                snapshot.source_high_water_mark,
+                json.dumps(
+                    list(snapshot.exact_anchor_ids),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                snapshot.rendered_context,
+                snapshot.token_cost,
+                _canonical_model_json(snapshot.audit_outcome),
+                _normalize_datetime(snapshot.created_at),
+                _normalize_datetime(snapshot.committed_at),
+            ),
+        )
+
+    @staticmethod
+    def _cas_active_pointer(
+        connection: sqlite3.Connection,
+        *,
+        job: CompactionJobEnvelope,
+        snapshot: SnapshotEnvelope,
+        updated_at: str,
+    ) -> bool:
+        if job.base_snapshot_id is None:
+            cursor = connection.execute(
+                """
+                INSERT INTO active_snapshots (
+                    session_key_hash,
+                    snapshot_id,
+                    pointer_version,
+                    updated_at
+                )
+                SELECT ?, ?, 1, ?
+                WHERE NOT EXISTS (
+                    SELECT 1
+                    FROM active_snapshots
+                    WHERE session_key_hash = ?
+                )
+                """,
+                (
+                    job.session_key.session_key_hash,
+                    snapshot.snapshot_id,
+                    updated_at,
+                    job.session_key.session_key_hash,
+                ),
+            )
+            return cursor.rowcount == 1
+
+        cursor = connection.execute(
+            """
+            UPDATE active_snapshots
+            SET snapshot_id = ?,
+                pointer_version = pointer_version + 1,
+                updated_at = ?
+            WHERE session_key_hash = ?
+              AND snapshot_id = ?
+              AND pointer_version = ?
+            """,
+            (
+                snapshot.snapshot_id,
+                updated_at,
+                job.session_key.session_key_hash,
+                job.base_snapshot_id,
+                job.base_pointer_version,
+            ),
+        )
+        return cursor.rowcount == 1
+
+    @staticmethod
+    def _finish_publish_job(
+        connection: sqlite3.Connection,
+        *,
+        job: CompactionJobEnvelope,
+        owner: str,
+        lease_epoch: int,
+        now: str,
+        outcome: PublishOutcome,
+    ) -> CompactionJobEnvelope:
+        committed_at = now if outcome == PublishOutcome.COMMITTED else None
+        cursor = connection.execute(
+            """
+            UPDATE compaction_jobs
+            SET state = ?,
+                lease_owner = NULL,
+                lease_expires_at = NULL,
+                next_retry_at = NULL,
+                updated_at = ?,
+                committed_at = ?
+            WHERE job_id = ?
+              AND state = 'READY_TO_COMMIT'
+              AND candidate_snapshot_id = ?
+              AND lease_owner = ?
+              AND lease_epoch = ?
+              AND lease_expires_at > ?
+            """,
+            (
+                outcome.value,
+                now,
+                committed_at,
+                job.job_id,
+                job.candidate_snapshot_id,
+                owner,
+                lease_epoch,
+                now,
+            ),
+        )
+        if cursor.rowcount != 1:
+            raise StaleLeaseError("publication lost its fenced terminal transition")
+        return SQLiteRepository._job_by_id(connection, job.job_id)
+
+    @staticmethod
+    def _preserve_follow_up(
+        connection: sqlite3.Connection,
+        *,
+        terminal_job: CompactionJobEnvelope,
+        winner: SnapshotEnvelope,
+        pointer_version: int,
+        now: str,
+    ) -> None:
+        intent = terminal_job.intent_target_high_water_mark
+        if intent <= winner.covered_event_end:
+            return
+
+        existing = connection.execute(
+            """
+            SELECT job_id, intent_target_high_water_mark
+            FROM compaction_jobs
+            WHERE session_key_hash = ?
+              AND state IN (
+                  'PENDING',
+                  'LEASED',
+                  'COMPILING',
+                  'AUDITING',
+                  'READY_TO_COMMIT',
+                  'RETRY_WAIT'
+              )
+            """,
+            (terminal_job.session_key.session_key_hash,),
+        ).fetchone()
+        if existing is not None:
+            if intent > int(existing["intent_target_high_water_mark"]):
+                connection.execute(
+                    """
+                    UPDATE compaction_jobs
+                    SET intent_target_high_water_mark = ?,
+                        updated_at = ?
+                    WHERE job_id = ?
+                    """,
+                    (intent, now, existing["job_id"]),
+                )
+            return
+
+        digest = hashlib.sha256(
+            (f"{terminal_job.job_id}\0{winner.snapshot_id}\0{pointer_version}\0{intent}").encode()
+        ).hexdigest()
+        follow_up_id = f"followup-{digest[:32]}"
+        connection.execute(
+            """
+            INSERT INTO compaction_jobs (
+                job_id,
+                session_key_hash,
+                state,
+                target_high_water_mark,
+                intent_target_high_water_mark,
+                base_snapshot_id,
+                base_pointer_version,
+                candidate_snapshot_id,
+                lease_owner,
+                lease_epoch,
+                lease_expires_at,
+                attempt_count,
+                next_retry_at,
+                error_stage,
+                error_code,
+                error_message,
+                created_at,
+                updated_at,
+                committed_at
+            ) VALUES (
+                ?, ?, 'PENDING', ?, ?, ?, ?, NULL, NULL, 0, NULL, 0,
+                NULL, NULL, NULL, NULL, ?, ?, NULL
+            )
+            """,
+            (
+                follow_up_id,
+                terminal_job.session_key.session_key_hash,
+                intent,
+                intent,
+                winner.snapshot_id,
+                pointer_version,
+                now,
+                now,
+            ),
+        )
 
     @staticmethod
     def _find_idempotent_event(
