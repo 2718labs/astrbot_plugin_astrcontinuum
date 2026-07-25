@@ -621,3 +621,187 @@ def test_pointer_cas_loss_rolls_back_candidate_and_uses_winner_for_follow_up(
             """
         ).fetchone()
         assert tuple(follow_up) == ("PENDING", 2, "snapshot-1", 2)
+
+
+def test_dangling_source_is_rejected_by_permanent_gate_without_writes(
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    capture(store, 1)
+    original = capsule(1)
+    dangling = original.model_copy(
+        update={
+            "source_event_ids": ("missing-event",),
+            "goals": (
+                original.goals[0].model_copy(update={"source_event_ids": ("missing-event",)}),
+            ),
+            "exact_anchors": (
+                original.exact_anchors[0].model_copy(
+                    update={"source_event_ids": ("missing-event",)}
+                ),
+            ),
+        }
+    )
+    members = memberships(dangling)
+    snapshot = candidate_snapshot("snapshot-dangling", members, target=1)
+    job = ready_job(
+        store,
+        target=1,
+        candidate_snapshot_id=snapshot.snapshot_id,
+        job_id="job-1",
+    )
+
+    with pytest.raises(ac.PublicationRejected) as captured:
+        publish(store, job, snapshot, members)
+
+    assert ac.PermanentFailureCode.UNSUPPORTED_ACTIVE_SEMANTIC in (
+        captured.value.report.failure_codes
+    )
+    assert ac.PermanentFailureCode.SOURCE_COVERAGE_NOT_FULL in (captured.value.report.failure_codes)
+    with store.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM capsules").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM snapshots").fetchone()[0] == 0
+        assert connection.execute("SELECT state FROM compaction_jobs").fetchone()[0] == (
+            "READY_TO_COMMIT"
+        )
+
+
+def test_noncontiguous_membership_is_rejected_without_candidate_writes(
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    capture(store, 1)
+    item = capsule(1)
+    invalid_members = (
+        ac.SnapshotCapsuleMembership(
+            ordinal=1,
+            slot="memory",
+            capsule=item,
+        ),
+    )
+    snapshot = candidate_snapshot("snapshot-membership", invalid_members, target=1)
+    job = ready_job(
+        store,
+        target=1,
+        candidate_snapshot_id=snapshot.snapshot_id,
+        job_id="job-1",
+    )
+
+    with pytest.raises(ac.RepositoryInvariantError, match="ordinals"):
+        publish(store, job, snapshot, invalid_members)
+
+    with store.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM capsules").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM snapshots").fetchone()[0] == 0
+        assert connection.execute("SELECT state FROM compaction_jobs").fetchone()[0] == (
+            "READY_TO_COMMIT"
+        )
+
+
+def test_exact_anchor_list_mismatch_is_rejected_without_candidate_writes(
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    capture(store, 1)
+    item = capsule(1)
+    members = memberships(item)
+    snapshot = candidate_snapshot("snapshot-anchor-mismatch", members, target=1).model_copy(
+        update={"exact_anchor_ids": ("wrong-anchor",)}
+    )
+    job = ready_job(
+        store,
+        target=1,
+        candidate_snapshot_id=snapshot.snapshot_id,
+        job_id="job-1",
+    )
+
+    with pytest.raises(ac.PublicationRejected) as captured:
+        publish(store, job, snapshot, members)
+
+    assert ac.PermanentFailureCode.SNAPSHOT_ANCHOR_MISMATCH in (captured.value.report.failure_codes)
+    with store.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM capsules").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM snapshots").fetchone()[0] == 0
+        assert connection.execute("SELECT state FROM compaction_jobs").fetchone()[0] == (
+            "READY_TO_COMMIT"
+        )
+
+
+def test_immutable_capsule_collision_preserves_winner_and_supersedes_loser(
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    capture(store, 1)
+    conflicting = capsule(
+        1,
+        capsule_id="winner-capsule",
+        goal_id="loser-goal",
+        anchor_id="loser-anchor",
+    )
+    members = memberships(conflicting)
+    candidate = candidate_snapshot("snapshot-loser", members, target=1)
+    job = ready_job(
+        store,
+        target=1,
+        candidate_snapshot_id=candidate.snapshot_id,
+        job_id="job-loser",
+    )
+    winner = seed_winning_snapshot(store)
+
+    result = publish(store, job, candidate, members)
+
+    assert result.outcome == ac.PublishOutcome.SUPERSEDED
+    assert result.winner == winner
+    with store.factory.connection(read_only=True) as connection:
+        row = connection.execute(
+            """
+            SELECT canonical_capsule_json
+            FROM capsules
+            WHERE capsule_id = 'winner-capsule'
+            """
+        ).fetchone()
+        assert row[0] != canonical_json(conflicting)
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM snapshots WHERE snapshot_id = 'snapshot-loser'"
+            ).fetchone()[0]
+            == 0
+        )
+
+
+def test_stale_fence_precedes_candidate_membership_validation(tmp_path: Path) -> None:
+    store = repository(tmp_path)
+    capture(store, 1)
+    item = capsule(1)
+    invalid_members = (
+        ac.SnapshotCapsuleMembership(
+            ordinal=1,
+            slot="memory",
+            capsule=item,
+        ),
+    )
+    candidate = candidate_snapshot("snapshot-stale", invalid_members, target=1)
+    old_job = ready_job(
+        store,
+        target=1,
+        candidate_snapshot_id=candidate.snapshot_id,
+        job_id="job-1",
+    )
+    store.recover_expired_leases(now=LEASE_END)
+    reclaimed = store.claim_job(
+        worker_id="worker-2",
+        now=LEASE_END,
+        lease_expires_at=LEASE_END + timedelta(minutes=5),
+    )
+    assert reclaimed is not None
+
+    with pytest.raises(ac.StaleLeaseError):
+        publish(store, old_job, candidate, invalid_members)
+
+    with store.factory.connection(read_only=True) as connection:
+        row = connection.execute(
+            "SELECT state, lease_owner, lease_epoch FROM compaction_jobs"
+        ).fetchone()
+        assert tuple(row) == ("LEASED", "worker-2", 2)
+        assert connection.execute("SELECT count(*) FROM capsules").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM snapshots").fetchone()[0] == 0
