@@ -799,41 +799,56 @@ class SQLiteRepository:
             self._inject("publish.before_savepoint")
             connection.execute("SAVEPOINT publish_candidate")
             conflict = False
-            try:
-                for membership in membership_tuple:
+            for membership in membership_tuple:
+                try:
                     self._insert_or_verify_capsule(
                         connection,
                         membership.capsule,
                     )
-                    self._inject("publish.after_capsule")
-                self._insert_committed_snapshot(connection, committed_snapshot)
-                self._inject("publish.after_snapshot")
+                except sqlite3.IntegrityError:
+                    conflict = True
+                    break
+                self._inject("publish.after_capsule")
+
+            if not conflict:
+                try:
+                    self._insert_committed_snapshot(connection, committed_snapshot)
+                except sqlite3.IntegrityError:
+                    conflict = True
+                else:
+                    self._inject("publish.after_snapshot")
+
+            if not conflict:
                 for membership in membership_tuple:
-                    connection.execute(
-                        """
-                        INSERT INTO snapshot_capsules (
-                            snapshot_id,
-                            ordinal,
-                            capsule_id,
-                            slot
-                        ) VALUES (?, ?, ?, ?)
-                        """,
-                        (
-                            committed_snapshot.snapshot_id,
-                            membership.ordinal,
-                            membership.capsule_id,
-                            membership.slot,
-                        ),
-                    )
+                    try:
+                        connection.execute(
+                            """
+                            INSERT INTO snapshot_capsules (
+                                snapshot_id,
+                                ordinal,
+                                capsule_id,
+                                slot
+                            ) VALUES (?, ?, ?, ?)
+                            """,
+                            (
+                                committed_snapshot.snapshot_id,
+                                membership.ordinal,
+                                membership.capsule_id,
+                                membership.slot,
+                            ),
+                        )
+                    except sqlite3.IntegrityError:
+                        conflict = True
+                        break
                     self._inject("publish.after_membership")
+
+            if not conflict:
                 conflict = not self._cas_active_pointer(
                     connection,
                     job=job,
                     snapshot=committed_snapshot,
                     updated_at=now_text,
                 )
-            except sqlite3.IntegrityError:
-                conflict = True
 
             if conflict:
                 connection.execute("ROLLBACK TO SAVEPOINT publish_candidate")
