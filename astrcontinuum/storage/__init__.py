@@ -9,6 +9,14 @@ from .migrations import (
     MigrationPlanError,
     SQLiteMigrator,
 )
+from .repository import (
+    EventIdentityConflict,
+    IdempotencyConflict,
+    RepositoryConflict,
+    RepositoryError,
+    SessionIdentityConflict,
+    SQLiteRepository,
+)
 from .sqlite import (
     DATABASE_FILENAME,
     DEFAULT_BUSY_TIMEOUT_MS,
@@ -21,11 +29,17 @@ __all__ = [
     "DEFAULT_BUSY_TIMEOUT_MS",
     "MAX_BUSY_TIMEOUT_MS",
     "MIGRATIONS",
+    "EventIdentityConflict",
+    "IdempotencyConflict",
     "Migration",
     "MigrationApplyError",
     "MigrationChecksumError",
     "MigrationError",
     "MigrationPlanError",
+    "RepositoryConflict",
+    "RepositoryError",
     "SQLiteConnectionFactory",
     "SQLiteMigrator",
+    "SQLiteRepository",
+    "SessionIdentityConflict",
 ]

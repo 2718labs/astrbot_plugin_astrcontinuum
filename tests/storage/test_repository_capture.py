@@ -141,9 +141,7 @@ def test_exact_duplicate_is_idempotent_and_conflicting_replay_is_rejected(
         capture_user(repository, content="changed")
 
     with repository.factory.connection(read_only=True) as connection:
-        assert connection.execute(
-            "SELECT next_event_sequence FROM sessions"
-        ).fetchone()[0] == 2
+        assert connection.execute("SELECT next_event_sequence FROM sessions").fetchone()[0] == 2
         assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 1
 
 
@@ -164,9 +162,7 @@ def test_capture_failure_rolls_back_counter_and_event(tmp_path: Path) -> None:
     event = capture_user(repository)
     assert event.sequence == 1
     with repository.factory.connection(read_only=True) as connection:
-        assert connection.execute(
-            "SELECT next_event_sequence FROM sessions"
-        ).fetchone()[0] == 2
+        assert connection.execute("SELECT next_event_sequence FROM sessions").fetchone()[0] == 2
         assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 1
 
 
@@ -176,9 +172,7 @@ def test_concurrent_connections_allocate_one_contiguous_sequence(tmp_path: Path)
     barrier = Barrier(count)
 
     def capture(index: int) -> ac.EventEnvelope:
-        repository = repository_type()(
-            ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000)
-        )
+        repository = repository_type()(ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000))
         barrier.wait()
         return capture_user(
             repository,
@@ -266,7 +260,7 @@ def test_capture_rejects_invalid_tool_type_and_naive_time_without_writes(
             created_at=NOW,
         )
     with pytest.raises(ValueError):
-        capture_user(repository, created_at=datetime(2026, 7, 26, 12, 0))
+        capture_user(repository, created_at=NOW.replace(tzinfo=None))
 
     with repository.factory.connection(read_only=True) as connection:
         assert connection.execute("SELECT count(*) FROM sessions").fetchone()[0] == 0
