@@ -98,28 +98,38 @@ def capsule(sequence: int = 1) -> ac.ContextCapsuleEnvelope:
 
 def candidate_bundle(
     snapshot_id: str = "snapshot-1",
+    *,
+    items: tuple[ac.ContextCapsuleEnvelope, ...] | None = None,
+    base_snapshot_id: str | None = None,
+    target: int = 1,
 ) -> tuple[
     ac.SnapshotEnvelope,
     tuple[ac.SnapshotCapsuleMembership, ...],
 ]:
-    item = capsule()
-    memberships = (
+    items = items or (capsule(),)
+    memberships = tuple(
         ac.SnapshotCapsuleMembership(
-            ordinal=0,
+            ordinal=ordinal,
             slot="memory",
             capsule=item,
-        ),
+        )
+        for ordinal, item in enumerate(items)
     )
     snapshot = ac.SnapshotEnvelope(
         snapshot_id=snapshot_id,
         session_key=session_key(),
-        base_snapshot_id=None,
-        covered_event_end=1,
-        source_high_water_mark=1,
-        capsule_ids=(item.capsule_id,),
-        exact_anchor_ids=(item.exact_anchors[0].anchor_id,),
-        rendered_context="Snapshot through 1",
-        token_cost=item.token_cost,
+        base_snapshot_id=base_snapshot_id,
+        covered_event_end=target,
+        source_high_water_mark=target,
+        capsule_ids=tuple(item.capsule_id for item in items),
+        exact_anchor_ids=tuple(
+            anchor.anchor_id
+            for item in items
+            for anchor in item.exact_anchors
+            if anchor.status == ac.AnchorStatus.ACTIVE
+        ),
+        rendered_context=f"Snapshot through {target}",
+        token_cost=sum(item.token_cost for item in items),
         audit_outcome=ac.SnapshotAuditOutcome(
             mechanical_passed=True,
             semantic_status=ac.SemanticAuditStatus.NOT_RUN,
@@ -136,11 +146,13 @@ def ready_job(
     store: ac.SQLiteRepository,
     *,
     candidate_snapshot_id: str,
+    job_id: str = "job-1",
+    target: int = 1,
 ) -> ac.CompactionJobEnvelope:
     raised = store.raise_compaction_intent(
-        job_id="job-1",
+        job_id=job_id,
         session_key=session_key(),
-        target_high_water_mark=1,
+        target_high_water_mark=target,
         now=NOW,
     )
     assert raised is not None
@@ -216,6 +228,102 @@ def assert_candidate_writes_absent(
         assert connection.execute("SELECT count(*) FROM snapshots").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM snapshot_capsules").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM active_snapshots").fetchone()[0] == 0
+
+
+def pointer_conflict_setup(
+    data_dir: Path,
+) -> tuple[
+    ac.SQLiteConnectionFactory,
+    ac.SQLiteRepository,
+    ac.CompactionJobEnvelope,
+    ac.SnapshotEnvelope,
+    tuple[ac.SnapshotCapsuleMembership, ...],
+]:
+    factory = migrated_factory(data_dir)
+    stable = ac.SQLiteRepository(factory)
+    capture(stable, 1)
+    first_item = capsule(1)
+    first_snapshot, first_memberships = candidate_bundle(
+        items=(first_item,),
+    )
+    first_job = ready_job(
+        stable,
+        candidate_snapshot_id=first_snapshot.snapshot_id,
+    )
+    first_result = publish(stable, first_job, first_snapshot, first_memberships)
+    assert first_result.outcome == ac.PublishOutcome.COMMITTED
+
+    capture(stable, 2)
+    second_snapshot, second_memberships = candidate_bundle(
+        "snapshot-2",
+        items=(first_item, capsule(2)),
+        base_snapshot_id=first_snapshot.snapshot_id,
+        target=2,
+    )
+    second_job = ready_job(
+        stable,
+        candidate_snapshot_id=second_snapshot.snapshot_id,
+        job_id="job-2",
+        target=2,
+    )
+    with factory.transaction(immediate=True) as connection:
+        connection.execute(
+            """
+            UPDATE active_snapshots
+            SET pointer_version = 2
+            WHERE session_key_hash = ?
+            """,
+            (session_key().session_key_hash,),
+        )
+    return factory, stable, second_job, second_snapshot, second_memberships
+
+
+def assert_conflict_crash_rolled_back(
+    factory: ac.SQLiteConnectionFactory,
+    *,
+    expected_intent: int,
+) -> None:
+    with factory.connection(read_only=True) as connection:
+        job = connection.execute(
+            """
+            SELECT state, lease_owner, lease_epoch, candidate_snapshot_id,
+                   intent_target_high_water_mark
+            FROM compaction_jobs
+            WHERE job_id = 'job-2'
+            """
+        ).fetchone()
+        assert tuple(job) == (
+            "READY_TO_COMMIT",
+            "worker-1",
+            1,
+            "snapshot-2",
+            expected_intent,
+        )
+        pointer = connection.execute(
+            """
+            SELECT snapshot_id, pointer_version
+            FROM active_snapshots
+            """
+        ).fetchone()
+        assert tuple(pointer) == ("snapshot-1", 2)
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM snapshots WHERE snapshot_id = 'snapshot-2'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM capsules WHERE capsule_id = 'capsule-2'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM compaction_jobs WHERE state = 'PENDING'"
+            ).fetchone()[0]
+            == 0
+        )
 
 
 @pytest.mark.parametrize(
@@ -355,6 +463,66 @@ def test_follow_up_creation_crash_rolls_back_publication_and_pending_job(
             ("COMMITTED", 1, None, 0),
             ("PENDING", 2, "snapshot-1", 1),
         ]
+
+
+def test_conflict_terminal_crash_rolls_back_superseded_job(tmp_path: Path) -> None:
+    factory, stable, job, snapshot, memberships = pointer_conflict_setup(tmp_path)
+    crashing = ac.SQLiteRepository(
+        factory,
+        fault_injector=fail_at("publish.after_terminal"),
+    )
+
+    with pytest.raises(InjectedCrash, match="publish.after_terminal"):
+        publish(crashing, job, snapshot, memberships)
+
+    assert_conflict_crash_rolled_back(factory, expected_intent=2)
+    recovered = publish(stable, job, snapshot, memberships)
+    assert recovered.outcome == ac.PublishOutcome.SUPERSEDED
+    with factory.connection(read_only=True) as connection:
+        follow_up = connection.execute(
+            """
+            SELECT state, target_high_water_mark, base_snapshot_id, base_pointer_version
+            FROM compaction_jobs
+            WHERE state = 'PENDING'
+            """
+        ).fetchone()
+        assert tuple(follow_up) == ("PENDING", 2, "snapshot-1", 2)
+
+
+def test_conflict_follow_up_crash_rolls_back_superseded_and_pending_job(
+    tmp_path: Path,
+) -> None:
+    factory, stable, job, snapshot, memberships = pointer_conflict_setup(tmp_path)
+    capture(stable, 3)
+    raised = stable.raise_compaction_intent(
+        job_id="ignored",
+        session_key=session_key(),
+        target_high_water_mark=3,
+        now=NOW + timedelta(seconds=3),
+    )
+    assert raised is not None
+    assert raised.intent_target_high_water_mark == 3
+    crashing = ac.SQLiteRepository(
+        factory,
+        fault_injector=fail_at("publish.after_follow_up"),
+    )
+
+    with pytest.raises(InjectedCrash, match="publish.after_follow_up"):
+        publish(crashing, job, snapshot, memberships)
+
+    assert_conflict_crash_rolled_back(factory, expected_intent=3)
+    recovered = publish(stable, job, snapshot, memberships)
+    assert recovered.outcome == ac.PublishOutcome.SUPERSEDED
+    with factory.connection(read_only=True) as connection:
+        follow_up = connection.execute(
+            """
+            SELECT state, target_high_water_mark, intent_target_high_water_mark,
+                   base_snapshot_id, base_pointer_version
+            FROM compaction_jobs
+            WHERE state = 'PENDING'
+            """
+        ).fetchone()
+        assert tuple(follow_up) == ("PENDING", 3, 3, "snapshot-1", 2)
 
 
 def test_injected_integrity_error_is_not_misclassified_as_publish_conflict(
