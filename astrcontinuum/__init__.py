@@ -16,6 +16,8 @@ from .domain import (
     EventEnvelope,
     EventRole,
     EventType,
+    PermanentFailureCode,
+    PermanentValidationReport,
     SemanticAuditStatus,
     SemanticStatus,
     SessionKey,
@@ -23,6 +25,7 @@ from .domain import (
     SnapshotEnvelope,
     SnapshotState,
     SourceHook,
+    validate_permanent,
 )
 from .models import AssemblyTrace, AuditReport, Claim, ClaimStatus, ContextCapsule, ContextEvent, ExactAnchor, Snapshot
 
@@ -49,6 +52,8 @@ __all__ = [
     "EventRole",
     "EventType",
     "ExactAnchor",
+    "PermanentFailureCode",
+    "PermanentValidationReport",
     "SemanticAuditStatus",
     "SemanticStatus",
     "SessionKey",
@@ -57,4 +62,5 @@ __all__ = [
     "SnapshotEnvelope",
     "SnapshotState",
     "SourceHook",
+    "validate_permanent",
 ]

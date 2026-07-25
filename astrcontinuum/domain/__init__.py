@@ -20,6 +20,11 @@ from .snapshots import (
     SnapshotEnvelope,
     SnapshotState,
 )
+from .validation import (
+    PermanentFailureCode,
+    PermanentValidationReport,
+    validate_permanent,
+)
 
 __all__ = [
     "AnchorStatus",
@@ -37,6 +42,8 @@ __all__ = [
     "EventEnvelope",
     "EventRole",
     "EventType",
+    "PermanentFailureCode",
+    "PermanentValidationReport",
     "SemanticAuditStatus",
     "SemanticStatus",
     "SessionKey",
@@ -44,4 +51,5 @@ __all__ = [
     "SnapshotEnvelope",
     "SnapshotState",
     "SourceHook",
+    "validate_permanent",
 ]
