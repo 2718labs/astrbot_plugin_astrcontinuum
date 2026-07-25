@@ -1,58 +1,45 @@
-"""AstrContinuum domain package."""
-
-from .domain import (
+from .capsules import (
     AnchorStatus,
     AnchorType,
     CapsuleAnchor,
     CapsuleClaim,
     CapsuleLevel,
     CapsuleQuality,
-    CompactionJobEnvelope,
-    CompactionJobState,
     ContextCapsuleEnvelope,
     Decision,
     Dependency,
     Entity,
-    EventEnvelope,
-    EventRole,
-    EventType,
-    SemanticAuditStatus,
     SemanticStatus,
-    SessionKey,
+)
+from .events import EventEnvelope, EventRole, EventType, SourceHook
+from .identity import SessionKey
+from .jobs import CompactionJobEnvelope, CompactionJobState
+from .snapshots import (
+    SemanticAuditStatus,
     SnapshotAuditOutcome,
     SnapshotEnvelope,
     SnapshotState,
-    SourceHook,
 )
-from .models import AssemblyTrace, AuditReport, Claim, ClaimStatus, ContextCapsule, ContextEvent, ExactAnchor, Snapshot
 
 __all__ = [
     "AnchorStatus",
     "AnchorType",
-    "AssemblyTrace",
-    "AuditReport",
     "CapsuleAnchor",
     "CapsuleClaim",
     "CapsuleLevel",
     "CapsuleQuality",
-    "Claim",
-    "ClaimStatus",
     "CompactionJobEnvelope",
     "CompactionJobState",
-    "ContextCapsule",
     "ContextCapsuleEnvelope",
-    "ContextEvent",
     "Decision",
     "Dependency",
     "Entity",
     "EventEnvelope",
     "EventRole",
     "EventType",
-    "ExactAnchor",
     "SemanticAuditStatus",
     "SemanticStatus",
     "SessionKey",
-    "Snapshot",
     "SnapshotAuditOutcome",
     "SnapshotEnvelope",
     "SnapshotState",
