@@ -737,7 +737,6 @@ class SQLiteRepository:
             raise ValueError("token_ceiling must be non-negative")
         now_text = _normalize_datetime(now)
         membership_tuple = tuple(memberships)
-        self._validate_candidate_memberships(candidate_snapshot, membership_tuple)
 
         with self._factory.transaction(immediate=True) as connection:
             fence_row = self._require_live_fence(
@@ -759,6 +758,7 @@ class SQLiteRepository:
             job = self._job_by_id(connection, job_id)
             if candidate_snapshot.session_key != job.session_key:
                 raise JobTransitionError("candidate Snapshot belongs to a different Job session")
+            self._validate_candidate_memberships(candidate_snapshot, membership_tuple)
 
             if job.base_snapshot_id is None:
                 previous_snapshot = None
