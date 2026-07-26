@@ -38,10 +38,16 @@ from .models import (
     Snapshot,
 )
 from .runtime import (
+    RUNTIME_SLOT_PRIORITY,
+    CandidateBlock,
+    CandidateKind,
     RequestViewErrorCode,
     RequestViewInvariantError,
     RequestViewSource,
+    RetrievalConfig,
+    RuntimeSlot,
     read_request_view,
+    select_candidates,
 )
 from .storage import (
     MIGRATIONS,
@@ -70,10 +76,13 @@ from .storage import (
 
 __all__ = [
     "MIGRATIONS",
+    "RUNTIME_SLOT_PRIORITY",
     "AnchorStatus",
     "AnchorType",
     "AssemblyTrace",
     "AuditReport",
+    "CandidateBlock",
+    "CandidateKind",
     "CapsuleAnchor",
     "CapsuleClaim",
     "CapsuleLevel",
@@ -112,6 +121,8 @@ __all__ = [
     "RequestViewErrorCode",
     "RequestViewInvariantError",
     "RequestViewSource",
+    "RetrievalConfig",
+    "RuntimeSlot",
     "SQLiteConnectionFactory",
     "SQLiteMigrator",
     "SQLiteRepository",
@@ -127,5 +138,6 @@ __all__ = [
     "SourceHook",
     "StaleLeaseError",
     "read_request_view",
+    "select_candidates",
     "validate_permanent",
 ]
