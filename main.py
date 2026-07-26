@@ -434,7 +434,13 @@ class AstrContinuumPlugin(Star):
         tool: Any,
         tool_args: Any,
     ) -> None:
-        """Write only the authoritative tool-call event."""
+        """Write only the authoritative tool-call event.
+
+        Args:
+            event: Current AstrBot message event.
+            tool: Tool descriptor supplied by AstrBot.
+            tool_args: Tool arguments supplied by the agent runner.
+        """
 
         state = self._state(event)
         bridge = self._bridge
@@ -466,7 +472,14 @@ class AstrContinuumPlugin(Star):
         tool_args: Any,
         tool_result: Any,
     ) -> None:
-        """Write only the authoritative tool-result event."""
+        """Write only the authoritative tool-result event.
+
+        Args:
+            event: Current AstrBot message event.
+            tool: Tool descriptor supplied by AstrBot.
+            tool_args: Tool arguments supplied by the agent runner.
+            tool_result: Authoritative result returned by the tool.
+        """
 
         state = self._state(event)
         bridge = self._bridge
