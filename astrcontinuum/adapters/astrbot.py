@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import importlib
 import json
@@ -12,8 +13,25 @@ from datetime import datetime, timezone
 from enum import Enum
 from typing import NoReturn
 
-from ..domain import SessionKey, SourceHook
-from ..runtime import TokenCounter
+from ..domain import (
+    CompactionJobEnvelope,
+    EventEnvelope,
+    EventType,
+    SessionKey,
+    SourceHook,
+)
+from ..runtime import (
+    AssemblyResult,
+    BudgetConfig,
+    CandidateBlock,
+    RetrievalConfig,
+    TokenCounter,
+    Utf8ByteTokenCounter,
+    assemble,
+    read_request_view,
+    select_candidates,
+)
+from ..storage import RequestView, SQLiteRepository
 
 _MESSAGE_MODULE = "astrbot.core.agent.message"
 _NO_RESULT = object()
@@ -45,6 +63,8 @@ class AdapterErrorCode(str, Enum):
     PROJECTION_API_UNAVAILABLE = "PROJECTION_API_UNAVAILABLE"
     PROJECTION_BUILD_FAILED = "PROJECTION_BUILD_FAILED"
     OPAQUE_TOKEN_COUNT_INVALID = "OPAQUE_TOKEN_COUNT_INVALID"
+    JOURNAL_CONTENT_INVALID = "JOURNAL_CONTENT_INVALID"
+    COMPACTION_TARGET_INVALID = "COMPACTION_TARGET_INVALID"
 
 
 @dataclass(frozen=True, slots=True)
@@ -118,6 +138,17 @@ class ProjectionBuild:
 
     objects: tuple[object, ...] = field(repr=False)
     fault: AdapterFault | None
+
+
+@dataclass(frozen=True, slots=True)
+class PreparedRequest:
+    """Request-local durable view and AC-owned fallback candidates."""
+
+    turn: HostTurnIdentity = field(repr=False)
+    current_input: str = field(repr=False)
+    user_event: EventEnvelope = field(repr=False)
+    view: RequestView = field(repr=False)
+    candidates: tuple[CandidateBlock, ...] = field(repr=False)
 
 
 def _raise(
@@ -550,3 +581,228 @@ def estimate_opaque_token_cost(
                 )
             total += value
     return total
+
+
+class AstrBotHookBridge:
+    """Async Hook bridge over the synchronous canonical SQLite repository."""
+
+    def __init__(
+        self,
+        repository: SQLiteRepository,
+        *,
+        retrieval_config: RetrievalConfig | None = None,
+        budget_config: BudgetConfig | None = None,
+        counter: TokenCounter | None = None,
+    ) -> None:
+        self._repository = repository
+        self._retrieval_config = retrieval_config or RetrievalConfig()
+        self._budget_config = budget_config or BudgetConfig()
+        self._counter = counter or Utf8ByteTokenCounter()
+
+    @property
+    def repository(self) -> SQLiteRepository:
+        return self._repository
+
+    def _content_cost(self, content: str) -> int:
+        if not isinstance(content, str):
+            _raise(
+                AdapterErrorCode.JOURNAL_CONTENT_INVALID,
+                AdapterStage.IDENTITY,
+            )
+        try:
+            value = self._counter.count_text(content)
+        except Exception:  # noqa: BLE001 - counter details stay private
+            _raise(
+                AdapterErrorCode.OPAQUE_TOKEN_COUNT_INVALID,
+                AdapterStage.OPAQUE_COST,
+            )
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            _raise(
+                AdapterErrorCode.OPAQUE_TOKEN_COUNT_INVALID,
+                AdapterStage.OPAQUE_COST,
+            )
+        return value
+
+    async def prepare_request(self, event: object, request: object) -> PreparedRequest:
+        """Capture the sole user event, read one view, and prepare fallback candidates."""
+
+        turn = extract_host_turn_identity(event, request)
+        current_input = getattr(request, "prompt", None)
+        if not isinstance(current_input, str):
+            _raise(
+                AdapterErrorCode.JOURNAL_CONTENT_INVALID,
+                AdapterStage.IDENTITY,
+            )
+        identity = deterministic_event_identity(turn, SourceHook.ON_LLM_REQUEST)
+        user_event = await asyncio.to_thread(
+            self._repository.capture_user_event,
+            event_id=identity.event_id,
+            session_key=turn.session_key,
+            content=current_input,
+            idempotency_key=identity.idempotency_key,
+            token_count=self._content_cost(current_input),
+            created_at=turn.created_at,
+        )
+        view = await asyncio.to_thread(
+            read_request_view,
+            self._repository,
+            turn.session_key,
+        )
+        candidates = tuple(
+            candidate
+            for candidate in select_candidates(
+                view,
+                current_input,
+                self._retrieval_config,
+            )
+            if user_event.event_id not in candidate.source_event_ids
+        )
+        return PreparedRequest(
+            turn=turn,
+            current_input=current_input,
+            user_event=user_event,
+            view=view,
+            candidates=candidates,
+        )
+
+    def assemble_prepared(
+        self,
+        prepared: PreparedRequest,
+        *,
+        opaque_token_cost: int,
+        fixed_required_cost: int,
+    ) -> AssemblyResult:
+        """Apply canonical budget arithmetic after foreign projections have run."""
+
+        return assemble(
+            prepared.view,
+            prepared.candidates,
+            current_input=prepared.current_input,
+            opaque_token_cost=opaque_token_cost,
+            fixed_required_cost=fixed_required_cost,
+            counter=self._counter,
+            config=self._budget_config,
+        )
+
+    async def capture_assistant(
+        self,
+        prepared: PreparedRequest,
+        content: str,
+    ) -> EventEnvelope:
+        """Capture the sole authoritative assistant completion."""
+
+        identity = deterministic_event_identity(
+            prepared.turn,
+            SourceHook.ON_AGENT_DONE,
+        )
+        return await asyncio.to_thread(
+            self._repository.capture_assistant_event,
+            event_id=identity.event_id,
+            session_key=prepared.turn.session_key,
+            content=content,
+            idempotency_key=identity.idempotency_key,
+            token_count=self._content_cost(content),
+            created_at=prepared.turn.created_at,
+        )
+
+    async def capture_tool_call(
+        self,
+        prepared: PreparedRequest,
+        tool: object,
+        tool_args: object,
+        *,
+        ordinal: int,
+    ) -> EventEnvelope:
+        """Capture the sole authoritative tool-call fact."""
+
+        metadata = canonical_tool_metadata(tool, tool_args)
+        return await self._capture_tool(
+            prepared,
+            metadata,
+            event_type=EventType.TOOL_CALL,
+            source_hook=SourceHook.ON_USING_LLM_TOOL,
+            ordinal=ordinal,
+        )
+
+    async def capture_tool_result(
+        self,
+        prepared: PreparedRequest,
+        tool: object,
+        tool_args: object,
+        tool_result: object,
+        *,
+        ordinal: int,
+    ) -> EventEnvelope:
+        """Capture the sole authoritative tool-result fact."""
+
+        metadata = canonical_tool_metadata(
+            tool,
+            tool_args,
+            tool_result=tool_result,
+        )
+        return await self._capture_tool(
+            prepared,
+            metadata,
+            event_type=EventType.TOOL_RESULT,
+            source_hook=SourceHook.ON_LLM_TOOL_RESPOND,
+            ordinal=ordinal,
+        )
+
+    async def _capture_tool(
+        self,
+        prepared: PreparedRequest,
+        metadata: str,
+        *,
+        event_type: EventType,
+        source_hook: SourceHook,
+        ordinal: int,
+    ) -> EventEnvelope:
+        identity = deterministic_event_identity(
+            prepared.turn,
+            source_hook,
+            ordinal=ordinal,
+            canonical_metadata=metadata,
+        )
+        return await asyncio.to_thread(
+            self._repository.capture_tool_event,
+            event_id=identity.event_id,
+            session_key=prepared.turn.session_key,
+            event_type=event_type,
+            content=metadata,
+            idempotency_key=identity.idempotency_key,
+            token_count=self._content_cost(metadata),
+            created_at=prepared.turn.created_at,
+        )
+
+    async def raise_compaction_intent(
+        self,
+        prepared: PreparedRequest,
+        *,
+        target_high_water_mark: int,
+    ) -> CompactionJobEnvelope | None:
+        """Raise one deterministic, bounded durable intent without waiting for work."""
+
+        if (
+            isinstance(target_high_water_mark, bool)
+            or not isinstance(target_high_water_mark, int)
+            or target_high_water_mark < 1
+        ):
+            _raise(
+                AdapterErrorCode.COMPACTION_TARGET_INVALID,
+                AdapterStage.EVENT_IDENTITY,
+            )
+        payload = _canonical_json(
+            {
+                "host_message_id": prepared.turn.host_message_id,
+                "session_key_hash": prepared.turn.session_key.session_key_hash,
+                "target_high_water_mark": target_high_water_mark,
+            }
+        )
+        job_id = "job:" + hashlib.sha256(payload.encode("utf-8")).hexdigest()
+        return await asyncio.to_thread(
+            self._repository.raise_compaction_intent,
+            job_id=job_id,
+            session_key=prepared.turn.session_key,
+            target_high_water_mark=target_high_water_mark,
+            now=prepared.turn.created_at,
+        )
