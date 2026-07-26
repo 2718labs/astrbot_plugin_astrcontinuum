@@ -2,10 +2,18 @@
 
 from . import runtime as _runtime
 from .compaction import (
+    CompilationCandidate,
+    CompilationRequest,
+    CompilerBackend,
+    CompilerErrorCode,
+    CompilerInvariantError,
+    CompilerOutput,
     EventSegment,
     SegmentBoundaryReason,
     SegmenterConfig,
+    compile_candidate,
     segment,
+    validate_candidate,
 )
 from .domain import (
     AnchorStatus,
@@ -109,6 +117,12 @@ __all__ = [
     "ClaimStatus",
     "CompactionJobEnvelope",
     "CompactionJobState",
+    "CompilationCandidate",
+    "CompilationRequest",
+    "CompilerBackend",
+    "CompilerErrorCode",
+    "CompilerInvariantError",
+    "CompilerOutput",
     "ContextCapsule",
     "ContextCapsuleEnvelope",
     "ContextEvent",
@@ -167,9 +181,11 @@ __all__ = [
     "SnapshotState",
     "SourceHook",
     "StaleLeaseError",
+    "compile_candidate",
     "read_request_view",
     "runtime_assemble",
     "segment",
     "select_candidates",
+    "validate_candidate",
     "validate_permanent",
 ]

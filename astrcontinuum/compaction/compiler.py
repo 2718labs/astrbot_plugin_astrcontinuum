@@ -1,0 +1,280 @@
+from __future__ import annotations
+
+import hashlib
+import json
+from collections.abc import Sequence
+from datetime import datetime
+
+from ..domain.capsules import AnchorStatus, ContextCapsuleEnvelope
+from ..domain.events import EventEnvelope
+from ..domain.identity import SessionKey
+from ..domain.snapshots import (
+    SemanticAuditStatus,
+    SnapshotAuditOutcome,
+    SnapshotEnvelope,
+    SnapshotState,
+)
+from ..domain.validation import PermanentValidationReport
+from ..runtime.types import TokenCounter
+from ..storage.repository import SnapshotCapsuleMembership
+from .segmenter import segment
+from .types import (
+    CompilationCandidate,
+    CompilationRequest,
+    CompilerBackend,
+    CompilerErrorCode,
+    CompilerInvariantError,
+    CompilerOutput,
+    SegmenterConfig,
+)
+from .validator import validate_candidate
+
+_SNAPSHOT_ID_SCHEMA_TAG = "astrcontinuum.compilation-candidate.v1"
+_MEMORY_MEMBERSHIP_SLOT = "memory"
+
+
+async def compile_candidate(
+    *,
+    base_snapshot: SnapshotEnvelope | None,
+    base_capsules: Sequence[ContextCapsuleEnvelope],
+    source_events: Sequence[EventEnvelope],
+    target_high_water_mark: int,
+    token_ceiling: int,
+    backend: CompilerBackend,
+    counter: TokenCounter,
+    now: datetime,
+    segmenter_config: SegmenterConfig,
+    preferred_end_sequences: Sequence[int] = (),
+) -> CompilationCandidate:
+    base_capsule_tuple = tuple(base_capsules)
+    source_event_tuple = tuple(source_events)
+    session_key = _validate_inputs(
+        base_snapshot=base_snapshot,
+        base_capsules=base_capsule_tuple,
+        source_events=source_event_tuple,
+        target_high_water_mark=target_high_water_mark,
+        token_ceiling=token_ceiling,
+        now=now,
+        segmenter_config=segmenter_config,
+    )
+    segments = segment(
+        source_event_tuple,
+        config=segmenter_config,
+        preferred_end_sequences=preferred_end_sequences,
+    )
+    request = CompilationRequest(
+        base_snapshot=base_snapshot,
+        base_capsules=base_capsule_tuple,
+        source_events=source_event_tuple,
+        segments=segments,
+        target_high_water_mark=target_high_water_mark,
+        token_ceiling=token_ceiling,
+    )
+
+    try:
+        output = await backend.compile(request)
+    except Exception:  # noqa: BLE001 - adapter boundary maps arbitrary failures.
+        raise CompilerInvariantError(CompilerErrorCode.BACKEND_FAILURE) from None
+
+    candidate_capsules, rendered_context = _validate_backend_output(output)
+    try:
+        token_cost = counter.count_text(rendered_context)
+    except Exception:  # noqa: BLE001 - adapter boundary maps arbitrary failures.
+        raise CompilerInvariantError(CompilerErrorCode.TOKEN_COUNTER_FAILURE) from None
+    if isinstance(token_cost, bool) or not isinstance(token_cost, int) or token_cost < 0:
+        raise CompilerInvariantError(CompilerErrorCode.TOKEN_COUNTER_INVALID)
+
+    active_anchor_ids = _active_anchor_ids(candidate_capsules)
+    try:
+        snapshot_id = _build_snapshot_id(
+            session_key=session_key,
+            base_snapshot_id=base_snapshot.snapshot_id if base_snapshot is not None else None,
+            target_high_water_mark=target_high_water_mark,
+            capsules=candidate_capsules,
+            active_anchor_ids=active_anchor_ids,
+            rendered_context=rendered_context,
+            token_cost=token_cost,
+        )
+        candidate_snapshot = SnapshotEnvelope(
+            snapshot_id=snapshot_id,
+            session_key=session_key,
+            base_snapshot_id=base_snapshot.snapshot_id if base_snapshot is not None else None,
+            covered_event_end=target_high_water_mark,
+            source_high_water_mark=target_high_water_mark,
+            capsule_ids=tuple(item.capsule_id for item in candidate_capsules),
+            exact_anchor_ids=active_anchor_ids,
+            rendered_context=rendered_context,
+            token_cost=token_cost,
+            audit_outcome=SnapshotAuditOutcome(
+                mechanical_passed=True,
+                semantic_status=SemanticAuditStatus.NOT_RUN,
+                failure_codes=(),
+            ),
+            state=SnapshotState.CANDIDATE,
+            created_at=now,
+            committed_at=None,
+        )
+    except (TypeError, ValueError):
+        raise CompilerInvariantError(CompilerErrorCode.BACKEND_OUTPUT_INVALID) from None
+
+    memberships = tuple(
+        SnapshotCapsuleMembership(
+            ordinal=ordinal,
+            slot=_MEMORY_MEMBERSHIP_SLOT,
+            capsule=item,
+        )
+        for ordinal, item in enumerate(candidate_capsules)
+    )
+    try:
+        report = validate_candidate(
+            base_snapshot=base_snapshot,
+            base_capsules=base_capsule_tuple,
+            candidate_snapshot=candidate_snapshot,
+            candidate_capsules=candidate_capsules,
+            source_events=source_event_tuple,
+            target_high_water_mark=target_high_water_mark,
+            token_ceiling=token_ceiling,
+        )
+    except Exception:  # noqa: BLE001 - validator boundary maps arbitrary failures.
+        raise CompilerInvariantError(CompilerErrorCode.PERMANENT_VALIDATOR_FAILURE) from None
+    if not isinstance(report, PermanentValidationReport):
+        raise CompilerInvariantError(CompilerErrorCode.PERMANENT_VALIDATOR_FAILURE)
+    if not report.passed:
+        raise CompilerInvariantError(
+            CompilerErrorCode.PERMANENT_VALIDATION_FAILED,
+            report=report,
+        )
+
+    return CompilationCandidate(
+        snapshot=candidate_snapshot,
+        memberships=memberships,
+        segments=segments,
+        permanent_report=report,
+    )
+
+
+def _validate_inputs(
+    *,
+    base_snapshot: SnapshotEnvelope | None,
+    base_capsules: tuple[ContextCapsuleEnvelope, ...],
+    source_events: tuple[EventEnvelope, ...],
+    target_high_water_mark: object,
+    token_ceiling: object,
+    now: object,
+    segmenter_config: object,
+) -> SessionKey:
+    if (
+        isinstance(target_high_water_mark, bool)
+        or not isinstance(target_high_water_mark, int)
+        or target_high_water_mark < 1
+    ):
+        raise CompilerInvariantError(CompilerErrorCode.TARGET_INVALID)
+    if isinstance(token_ceiling, bool) or not isinstance(token_ceiling, int) or token_ceiling < 0:
+        raise CompilerInvariantError(CompilerErrorCode.TOKEN_CEILING_INVALID)
+    if not _is_aware_datetime(now):
+        raise CompilerInvariantError(CompilerErrorCode.NOW_INVALID)
+    if not isinstance(segmenter_config, SegmenterConfig):
+        raise CompilerInvariantError(CompilerErrorCode.SEGMENTER_CONFIG_INVALID)
+    if not source_events:
+        raise CompilerInvariantError(CompilerErrorCode.SOURCE_EVENTS_EMPTY)
+    if any(not isinstance(item, EventEnvelope) for item in source_events):
+        raise CompilerInvariantError(CompilerErrorCode.SOURCE_EVENTS_INVALID)
+
+    if base_snapshot is None:
+        if base_capsules:
+            raise CompilerInvariantError(CompilerErrorCode.BASE_CAPSULE_MISMATCH)
+        base_coverage = 0
+        session_key = source_events[0].session_key
+    else:
+        if (
+            not isinstance(base_snapshot, SnapshotEnvelope)
+            or base_snapshot.state is not SnapshotState.COMMITTED
+            or base_snapshot.covered_event_end != base_snapshot.source_high_water_mark
+        ):
+            raise CompilerInvariantError(CompilerErrorCode.BASE_INVALID)
+        if (
+            any(not isinstance(item, ContextCapsuleEnvelope) for item in base_capsules)
+            or base_snapshot.capsule_ids != tuple(item.capsule_id for item in base_capsules)
+            or base_snapshot.exact_anchor_ids != _active_anchor_ids(base_capsules)
+            or any(item.session_key != base_snapshot.session_key for item in base_capsules)
+        ):
+            raise CompilerInvariantError(CompilerErrorCode.BASE_CAPSULE_MISMATCH)
+        base_coverage = base_snapshot.covered_event_end
+        session_key = base_snapshot.session_key
+
+    if any(item.session_key != session_key for item in source_events):
+        raise CompilerInvariantError(CompilerErrorCode.SOURCE_SESSION_MISMATCH)
+    if (
+        target_high_water_mark <= base_coverage
+        or len(source_events) != target_high_water_mark - base_coverage
+        or any(
+            item.sequence != base_coverage + offset
+            for offset, item in enumerate(source_events, start=1)
+        )
+        or len({item.event_id for item in source_events}) != len(source_events)
+    ):
+        raise CompilerInvariantError(CompilerErrorCode.SOURCE_COVERAGE_MISMATCH)
+    return session_key
+
+
+def _validate_backend_output(
+    output: object,
+) -> tuple[tuple[ContextCapsuleEnvelope, ...], str]:
+    if not isinstance(output, CompilerOutput):
+        raise CompilerInvariantError(CompilerErrorCode.BACKEND_OUTPUT_INVALID)
+    if not isinstance(output.capsules, tuple) or not isinstance(output.rendered_context, str):
+        raise CompilerInvariantError(CompilerErrorCode.BACKEND_OUTPUT_INVALID)
+    if not output.capsules or not output.rendered_context:
+        raise CompilerInvariantError(CompilerErrorCode.BACKEND_OUTPUT_EMPTY)
+    if any(not isinstance(item, ContextCapsuleEnvelope) for item in output.capsules):
+        raise CompilerInvariantError(CompilerErrorCode.BACKEND_OUTPUT_INVALID)
+    return output.capsules, output.rendered_context
+
+
+def _active_anchor_ids(
+    capsules: Sequence[ContextCapsuleEnvelope],
+) -> tuple[str, ...]:
+    return tuple(
+        anchor.anchor_id
+        for capsule in capsules
+        for anchor in capsule.exact_anchors
+        if anchor.status is AnchorStatus.ACTIVE
+    )
+
+
+def _build_snapshot_id(
+    *,
+    session_key: SessionKey,
+    base_snapshot_id: str | None,
+    target_high_water_mark: int,
+    capsules: tuple[ContextCapsuleEnvelope, ...],
+    active_anchor_ids: tuple[str, ...],
+    rendered_context: str,
+    token_cost: int,
+) -> str:
+    identity_payload = {
+        "schema": _SNAPSHOT_ID_SCHEMA_TAG,
+        "session_key": session_key.canonical_json(),
+        "base_snapshot_id": base_snapshot_id,
+        "target_high_water_mark": target_high_water_mark,
+        "capsules": [item.model_dump(mode="json") for item in capsules],
+        "active_anchor_ids": list(active_anchor_ids),
+        "rendered_context": rendered_context,
+        "token_cost": token_cost,
+    }
+    canonical_json = json.dumps(
+        identity_payload,
+        ensure_ascii=False,
+        separators=(",", ":"),
+        sort_keys=True,
+    )
+    return hashlib.sha256(canonical_json.encode("utf-8")).hexdigest()
+
+
+def _is_aware_datetime(value: object) -> bool:
+    if not isinstance(value, datetime) or value.tzinfo is None:
+        return False
+    try:
+        return value.utcoffset() is not None
+    except Exception:  # noqa: BLE001 - custom tzinfo may execute user code.
+        return False
