@@ -71,6 +71,54 @@ def test_transaction_commits_on_success_and_rolls_back_on_exception(tmp_path: Pa
     assert values == ["committed"]
 
 
+def test_startup_exclusive_transaction_can_temporarily_disable_foreign_keys(
+    tmp_path: Path,
+) -> None:
+    factory = _factory(tmp_path)
+
+    with factory.startup_exclusive_transaction(enforce_foreign_keys=False) as connection:
+        assert connection.in_transaction is True
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 0
+        connection.execute("CREATE TABLE committed (value TEXT NOT NULL)")
+
+    with factory.connection() as connection:
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert (
+            connection.execute(
+                """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'committed'
+            """
+            ).fetchone()
+            is not None
+        )
+
+
+def test_startup_exclusive_transaction_rolls_back_schema_and_restores_policy(
+    tmp_path: Path,
+) -> None:
+    factory = _factory(tmp_path)
+
+    with (
+        pytest.raises(RuntimeError, match="stop"),
+        factory.startup_exclusive_transaction(enforce_foreign_keys=False) as connection,
+    ):
+        connection.execute("CREATE TABLE rolled_back (value TEXT NOT NULL)")
+        raise RuntimeError("stop")
+
+    with factory.connection() as connection:
+        assert connection.execute("PRAGMA foreign_keys").fetchone()[0] == 1
+        assert (
+            connection.execute(
+                """
+            SELECT 1 FROM sqlite_master
+            WHERE type = 'table' AND name = 'rolled_back'
+            """
+            ).fetchone()
+            is None
+        )
+
+
 def test_read_only_connection_can_read_but_cannot_mutate(tmp_path: Path) -> None:
     factory = _factory(tmp_path)
     with factory.transaction() as connection:
