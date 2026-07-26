@@ -1,6 +1,12 @@
 """AstrContinuum domain package."""
 
 from . import runtime as _runtime
+from .compaction import (
+    EventSegment,
+    SegmentBoundaryReason,
+    SegmenterConfig,
+    segment,
+)
 from .domain import (
     AnchorStatus,
     AnchorType,
@@ -112,6 +118,7 @@ __all__ = [
     "EventEnvelope",
     "EventIdentityConflict",
     "EventRole",
+    "EventSegment",
     "EventType",
     "ExactAnchor",
     "IdempotencyConflict",
@@ -147,6 +154,8 @@ __all__ = [
     "SQLiteConnectionFactory",
     "SQLiteMigrator",
     "SQLiteRepository",
+    "SegmentBoundaryReason",
+    "SegmenterConfig",
     "SemanticAuditStatus",
     "SemanticStatus",
     "SessionIdentityConflict",
@@ -160,6 +169,7 @@ __all__ = [
     "StaleLeaseError",
     "read_request_view",
     "runtime_assemble",
+    "segment",
     "select_candidates",
     "validate_permanent",
 ]
