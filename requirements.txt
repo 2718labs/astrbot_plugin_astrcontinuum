@@ -1,1 +1,2 @@
+cryptography>=42
 pydantic>=2.7,<3
