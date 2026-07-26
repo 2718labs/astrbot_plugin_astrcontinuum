@@ -8,6 +8,7 @@ from threading import Barrier
 import pytest
 
 import astrcontinuum as ac
+from tests.storage.security_testkit import secure_repository
 
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
 
@@ -26,8 +27,7 @@ def session_key(index: int = 1) -> ac.SessionKey:
 
 def repository(data_dir: Path) -> ac.SQLiteRepository:
     factory = ac.SQLiteConnectionFactory(data_dir, busy_timeout_ms=5_000)
-    ac.SQLiteMigrator(factory).migrate()
-    return ac.SQLiteRepository(factory)
+    return secure_repository(factory)
 
 
 def create_claimed_job(
@@ -182,7 +182,7 @@ def test_fail_job_is_fenced_and_injected_failure_rolls_back(tmp_path: Path) -> N
         if name == "failure.after_update":
             raise RuntimeError("injected failure crash")
 
-    crashing = ac.SQLiteRepository(setup.factory, fault_injector=failpoint)
+    crashing = secure_repository(setup.factory, fault_injector=failpoint)
     with pytest.raises(RuntimeError, match="injected failure crash"):
         crashing.fail_job(
             job_id=leased.job_id,
@@ -305,7 +305,7 @@ def test_concurrent_recovery_has_one_effective_winner(tmp_path: Path) -> None:
     barrier = Barrier(2)
 
     def recover() -> tuple[ac.CompactionJobEnvelope, ...]:
-        store = ac.SQLiteRepository(ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000))
+        store = secure_repository(ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000))
         barrier.wait()
         return store.recover_expired_leases(now=NOW + timedelta(minutes=2))
 
@@ -332,7 +332,7 @@ def test_recovery_injected_failure_rolls_back_whole_scan(tmp_path: Path) -> None
             if calls == 2:
                 raise RuntimeError("injected recovery crash")
 
-    crashing = ac.SQLiteRepository(setup.factory, fault_injector=failpoint)
+    crashing = secure_repository(setup.factory, fault_injector=failpoint)
     with pytest.raises(RuntimeError, match="injected recovery crash"):
         crashing.recover_expired_leases(now=NOW + timedelta(minutes=2))
 

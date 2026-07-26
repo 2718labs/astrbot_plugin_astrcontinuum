@@ -10,7 +10,6 @@ import pytest
 import astrcontinuum as ac
 
 NOW = datetime(2026, 7, 27, 8, 0, tzinfo=timezone.utc)
-LEASE_END = NOW + timedelta(minutes=10)
 ACTIVE_KEY = bytes(range(32))
 NEW_KEY = bytes(reversed(range(32)))
 WRONG_KEY = bytes([37]) * 32
@@ -98,17 +97,11 @@ def _capsule(event: ac.EventEnvelope) -> ac.ContextCapsuleEnvelope:
     )
 
 
-def _publish_legacy_snapshot(
-    store: ac.SQLiteRepository,
+def _legacy_snapshot(
     event: ac.EventEnvelope,
 ) -> tuple[ac.ContextCapsuleEnvelope, ac.SnapshotEnvelope]:
     capsule = _capsule(event)
-    membership = ac.SnapshotCapsuleMembership(
-        ordinal=0,
-        slot="memory",
-        capsule=capsule,
-    )
-    candidate = ac.SnapshotEnvelope(
+    snapshot = ac.SnapshotEnvelope(
         snapshot_id="snapshot-1",
         session_key=event.session_key,
         base_snapshot_id=None,
@@ -123,48 +116,11 @@ def _publish_legacy_snapshot(
             semantic_status=ac.SemanticAuditStatus.NOT_RUN,
             failure_codes=(),
         ),
-        state=ac.SnapshotState.CANDIDATE,
+        state=ac.SnapshotState.COMMITTED,
         created_at=NOW,
-        committed_at=None,
+        committed_at=NOW + timedelta(minutes=1),
     )
-    raised = store.raise_compaction_intent(
-        job_id="job-1",
-        session_key=event.session_key,
-        target_high_water_mark=event.sequence,
-        now=NOW,
-    )
-    assert raised is not None
-    leased = store.claim_job(
-        worker_id="worker-1",
-        now=NOW,
-        lease_expires_at=LEASE_END,
-    )
-    assert leased is not None
-    compiling = store.transition_job(
-        job_id=leased.job_id,
-        owner="worker-1",
-        lease_epoch=leased.lease_epoch,
-        to_state=ac.CompactionJobState.COMPILING,
-        now=NOW + timedelta(seconds=1),
-    )
-    ready = store.transition_job(
-        job_id=compiling.job_id,
-        owner="worker-1",
-        lease_epoch=compiling.lease_epoch,
-        to_state=ac.CompactionJobState.READY_TO_COMMIT,
-        candidate_snapshot_id=candidate.snapshot_id,
-        now=NOW + timedelta(seconds=2),
-    )
-    published = store.publish_snapshot(
-        job_id=ready.job_id,
-        owner="worker-1",
-        lease_epoch=ready.lease_epoch,
-        candidate_snapshot=candidate,
-        memberships=(membership,),
-        token_ceiling=1_000,
-        now=NOW + timedelta(minutes=1),
-    )
-    return capsule, published.winner
+    return capsule, snapshot
 
 
 def _seed_legacy_database(
@@ -177,17 +133,170 @@ def _seed_legacy_database(
     ac.SnapshotEnvelope,
 ]:
     factory = _factory(data_dir)
-    store = ac.SQLiteRepository(factory)
     key = _session_key()
-    event = store.capture_user_event(
+    event = ac.EventEnvelope.create(
         event_id="event-1",
         session_key=key,
+        sequence=1,
+        event_type=ac.EventType.USER_MESSAGE,
         content=f"{PLAINTEXT_MARKER}-message",
         idempotency_key="request-1",
         token_count=5,
         created_at=NOW,
     )
-    capsule, snapshot = _publish_legacy_snapshot(store, event)
+    capsule, snapshot = _legacy_snapshot(event)
+    timestamp = NOW.isoformat(timespec="microseconds").replace("+00:00", "Z")
+    committed_at = (
+        snapshot.committed_at.isoformat(timespec="microseconds").replace(
+            "+00:00",
+            "Z",
+        )
+        if snapshot.committed_at is not None
+        else None
+    )
+    with factory.transaction(immediate=True) as connection:
+        connection.execute(
+            """
+            INSERT INTO sessions (
+                session_key_hash,
+                canonical_session_key_json,
+                platform_instance_id,
+                message_type,
+                session_id,
+                group_id,
+                user_id,
+                conversation_id,
+                persona_id,
+                next_event_sequence,
+                created_at,
+                updated_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 2, ?, ?)
+            """,
+            (
+                key.session_key_hash,
+                key.canonical_json(),
+                key.platform_instance_id,
+                key.message_type,
+                key.session_id,
+                key.group_id,
+                key.user_id,
+                key.conversation_id,
+                key.persona_id,
+                timestamp,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO journal_events (
+                event_id,
+                session_key_hash,
+                sequence,
+                event_type,
+                role,
+                content,
+                source_hook,
+                idempotency_key,
+                token_count,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                event.event_id,
+                key.session_key_hash,
+                event.sequence,
+                event.event_type.value,
+                event.role.value,
+                event.content,
+                event.source_hook.value,
+                event.idempotency_key,
+                event.token_count,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO capsules (
+                capsule_id,
+                session_key_hash,
+                level,
+                covered_event_start,
+                covered_event_end,
+                canonical_capsule_json,
+                token_cost,
+                source_coverage,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                capsule.capsule_id,
+                key.session_key_hash,
+                capsule.level.value,
+                capsule.covered_event_start,
+                capsule.covered_event_end,
+                _canonical_model_json(capsule),
+                capsule.token_cost,
+                capsule.quality.source_coverage,
+                timestamp,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO snapshots (
+                snapshot_id,
+                session_key_hash,
+                base_snapshot_id,
+                covered_event_end,
+                source_high_water_mark,
+                exact_anchor_ids_json,
+                rendered_context,
+                token_cost,
+                audit_outcome,
+                lifecycle_state,
+                created_at,
+                committed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMMITTED', ?, ?)
+            """,
+            (
+                snapshot.snapshot_id,
+                key.session_key_hash,
+                snapshot.base_snapshot_id,
+                snapshot.covered_event_end,
+                snapshot.source_high_water_mark,
+                json.dumps(
+                    list(snapshot.exact_anchor_ids),
+                    ensure_ascii=False,
+                    separators=(",", ":"),
+                ),
+                snapshot.rendered_context,
+                snapshot.token_cost,
+                _canonical_model_json(snapshot.audit_outcome),
+                timestamp,
+                committed_at,
+            ),
+        )
+        connection.execute(
+            """
+            INSERT INTO snapshot_capsules (
+                snapshot_id,
+                ordinal,
+                capsule_id,
+                slot
+            ) VALUES (?, 0, ?, 'memory')
+            """,
+            (snapshot.snapshot_id, capsule.capsule_id),
+        )
+        connection.execute(
+            """
+            INSERT INTO active_snapshots (
+                session_key_hash,
+                snapshot_id,
+                pointer_version,
+                updated_at
+            ) VALUES (?, ?, 1, ?)
+            """,
+            (key.session_key_hash, snapshot.snapshot_id, committed_at),
+        )
     return factory, key, event, capsule, snapshot
 
 
@@ -671,10 +780,27 @@ def test_legacy_precommit_failure_rolls_back_to_v01_readable_rows(
 
     _assert_code(raised, ac.SecurityErrorCode.STORAGE_MIGRATION_FAILED)
     assert _physical_storage(factory) == before
-    store = ac.SQLiteRepository(factory)
-    view = store.read_request_view(key)
-    assert view.snapshot is not None
-    assert view.snapshot.rendered_context == f"{PLAINTEXT_MARKER}-rendered"
+    with factory.connection(read_only=True) as connection:
+        session_row = connection.execute(
+            """
+            SELECT canonical_session_key_json
+            FROM sessions
+            WHERE session_key_hash = ?
+            """,
+            (key.session_key_hash,),
+        ).fetchone()
+        snapshot_row = connection.execute(
+            """
+            SELECT rendered_context
+            FROM snapshots
+            WHERE session_key_hash = ?
+            """,
+            (key.session_key_hash,),
+        ).fetchone()
+    assert session_row is not None
+    assert snapshot_row is not None
+    assert ac.SessionKey.model_validate_json(session_row["canonical_session_key_json"]) == key
+    assert snapshot_row["rendered_context"] == f"{PLAINTEXT_MARKER}-rendered"
 
 
 def test_postcommit_interruption_resumes_needs_scrub_without_retransform(

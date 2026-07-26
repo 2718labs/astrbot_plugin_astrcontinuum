@@ -10,6 +10,16 @@ import astrcontinuum as ac
 from astrcontinuum.compaction import CompactionWorker, CompactionWorkerConfig
 
 NOW = datetime(2026, 7, 27, 4, 0, tzinfo=timezone.utc)
+TEST_KEY = bytes(range(32))
+
+
+def storage_keys() -> ac.ResolvedKeyMaterial:
+    return ac.ResolvedKeyMaterial(
+        active=ac.KeyMaterial.from_raw(TEST_KEY),
+        previous=None,
+        source=ac.KeySource.ENVIRONMENT,
+        local_degraded=False,
+    )
 
 
 class FrozenClock:
@@ -97,8 +107,8 @@ def key(name: str = "worker") -> ac.SessionKey:
 
 def repository(path: Path) -> ac.SQLiteRepository:
     factory = ac.SQLiteConnectionFactory(path)
-    ac.SQLiteMigrator(factory).migrate()
-    return ac.SQLiteRepository(factory)
+    activation = ac.activate_storage_security(factory, storage_keys())
+    return ac.SQLiteRepository(factory, codec=activation.codec)
 
 
 def capture(

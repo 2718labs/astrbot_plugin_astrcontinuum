@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 import astrcontinuum as ac
+from tests.storage.security_testkit import secure_repository, storage_test_codec
 
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
 LEASE_END = NOW + timedelta(minutes=10)
@@ -27,8 +28,7 @@ def session_key(session_id: str = "session-1") -> ac.SessionKey:
 
 def repository(data_dir: Path) -> ac.SQLiteRepository:
     factory = ac.SQLiteConnectionFactory(data_dir, busy_timeout_ms=5_000)
-    ac.SQLiteMigrator(factory).migrate()
-    return ac.SQLiteRepository(factory)
+    return secure_repository(factory)
 
 
 def capture(
@@ -359,6 +359,7 @@ def seed_winning_snapshot(store: ac.SQLiteRepository) -> ac.SnapshotEnvelope:
         }
     )
     timestamp = "2026-07-26T12:00:00.000000Z"
+    codec = storage_test_codec()
     with store.factory.transaction(immediate=True) as connection:
         connection.execute(
             """
@@ -380,7 +381,12 @@ def seed_winning_snapshot(store: ac.SQLiteRepository) -> ac.SnapshotEnvelope:
                 item.level.value,
                 item.covered_event_start,
                 item.covered_event_end,
-                canonical_json(item),
+                codec.encrypt_object_json(
+                    "capsules",
+                    "canonical_capsule_json",
+                    item.capsule_id,
+                    canonical_json(item),
+                ),
                 item.token_cost,
                 item.quality.source_coverage,
                 timestamp,
@@ -406,10 +412,25 @@ def seed_winning_snapshot(store: ac.SQLiteRepository) -> ac.SnapshotEnvelope:
             (
                 committed.snapshot_id,
                 key.session_key_hash,
-                json.dumps(list(committed.exact_anchor_ids), separators=(",", ":")),
-                committed.rendered_context,
+                codec.encrypt_array_json(
+                    "snapshots",
+                    "exact_anchor_ids_json",
+                    committed.snapshot_id,
+                    json.dumps(list(committed.exact_anchor_ids), separators=(",", ":")),
+                ),
+                codec.encrypt_text(
+                    "snapshots",
+                    "rendered_context",
+                    committed.snapshot_id,
+                    committed.rendered_context,
+                ),
                 committed.token_cost,
-                canonical_json(committed.audit_outcome),
+                codec.encrypt_object_json(
+                    "snapshots",
+                    "audit_outcome",
+                    committed.snapshot_id,
+                    canonical_json(committed.audit_outcome),
+                ),
                 timestamp,
                 timestamp,
             ),
@@ -760,7 +781,13 @@ def test_immutable_capsule_collision_preserves_winner_and_supersedes_loser(
             WHERE capsule_id = 'winner-capsule'
             """
         ).fetchone()
-        assert row[0] != canonical_json(conflicting)
+        persisted = storage_test_codec().decrypt_object_json(
+            "capsules",
+            "canonical_capsule_json",
+            "winner-capsule",
+            row[0],
+        )
+        assert persisted != canonical_json(conflicting)
         assert (
             connection.execute(
                 "SELECT count(*) FROM snapshots WHERE snapshot_id = 'snapshot-loser'"
