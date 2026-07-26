@@ -65,6 +65,7 @@ class AdapterErrorCode(str, Enum):
     OPAQUE_TOKEN_COUNT_INVALID = "OPAQUE_TOKEN_COUNT_INVALID"
     JOURNAL_CONTENT_INVALID = "JOURNAL_CONTENT_INVALID"
     COMPACTION_TARGET_INVALID = "COMPACTION_TARGET_INVALID"
+    MESSAGE_BOUNDARY_INVALID = "MESSAGE_BOUNDARY_INVALID"
 
 
 @dataclass(frozen=True, slots=True)
@@ -581,6 +582,31 @@ def estimate_opaque_token_cost(
                 )
             total += value
     return total
+
+
+def _message_role(message: object) -> str | None:
+    value = (
+        message.get("role", None)
+        if isinstance(message, Mapping)
+        else getattr(message, "role", None)
+    )
+    return value if isinstance(value, str) else None
+
+
+def select_projection_boundaries(
+    messages: list[object],
+) -> tuple[tuple[object, ...], tuple[object, ...]]:
+    """Select the leading system objects and exact current user object by identity."""
+
+    if not isinstance(messages, list) or not messages or _message_role(messages[-1]) != "user":
+        _raise(
+            AdapterErrorCode.MESSAGE_BOUNDARY_INVALID,
+            AdapterStage.PROJECTION,
+        )
+    system_end = 0
+    while system_end < len(messages) and _message_role(messages[system_end]) == "system":
+        system_end += 1
+    return tuple(messages[:system_end]), (messages[-1],)
 
 
 class AstrBotHookBridge:

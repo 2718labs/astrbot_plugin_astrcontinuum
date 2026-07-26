@@ -17,6 +17,7 @@ from .astrbot import (
     estimate_opaque_token_cost,
     extract_host_turn_identity,
     probe_projection_capability,
+    select_projection_boundaries,
 )
 from .sylanne import SylanneAdapter
 
@@ -38,4 +39,5 @@ __all__ = [
     "estimate_opaque_token_cost",
     "extract_host_turn_identity",
     "probe_projection_capability",
+    "select_projection_boundaries",
 ]
