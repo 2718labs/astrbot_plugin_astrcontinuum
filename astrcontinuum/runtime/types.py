@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol
 
@@ -25,6 +25,59 @@ class RequestViewSource(Protocol):
     """Narrow durable read port used by the request-side runtime."""
 
     def read_request_view(self, session_key: SessionKey) -> RequestView: ...
+
+
+class ProjectionStage(str, Enum):
+    """Stable projection lifecycle stages."""
+
+    GUARD = "GUARD"
+    PROJECT = "PROJECT"
+    RESTORE = "RESTORE"
+
+
+class ProjectionErrorCode(str, Enum):
+    """Stable, content-free reversible-projection failures."""
+
+    MESSAGE_LIST_INVALID = "MESSAGE_LIST_INVALID"
+    LIST_IDENTITY_MISMATCH = "LIST_IDENTITY_MISMATCH"
+    REQUEST_IDENTITY_MISMATCH = "REQUEST_IDENTITY_MISMATCH"
+    PRESERVED_OBJECT_INVALID = "PRESERVED_OBJECT_INVALID"
+    PRESERVED_OBJECT_MISMATCH = "PRESERVED_OBJECT_MISMATCH"
+    PROJECTION_OBJECT_INVALID = "PROJECTION_OBJECT_INVALID"
+    PROJECTED_PREFIX_MISMATCH = "PROJECTED_PREFIX_MISMATCH"
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectionGuard:
+    """Immutable request-local identity guard captured from native history."""
+
+    request_identity: int
+    message_list_identity: int
+    native_objects: tuple[object, ...] = field(repr=False)
+    native_history_objects: tuple[object, ...] = field(repr=False)
+    system_objects: tuple[object, ...] = field(repr=False)
+    current_objects: tuple[object, ...] = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectedView:
+    """Exact identity graph before and after AC projection."""
+
+    guard: ProjectionGuard = field(repr=False)
+    request_identity: int
+    message_list_identity: int
+    pre_projection_objects: tuple[object, ...] = field(repr=False)
+    projection_objects: tuple[object, ...] = field(repr=False)
+    projected_objects: tuple[object, ...] = field(repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class RestoredView:
+    """Exact foreign projection and appended Delta captured at restoration."""
+
+    projected: ProjectedView = field(repr=False)
+    delta_objects: tuple[object, ...] = field(repr=False)
+    restored_objects: tuple[object, ...] = field(repr=False)
 
 
 class RuntimeSlot(str, Enum):

@@ -1,6 +1,13 @@
 """Canonical request-side AstrContinuum runtime."""
 
 from .budget import BudgetInvariantError, Utf8ByteTokenCounter, assemble
+from .projection import (
+    ProjectionInvariantError,
+    guard_projection,
+    project,
+    restore,
+    verify_native,
+)
 from .read_view import RequestViewInvariantError, read_request_view
 from .retrieval import select_candidates
 from .types import (
@@ -13,8 +20,13 @@ from .types import (
     BudgetConfig,
     CandidateBlock,
     CandidateKind,
+    ProjectedView,
+    ProjectionErrorCode,
+    ProjectionGuard,
+    ProjectionStage,
     RequestViewErrorCode,
     RequestViewSource,
+    RestoredView,
     RetrievalConfig,
     RuntimeSlot,
     TokenCounter,
@@ -31,14 +43,24 @@ __all__ = [
     "BudgetInvariantError",
     "CandidateBlock",
     "CandidateKind",
+    "ProjectedView",
+    "ProjectionErrorCode",
+    "ProjectionGuard",
+    "ProjectionInvariantError",
+    "ProjectionStage",
     "RequestViewErrorCode",
     "RequestViewInvariantError",
     "RequestViewSource",
+    "RestoredView",
     "RetrievalConfig",
     "RuntimeSlot",
     "TokenCounter",
     "Utf8ByteTokenCounter",
     "assemble",
+    "guard_projection",
+    "project",
     "read_request_view",
+    "restore",
     "select_candidates",
+    "verify_native",
 ]
