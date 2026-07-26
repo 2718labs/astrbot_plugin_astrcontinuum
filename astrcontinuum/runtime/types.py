@@ -155,3 +155,117 @@ class CandidateBlock:
             raise ValueError("reason must be non-empty")
         if self.event_sequence is not None and self.event_sequence < 1:
             raise ValueError("event_sequence must be positive")
+
+
+class TokenCounter(Protocol):
+    """Canonical replaceable tokenizer boundary."""
+
+    def count_text(self, text: str) -> int: ...
+
+
+class AssemblyMode(str, Enum):
+    """Projection-only budget mode."""
+
+    NORMAL = "NORMAL"
+    EMERGENCY_ASSEMBLY = "EMERGENCY_ASSEMBLY"
+
+
+class BudgetErrorCode(str, Enum):
+    """Stable, content-free budget failures."""
+
+    CURRENT_INPUT_INVALID = "CURRENT_INPUT_INVALID"
+    OPAQUE_TOKEN_COST_INVALID = "OPAQUE_TOKEN_COST_INVALID"
+    FIXED_REQUIRED_COST_INVALID = "FIXED_REQUIRED_COST_INVALID"
+    TOKEN_COUNTER_INVALID = "TOKEN_COUNTER_INVALID"
+    TOKEN_COUNTER_FAILURE = "TOKEN_COUNTER_FAILURE"
+    REQUIRED_INPUT_EXCEEDS_BUDGET = "REQUIRED_INPUT_EXCEEDS_BUDGET"
+    INTERNAL_BUDGET_INVARIANT = "INTERNAL_BUDGET_INVARIANT"
+
+
+@dataclass(frozen=True, slots=True)
+class BudgetConfig:
+    """Canonical request-input budget configuration."""
+
+    target_input_budget: int = 130_000
+    hard_input_ceiling: int = 150_000
+    model_context_limit: int = 200_000
+    reserved_output_and_tools: int = 32_000
+    safety_margin: int = 2_000
+
+    def __post_init__(self) -> None:
+        positive_fields = (
+            "target_input_budget",
+            "hard_input_ceiling",
+            "model_context_limit",
+        )
+        non_negative_fields = (
+            "reserved_output_and_tools",
+            "safety_margin",
+        )
+        for field_name in positive_fields:
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{field_name} must be a positive integer")
+        for field_name in non_negative_fields:
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{field_name} must be a non-negative integer")
+        if self.reserved_output_and_tools > self.model_context_limit:
+            raise ValueError("reserved_output_and_tools must not exceed model_context_limit")
+
+
+@dataclass(frozen=True, slots=True)
+class BlockSelection:
+    """Content-free trace record for one selected block."""
+
+    block_id: str
+    slot: RuntimeSlot
+    source_event_ids: tuple[str, ...]
+    token_cost: int
+    score: float
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class BlockRejection:
+    """Content-free trace record for one omitted block."""
+
+    block_id: str
+    slot: RuntimeSlot
+    source_event_ids: tuple[str, ...]
+    token_cost: int
+    score: float
+    reason: str
+
+
+@dataclass(frozen=True, slots=True)
+class AssemblyTrace:
+    """Content-free budget arithmetic and selection trace."""
+
+    mode: AssemblyMode
+    snapshot_id: str | None
+    pointer_version: int
+    covered_event_end: int
+    high_water_mark: int
+    b_input: int
+    current_input_cost: int
+    fixed_required_cost: int
+    safety_margin: int
+    b_required: int
+    opaque_token_cost: int
+    b_ac: int
+    ac_selected_cost: int
+    projection_overhead_cost: int
+    total_input_cost: int
+    slot_token_costs: tuple[tuple[RuntimeSlot, int], ...]
+    selections: tuple[BlockSelection, ...]
+    rejections: tuple[BlockRejection, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class AssemblyResult:
+    """Selected AC-owned content plus its content-free trace."""
+
+    projected_text: str
+    selected_blocks: tuple[CandidateBlock, ...]
+    trace: AssemblyTrace

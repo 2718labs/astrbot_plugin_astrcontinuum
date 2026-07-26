@@ -1,5 +1,6 @@
 """AstrContinuum domain package."""
 
+from . import runtime as _runtime
 from .domain import (
     AnchorStatus,
     AnchorType,
@@ -74,6 +75,17 @@ from .storage import (
     StaleLeaseError,
 )
 
+RuntimeAssemblyMode = _runtime.AssemblyMode
+RuntimeAssemblyResult = _runtime.AssemblyResult
+RuntimeAssemblyTrace = _runtime.AssemblyTrace
+RuntimeBlockRejection = _runtime.BlockRejection
+RuntimeBlockSelection = _runtime.BlockSelection
+RuntimeBudgetConfig = _runtime.BudgetConfig
+RuntimeBudgetInvariantError = _runtime.BudgetInvariantError
+RuntimeTokenCounter = _runtime.TokenCounter
+RuntimeUtf8ByteTokenCounter = _runtime.Utf8ByteTokenCounter
+runtime_assemble = _runtime.assemble
+
 __all__ = [
     "MIGRATIONS",
     "RUNTIME_SLOT_PRIORITY",
@@ -122,7 +134,16 @@ __all__ = [
     "RequestViewInvariantError",
     "RequestViewSource",
     "RetrievalConfig",
+    "RuntimeAssemblyMode",
+    "RuntimeAssemblyResult",
+    "RuntimeAssemblyTrace",
+    "RuntimeBlockRejection",
+    "RuntimeBlockSelection",
+    "RuntimeBudgetConfig",
+    "RuntimeBudgetInvariantError",
     "RuntimeSlot",
+    "RuntimeTokenCounter",
+    "RuntimeUtf8ByteTokenCounter",
     "SQLiteConnectionFactory",
     "SQLiteMigrator",
     "SQLiteRepository",
@@ -138,6 +159,7 @@ __all__ = [
     "SourceHook",
     "StaleLeaseError",
     "read_request_view",
+    "runtime_assemble",
     "select_candidates",
     "validate_permanent",
 ]
