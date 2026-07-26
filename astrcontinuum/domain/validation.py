@@ -1,11 +1,13 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from dataclasses import dataclass
 from enum import Enum
 
 from ._base import FrozenEnvelope, NonNegativeInt, UnitFloat
 from .capsules import (
     AnchorStatus,
+    CapsuleAnchor,
     ContextCapsuleEnvelope,
     SemanticStatus,
 )
@@ -42,10 +44,21 @@ class PermanentValidationReport(FrozenEnvelope):
     unsupported_critical_claims: NonNegativeInt
 
 
-def _active_semantics(
+@dataclass(frozen=True, slots=True)
+class _SemanticRecord:
+    stable_id: str
+    source_event_ids: tuple[str, ...]
+    status: SemanticStatus
+    supports_transition: bool
+
+
+_APPROVED_TRANSITION_STATUSES = frozenset({SemanticStatus.SUPERSEDED, SemanticStatus.RETRACTED})
+
+
+def _semantic_records(
     capsules: Sequence[ContextCapsuleEnvelope],
-) -> list[tuple[str, tuple[str, ...]]]:
-    records: list[tuple[str, tuple[str, ...]]] = []
+) -> list[_SemanticRecord]:
+    records: list[_SemanticRecord] = []
     for capsule in capsules:
         claim_groups = (
             capsule.goals,
@@ -57,25 +70,49 @@ def _active_semantics(
         )
         for group in claim_groups:
             records.extend(
-                (item.claim_id, item.source_event_ids)
+                _SemanticRecord(
+                    stable_id=item.claim_id,
+                    source_event_ids=item.source_event_ids,
+                    status=item.status,
+                    supports_transition=True,
+                )
                 for item in group
-                if item.status == SemanticStatus.ACTIVE
             )
         records.extend(
-            (item.decision_id, item.source_event_ids)
+            _SemanticRecord(
+                stable_id=item.decision_id,
+                source_event_ids=item.source_event_ids,
+                status=item.status,
+                supports_transition=True,
+            )
             for item in capsule.decisions
-            if item.status == SemanticStatus.ACTIVE
         )
-        records.extend((item.entity_id, item.source_event_ids) for item in capsule.entities)
-        records.extend((item.dependency_id, item.source_event_ids) for item in capsule.dependencies)
+        records.extend(
+            _SemanticRecord(
+                stable_id=item.entity_id,
+                source_event_ids=item.source_event_ids,
+                status=SemanticStatus.ACTIVE,
+                supports_transition=False,
+            )
+            for item in capsule.entities
+        )
+        records.extend(
+            _SemanticRecord(
+                stable_id=item.dependency_id,
+                source_event_ids=item.source_event_ids,
+                status=SemanticStatus.ACTIVE,
+                supports_transition=False,
+            )
+            for item in capsule.dependencies
+        )
     return records
 
 
 def _active_anchors(
     capsules: Sequence[ContextCapsuleEnvelope],
-) -> list[tuple[str, tuple[str, ...]]]:
+) -> list[CapsuleAnchor]:
     return [
-        (anchor.anchor_id, anchor.source_event_ids)
+        anchor
         for capsule in capsules
         for anchor in capsule.exact_anchors
         if anchor.status == AnchorStatus.ACTIVE
@@ -128,7 +165,7 @@ def validate_permanent(
         failures.add(PermanentFailureCode.CAPSULE_MEMBERSHIP_MISMATCH)
 
     candidate_anchor_records = _active_anchors(candidate_capsules)
-    candidate_anchor_ids = tuple(item_id for item_id, _ in candidate_anchor_records)
+    candidate_anchor_ids = tuple(item.anchor_id for item in candidate_anchor_records)
     if candidate_snapshot.exact_anchor_ids != candidate_anchor_ids:
         failures.add(PermanentFailureCode.SNAPSHOT_ANCHOR_MISMATCH)
 
@@ -154,8 +191,28 @@ def validate_permanent(
     current_source_ids = {event.event_id for event in source_events}
     valid_source_ids = previous_source_ids | current_source_ids
 
-    semantic_records = _active_semantics(candidate_capsules)
-    provenance_records = semantic_records + candidate_anchor_records
+    previous_semantic_records = _semantic_records(previous_capsules)
+    candidate_semantic_records = _semantic_records(candidate_capsules)
+    previous_active_semantics = [
+        item for item in previous_semantic_records if item.status == SemanticStatus.ACTIVE
+    ]
+    candidate_active_semantics = [
+        item for item in candidate_semantic_records if item.status == SemanticStatus.ACTIVE
+    ]
+    previous_transitionable_ids = {
+        item.stable_id for item in previous_active_semantics if item.supports_transition
+    }
+    candidate_transition_records = [
+        item
+        for item in candidate_semantic_records
+        if item.supports_transition
+        and item.stable_id in previous_transitionable_ids
+        and item.status in _APPROVED_TRANSITION_STATUSES
+    ]
+    provenance_records = [
+        (item.stable_id, item.source_event_ids)
+        for item in candidate_active_semantics + candidate_transition_records
+    ] + [(item.anchor_id, item.source_event_ids) for item in candidate_anchor_records]
     unsupported_records = [
         item_id
         for item_id, source_ids in provenance_records
@@ -168,16 +225,25 @@ def validate_permanent(
     if unsupported_records or capsule_source_mismatch:
         failures.add(PermanentFailureCode.UNSUPPORTED_ACTIVE_SEMANTIC)
 
-    previous_semantic_ids = {item_id for item_id, _ in _active_semantics(previous_capsules)}
-    candidate_semantic_ids = {item_id for item_id, _ in semantic_records}
-    if not previous_semantic_ids.issubset(candidate_semantic_ids):
+    previous_semantic_ids = {item.stable_id for item in previous_active_semantics}
+    candidate_active_semantic_ids = {item.stable_id for item in candidate_active_semantics}
+    approved_transition_ids = {
+        item.stable_id
+        for item in candidate_transition_records
+        if all(source_id in valid_source_ids for source_id in item.source_event_ids)
+        and any(source_id in current_source_ids for source_id in item.source_event_ids)
+    }
+    retained_semantic_ids = candidate_active_semantic_ids | approved_transition_ids
+    if not previous_semantic_ids.issubset(retained_semantic_ids):
         failures.add(PermanentFailureCode.MISSING_PRIOR_SEMANTIC)
 
-    previous_anchor_ids = {item_id for item_id, _ in _active_anchors(previous_capsules)}
-    candidate_anchor_id_set = {item_id for item_id, _ in candidate_anchor_records}
-    preserved_anchor_count = len(previous_anchor_ids & candidate_anchor_id_set)
+    previous_anchor_records = _active_anchors(previous_capsules)
+    preserved_anchor_count = sum(
+        any(candidate_anchor == previous_anchor for candidate_anchor in candidate_anchor_records)
+        for previous_anchor in previous_anchor_records
+    )
     computed_anchor_recall = (
-        preserved_anchor_count / len(previous_anchor_ids) if previous_anchor_ids else 1.0
+        preserved_anchor_count / len(previous_anchor_records) if previous_anchor_records else 1.0
     )
     if computed_anchor_recall < 1.0:
         failures.add(PermanentFailureCode.MISSING_REQUIRED_ANCHOR)

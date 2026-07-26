@@ -54,24 +54,73 @@ def claim(
     source_event_id: str,
     *,
     status: Any = ac.SemanticStatus.ACTIVE,
+    source_event_ids: tuple[str, ...] | None = None,
 ) -> Any:
     return ac.CapsuleClaim(
         claim_id=claim_id,
         text=f"claim {claim_id}",
         status=status,
         confidence=1.0,
+        source_event_ids=source_event_ids if source_event_ids is not None else (source_event_id,),
+    )
+
+
+def decision(
+    decision_id: str,
+    source_event_id: str,
+    *,
+    status: Any = ac.SemanticStatus.ACTIVE,
+    source_event_ids: tuple[str, ...] | None = None,
+) -> Any:
+    return ac.Decision(
+        decision_id=decision_id,
+        text=f"decision {decision_id}",
+        status=status,
+        confidence=1.0,
+        source_event_ids=source_event_ids if source_event_ids is not None else (source_event_id,),
+        rationale="rationale",
+        alternatives=(),
+        supersedes=(),
+        rejected_because="",
+    )
+
+
+def entity(entity_id: str, source_event_id: str) -> Any:
+    return ac.Entity(
+        entity_id=entity_id,
+        kind="person",
+        canonical_name=f"entity {entity_id}",
+        aliases=(),
         source_event_ids=(source_event_id,),
     )
 
 
-def anchor(anchor_id: str, source_event_id: str) -> Any:
+def dependency(dependency_id: str, source_event_id: str) -> Any:
+    return ac.Dependency(
+        dependency_id=dependency_id,
+        kind="requires",
+        target_id="target-1",
+        source_event_ids=(source_event_id,),
+    )
+
+
+def anchor(
+    anchor_id: str,
+    source_event_id: str,
+    *,
+    anchor_type: Any = ac.AnchorType.NAME,
+    exact_text: str | None = None,
+    source_event_ids: tuple[str, ...] | None = None,
+    status: Any = ac.AnchorStatus.ACTIVE,
+    importance: float = 1.0,
+) -> Any:
     return ac.CapsuleAnchor(
         anchor_id=anchor_id,
-        anchor_type=ac.AnchorType.NAME,
-        exact_text=f"anchor {anchor_id}",
-        source_event_ids=(source_event_id,),
-        status=ac.AnchorStatus.ACTIVE,
-        importance=1.0,
+        anchor_type=anchor_type,
+        exact_text=exact_text if exact_text is not None else f"anchor {anchor_id}",
+        source_event_ids=source_event_ids if source_event_ids is not None else (source_event_id,),
+        status=status,
+        importance=importance,
     )
 
 
@@ -95,7 +144,15 @@ def capsule(
     end: int = 1,
     source_event_ids: tuple[str, ...] = ("event-1",),
     goals: tuple[Any, ...] | None = None,
+    constraints: tuple[Any, ...] = (),
+    decisions: tuple[Any, ...] = (),
+    progress: tuple[Any, ...] = (),
+    open_loops: tuple[Any, ...] = (),
+    preferences: tuple[Any, ...] = (),
+    entities: tuple[Any, ...] = (),
+    emotional_context: tuple[Any, ...] = (),
     anchors: tuple[Any, ...] | None = None,
+    dependencies: tuple[Any, ...] = (),
     capsule_quality: Any | None = None,
     token_cost: int = 10,
 ) -> Any:
@@ -108,17 +165,17 @@ def capsule(
         covered_event_end=end,
         source_event_ids=source_event_ids,
         goals=goals if goals is not None else (claim("goal-1", source_event_ids[0]),),
-        constraints=(),
-        decisions=(),
-        progress=(),
-        open_loops=(),
-        preferences=(),
-        entities=(),
-        emotional_context=(),
+        constraints=constraints,
+        decisions=decisions,
+        progress=progress,
+        open_loops=open_loops,
+        preferences=preferences,
+        entities=entities,
+        emotional_context=emotional_context,
         exact_anchors=anchors
         if anchors is not None
         else (anchor("anchor-1", source_event_ids[0]),),
-        dependencies=(),
+        dependencies=dependencies,
         narrative_summary=f"capsule {capsule_id}",
         token_cost=token_cost,
         quality=capsule_quality or quality(),
@@ -194,6 +251,41 @@ def validate(
         source_events=events,
         target_high_water_mark=target,
         token_ceiling=token_ceiling,
+    )
+
+
+def capsule_with_claim_group(
+    group_name: str,
+    record: Any,
+    **kwargs: Any,
+) -> Any:
+    return capsule(
+        goals=(record,) if group_name == "goals" else (),
+        constraints=(record,) if group_name == "constraints" else (),
+        progress=(record,) if group_name == "progress" else (),
+        open_loops=(record,) if group_name == "open_loops" else (),
+        preferences=(record,) if group_name == "preferences" else (),
+        emotional_context=(record,) if group_name == "emotional_context" else (),
+        **kwargs,
+    )
+
+
+def validate_history(
+    previous_capsule: Any,
+    candidate_capsule: Any,
+) -> Any:
+    previous = snapshot(
+        (previous_capsule,),
+        snapshot_id="snapshot-old",
+        covered_event_end=1,
+        source_high_water_mark=1,
+    )
+    return validate(
+        previous_snapshot=previous,
+        previous_capsules=(previous_capsule,),
+        candidate_capsules=(candidate_capsule,),
+        source_events=(event(2),),
+        target=2,
     )
 
 
@@ -302,6 +394,278 @@ def test_previous_active_semantics_and_anchors_must_be_preserved() -> None:
     assert failure_code("MISSING_PRIOR_SEMANTIC") in report.failure_codes
     assert failure_code("MISSING_REQUIRED_ANCHOR") in report.failure_codes
     assert report.anchor_recall == 0.0
+
+
+def test_previous_active_claim_can_remain_active() -> None:
+    required_anchor = anchor("anchor-old", "event-1")
+    retained_claim = claim("stable-claim", "event-1")
+    previous_capsule = capsule(
+        capsule_id="capsule-old",
+        source_event_ids=("event-1",),
+        goals=(retained_claim,),
+        anchors=(required_anchor,),
+    )
+    candidate_capsule = capsule(
+        capsule_id="capsule-new",
+        start=1,
+        end=2,
+        source_event_ids=("event-1", "event-2"),
+        goals=(retained_claim,),
+        anchors=(required_anchor,),
+    )
+
+    report = validate_history(previous_capsule, candidate_capsule)
+
+    assert report.passed
+    assert report.failure_codes == ()
+
+
+@pytest.mark.parametrize(
+    "group_name",
+    [
+        "goals",
+        "constraints",
+        "progress",
+        "open_loops",
+        "preferences",
+        "emotional_context",
+    ],
+)
+@pytest.mark.parametrize(
+    "transition_status",
+    [ac.SemanticStatus.SUPERSEDED, ac.SemanticStatus.RETRACTED],
+)
+def test_previous_active_claim_accepts_sourced_transition(
+    group_name: str,
+    transition_status: Any,
+) -> None:
+    required_anchor = anchor("anchor-old", "event-1")
+    previous_capsule = capsule_with_claim_group(
+        group_name,
+        claim("stable-claim", "event-1"),
+        capsule_id="capsule-old",
+        source_event_ids=("event-1",),
+        anchors=(required_anchor,),
+    )
+    candidate_capsule = capsule_with_claim_group(
+        group_name,
+        claim(
+            "stable-claim",
+            "event-2",
+            status=transition_status,
+            source_event_ids=("event-1", "event-2"),
+        ),
+        capsule_id="capsule-new",
+        start=1,
+        end=2,
+        source_event_ids=("event-1", "event-2"),
+        anchors=(required_anchor,),
+    )
+
+    report = validate_history(previous_capsule, candidate_capsule)
+
+    assert report.passed
+    assert report.failure_codes == ()
+    assert report.source_coverage == 1.0
+
+
+@pytest.mark.parametrize(
+    "transition_status",
+    [ac.SemanticStatus.SUPERSEDED, ac.SemanticStatus.RETRACTED],
+)
+def test_previous_active_decision_accepts_sourced_transition(
+    transition_status: Any,
+) -> None:
+    required_anchor = anchor("anchor-old", "event-1")
+    previous_capsule = capsule(
+        capsule_id="capsule-old",
+        source_event_ids=("event-1",),
+        goals=(),
+        decisions=(decision("stable-decision", "event-1"),),
+        anchors=(required_anchor,),
+    )
+    candidate_capsule = capsule(
+        capsule_id="capsule-new",
+        start=1,
+        end=2,
+        source_event_ids=("event-1", "event-2"),
+        goals=(),
+        decisions=(
+            decision(
+                "stable-decision",
+                "event-2",
+                status=transition_status,
+                source_event_ids=("event-1", "event-2"),
+            ),
+        ),
+        anchors=(required_anchor,),
+    )
+
+    report = validate_history(previous_capsule, candidate_capsule)
+
+    assert report.passed
+    assert report.failure_codes == ()
+
+
+@pytest.mark.parametrize(
+    "case",
+    ["old_source_only", "uncertain", "new_id", "removed"],
+)
+def test_invalid_or_missing_prior_claim_transition_is_rejected(case: str) -> None:
+    required_anchor = anchor("anchor-old", "event-1")
+    previous_capsule = capsule(
+        capsule_id="capsule-old",
+        source_event_ids=("event-1",),
+        goals=(claim("stable-claim", "event-1"),),
+        anchors=(required_anchor,),
+    )
+    if case == "old_source_only":
+        candidate_claims = (
+            claim(
+                "stable-claim",
+                "event-1",
+                status=ac.SemanticStatus.SUPERSEDED,
+            ),
+        )
+    elif case == "uncertain":
+        candidate_claims = (
+            claim(
+                "stable-claim",
+                "event-2",
+                status=ac.SemanticStatus.UNCERTAIN,
+            ),
+        )
+    elif case == "new_id":
+        candidate_claims = (claim("replacement-claim", "event-2"),)
+    else:
+        candidate_claims = ()
+    candidate_capsule = capsule(
+        capsule_id="capsule-new",
+        start=1,
+        end=2,
+        source_event_ids=("event-1", "event-2"),
+        goals=candidate_claims,
+        anchors=(required_anchor,),
+    )
+
+    report = validate_history(previous_capsule, candidate_capsule)
+
+    assert failure_code("MISSING_PRIOR_SEMANTIC") in report.failure_codes
+    assert not report.passed
+
+
+def test_transition_with_unknown_source_keeps_provenance_failures() -> None:
+    required_anchor = anchor("anchor-old", "event-1")
+    previous_capsule = capsule(
+        capsule_id="capsule-old",
+        source_event_ids=("event-1",),
+        goals=(claim("stable-claim", "event-1"),),
+        anchors=(required_anchor,),
+    )
+    candidate_capsule = capsule(
+        capsule_id="capsule-new",
+        start=1,
+        end=2,
+        source_event_ids=("event-1", "event-2"),
+        goals=(
+            claim(
+                "stable-claim",
+                "event-2",
+                status=ac.SemanticStatus.SUPERSEDED,
+                source_event_ids=("event-2", "unknown-event"),
+            ),
+        ),
+        anchors=(required_anchor,),
+    )
+
+    report = validate_history(previous_capsule, candidate_capsule)
+
+    assert failure_code("MISSING_PRIOR_SEMANTIC") in report.failure_codes
+    assert failure_code("UNSUPPORTED_ACTIVE_SEMANTIC") in report.failure_codes
+    assert failure_code("SOURCE_COVERAGE_NOT_FULL") in report.failure_codes
+    assert failure_code("UNSUPPORTED_CRITICAL_CLAIMS") in report.failure_codes
+    assert report.source_coverage < 1.0
+    assert report.unsupported_critical_claims == 1
+
+
+@pytest.mark.parametrize("record_kind", ["entity", "dependency"])
+def test_entity_and_dependency_cannot_disappear_via_transition_rule(
+    record_kind: str,
+) -> None:
+    required_anchor = anchor("anchor-old", "event-1")
+    previous_capsule = capsule(
+        capsule_id="capsule-old",
+        source_event_ids=("event-1",),
+        goals=(),
+        entities=(entity("stable-entity", "event-1"),) if record_kind == "entity" else (),
+        dependencies=(dependency("stable-dependency", "event-1"),)
+        if record_kind == "dependency"
+        else (),
+        anchors=(required_anchor,),
+    )
+    candidate_capsule = capsule(
+        capsule_id="capsule-new",
+        start=1,
+        end=2,
+        source_event_ids=("event-1", "event-2"),
+        goals=(),
+        anchors=(required_anchor,),
+    )
+
+    report = validate_history(previous_capsule, candidate_capsule)
+
+    assert failure_code("MISSING_PRIOR_SEMANTIC") in report.failure_codes
+    assert not report.passed
+
+
+@pytest.mark.parametrize(
+    "change",
+    ["exact_text", "anchor_type", "source", "status"],
+)
+def test_previous_active_anchor_requires_exact_active_record(change: str) -> None:
+    retained_claim = claim("stable-claim", "event-1")
+    required_anchor = anchor("stable-anchor", "event-1")
+    if change == "exact_text":
+        candidate_anchor = anchor(
+            "stable-anchor",
+            "event-1",
+            exact_text="changed exact text",
+        )
+    elif change == "anchor_type":
+        candidate_anchor = anchor(
+            "stable-anchor",
+            "event-1",
+            anchor_type=ac.AnchorType.URL,
+        )
+    elif change == "source":
+        candidate_anchor = anchor("stable-anchor", "event-2")
+    else:
+        candidate_anchor = anchor(
+            "stable-anchor",
+            "event-1",
+            status=ac.AnchorStatus.SUPERSEDED,
+        )
+    previous_capsule = capsule(
+        capsule_id="capsule-old",
+        source_event_ids=("event-1",),
+        goals=(retained_claim,),
+        anchors=(required_anchor,),
+    )
+    candidate_capsule = capsule(
+        capsule_id="capsule-new",
+        start=1,
+        end=2,
+        source_event_ids=("event-1", "event-2"),
+        goals=(retained_claim,),
+        anchors=(candidate_anchor,),
+    )
+
+    report = validate_history(previous_capsule, candidate_capsule)
+
+    assert failure_code("MISSING_REQUIRED_ANCHOR") in report.failure_codes
+    assert failure_code("ANCHOR_RECALL_NOT_FULL") in report.failure_codes
+    assert report.anchor_recall < 1.0
+    assert not report.passed
 
 
 @pytest.mark.parametrize(
