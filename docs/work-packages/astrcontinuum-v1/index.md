@@ -23,7 +23,7 @@
 | `V1-202` | done | `V1-201` | SQLite migrations and connection policy |
 | `V1-203` | done | `V1-202` | Nine repository transactions, concurrency, and recovery |
 | `V1-301` | done | `V1-203` | Standalone read view, retrieval, budget, and assembly trace |
-| `V1-302` | ready | `V1-301` | Reversible AstrBot projection and unique Hook writers |
+| `V1-302` | active | `V1-301` | Reversible AstrBot projection and unique Hook writers |
 | `V1-401` | done | `V1-203`, `V1-301` | Segmenter, compiler, permanent validator, and optional auditor |
 | `V1-402` | ready | `V1-301`, `V1-401` | Query-aware reconstruction and FTS fallback |
 | `V1-501` | pending | `V1-302`, `V1-402` | Tool payloads, Inspector commands, lifecycle, migration |
@@ -35,14 +35,14 @@ their direct contracts and dependencies are green.
 
 ## Dispatch
 
-- Current wave: `V1-401` closure; `V1-302` and `V1-402` are ready
-- Completed card: `tasks/V1-401.md`
-- Write owner: none after V1-401 verification and workflow closure
-- Write scope: no active implementation lease
-- Write conflicts: do not dispatch `V1-302` and `V1-402` concurrently until their
-  exact export and test scopes are disjoint
-- Next gate: generate and strictly register one ready task card before claiming its
-  implementation lease
+- Current wave: `V1-302`; `V1-402` remains ready
+- Active card: `tasks/V1-302.md`
+- Intended write owner: `astrbot-projection-primary-agent`
+- Write scope: runtime projection, AstrBot adapter/Hook wiring, and card-owned tests
+- Write conflicts: do not dispatch `V1-402` while `V1-302` owns runtime exports and
+  tests
+- Next gate: strict input sync, task registration, no-miss query, checkpoint, and lease
+  claim before production writes
 
 ## Operating Rules
 
