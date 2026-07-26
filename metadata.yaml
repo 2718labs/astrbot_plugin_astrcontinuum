@@ -1,23 +1,10 @@
 name: astrbot_plugin_astrcontinuum
 display_name: AstrContinuum / 星续
-desc: "AstrBot 非阻塞长期上下文运行时：稳定快照、增量 Delta、多分辨率胶囊、精确锚点、查询感知恢复与压缩损失审计。"
-short_desc: "上下文会被压缩，对话不会断裂。"
-version: "0.1.0-alpha"
-author: Ayleovelle
+desc: "Repository-stage technical preview of a non-blocking, durable long-context runtime for AstrBot."
+short_desc: "Durable Journal, reversible context projection, and snapshot-plus-Delta architecture."
+version: v0.1.0
+author: 2718labs
 license: AGPL-3.0-or-later
-repo: "https://github.com/Ayleovelle/astrbot_plugin_astrcontinuum"
+repo: https://github.com/2718labs/astrbot_plugin_astrcontinuum
 support_platforms: []
 astrbot_version: ">=4.24.0,<5.0.0"
-
-compatibility_matrix:
-  min_python: "3.10"
-  max_python: "3.13"
-  tested_platforms: ["linux", "windows"]
-resource_budget:
-  memory_mb: 256
-  cpu_percent: 10
-  disk_mb: 2048
-personality_impact:
-  modifies_personality: false
-  modifies_memory: false
-  modifies_proactive: false

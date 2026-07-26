@@ -113,9 +113,9 @@ def _contains_identity(objects: tuple[object, ...], target: object) -> bool:
 
 @register(
     "astrbot_plugin_astrcontinuum",
-    "Ayleovelle",
+    "2718labs",
     "Non-blocking infinite context runtime for AstrBot",
-    "0.1.0-alpha",
+    "0.1.0",
 )
 class AstrContinuumPlugin(Star):
     """One standards-compliant Star with reversible provider projection."""
@@ -551,6 +551,7 @@ class AstrContinuumPlugin(Star):
 
         del event, response
 
+    @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("context_status")
     async def context_status(self, event: AstrMessageEvent):
         status = "ready" if self._bridge is not None else "not ready"

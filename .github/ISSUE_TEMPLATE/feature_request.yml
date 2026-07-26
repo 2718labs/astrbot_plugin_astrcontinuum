@@ -1,0 +1,48 @@
+name: Feature request / 功能建议
+description: Propose a capability or architecture evolution. / 提议功能或架构演进。
+title: "[Feature] "
+labels:
+  - enhancement
+body:
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / 问题
+      description: Describe the user or operator problem, not only a preferred implementation. / 请描述用户或运维问题，而不只是实现方案。
+    validations:
+      required: true
+
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed behavior / 建议行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: architecture
+    attributes:
+      label: Architecture and invariant impact / 架构与不变量影响
+      description: Consider Journal authority, identity, Snapshot coverage, projection/restoration, migrations, concurrency, privacy, and failure behavior. / 请考虑事件权威、身份、覆盖、投影恢复、迁移、并发、隐私和故障行为。
+    validations:
+      required: true
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered / 已考虑的替代方案
+
+  - type: textarea
+    id: evidence
+    attributes:
+      label: Compatibility or operational evidence / 兼容性或运行证据
+
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Confirmation / 确认
+      options:
+        - label: I reviewed the architecture and existing roadmap. / 我已阅读架构与现有路线图。
+          required: true
+        - label: I searched existing issues. / 我已搜索现有 Issue。
+          required: true

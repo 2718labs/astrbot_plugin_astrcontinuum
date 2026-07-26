@@ -1,0 +1,140 @@
+# AstrBot 接入契约
+
+[English](./ASTRBOT_INTEGRATION.md) | 简体中文
+
+本文规定仓库版本 `v0.1.0` 中 AstrContinuum 与 AstrBot 的真实边界。它不是“计划使用的
+API 清单”。凡是修改 Hook 职责、优先级、消息投影、请求身份或插件生命周期，都必须同步
+更新本文，并通过真实 `PluginManager` 兼容探针。
+
+## 1. 组合入口
+
+`main.py` 只注册一个 `Star` 子类，负责：
+
+- 通过 `StarTools` 获取插件数据目录；
+- 幂等执行 SQLite 迁移并创建 Repository；
+- 创建 AstrBot Hook 桥接；
+- 在事件对象中保存仅当前请求可见的状态；
+- 执行有界上下文装配与临时投影；
+- 验证恢复、写入助手事件并持久化压缩意图；
+- 插件终止时关闭资源。
+
+领域、运行时、压缩和存储包不导入 AstrBot。宿主私有对象统一隔离在
+`astrcontinuum.adapters.astrbot` 后面。
+
+## 2. 已验证宿主范围
+
+公开元数据声明 `>=4.24.0,<5.0.0`。提交态插件归档已通过官方 AstrBot 分发包验证：
+
+| AstrBot | Python | 验证范围 |
+| --- | --- | --- |
+| `4.24.0` | `3.12.13` | PluginManager 生命周期、注册优先级、投影恢复、Journal 顺序、终止 |
+| `4.24.2` | `3.12.13` | 同一完整探针 |
+| `4.26.7` | `3.12.13` | 同一完整探针 |
+
+AstrBot `4.24.0` 会对缺失的 `StarMetadata.pages` 打印宿主自身回退警告，但不影响本插件
+加载或行为。通过一个抽样版本只代表证据覆盖，不能推导所有后续 `4.x` 都已经验证。
+
+## 3. 权威事件 Hook
+
+只有以下四个 Hook/Event/Role 组合可以追加 Journal：
+
+| Hook | Event type | Role |
+| --- | --- | --- |
+| `on_llm_request` | `USER_MESSAGE` | `USER` |
+| `on_agent_done` finalizer | `ASSISTANT_MESSAGE` | `ASSISTANT` |
+| `on_using_llm_tool` | `TOOL_CALL` | `TOOL` |
+| `on_llm_tool_respond` | `TOOL_RESULT` | `TOOL` |
+
+`on_llm_response` 只能观察，不能写助手事件，否则会与唯一写入者 `on_agent_done` 重复。
+确定性幂等键配合 SQLite 唯一约束，保证重复/并发回调只产生一行，也不会多消耗序号。
+
+## 4. Hook 顺序与职责
+
+| Handler | 优先级 | 职责 | 禁止事项 |
+| --- | ---: | --- | --- |
+| `on_llm_request` | `2000` | 写用户事件、冻结 `H`、读取 Snapshot+Delta、预算装配 | 远程审计/编译、等待 worker、全库扫描、迁移 |
+| `on_agent_begin_guard` | `2000` | 在投影前记录原生对象的精确身份 | 替换或复制宿主历史 |
+| `on_agent_begin_project` | `-100` | 追加一个插件自有临时 Provider 消息 | 修改原生消息或持久历史 |
+| `on_agent_done_restore` | `2000` | 删除自有投影并保留 Provider 新增 Delta | 按值重建宿主历史 |
+| `on_agent_done_finalize` | `900` | 验证恢复、写助手事件、持久化压缩意图 | 在线发布候选 Snapshot |
+| `on_using_llm_tool` | `0` | 保存有界工具调用元数据 | 保存任意对象表示 |
+| `on_llm_tool_respond` | `0` | 保存有界工具结果元数据 | 保存无限结果 |
+| `on_llm_response` | `0` | 可选的无内容观测 | 任何 Journal 写入 |
+
+两组 `on_agent_begin` / `on_agent_done` 故意使用不同优先级。修改它们会改变保护的是哪一组
+对象、恢复发生在 AstrBot 和其他插件的哪个阶段，因此属于架构变更。
+
+## 5. 请求级状态
+
+AstrContinuum 在带命名空间的 event extra 中保存私有 `_RequestState`，其中只有当前请求
+需要的引用：原始 request、冻结读视图、投影 guard、投影/恢复结果、助手事件、工具序号与
+脱敏故障。它不是持久真源，不能进入 SQLite 或日志；缺失时应有界 fail-open。
+
+## 6. 会话身份
+
+适配层从宿主提取完整七元 `SessionKey`：
+
+```text
+platform_instance_id
+message_type
+session_id
+group_id
+user_id
+conversation_id
+persona_id
+```
+
+可空的 `group_id` / `persona_id` 使用规范表示。完整键保留在 wire envelope 中，SHA-256
+只用于物理查询。若宿主无法提供必需身份，本请求跳过 AstrContinuum，不能写入含糊会话。
+
+## 7. 投影能力边界
+
+当前投影依赖 AstrBot 的 `Message`、`TextPart`、`extra_user_content_parts` 和
+`mark_as_temp` / `_no_save`，使用前必须运行时探测。
+
+恢复必须按对象身份进行：
+
+1. 保存 request、contexts list 和每个原生 message 的身份；
+2. 只追加 AstrContinuum 自己拥有的临时 message；
+3. 允许 Provider/Agent 追加自己的 Delta；
+4. 删除精确的自有对象；
+5. 验证原 request、list 和原生 message 身份不变；
+6. 保留 Provider 合法新增对象。
+
+“值相等”不能替代“同一个对象”；即使重建的字典内容一样，也会侵犯宿主所有权并可能破坏
+后续持久化。
+
+## 8. 故障与日志
+
+兼容或不变量失败只能生成有界 `AdapterFault`（错误码、阶段、计数），不能包含消息内容或
+对象表示。在线请求保持可用：
+
+- 身份提取失败：本请求不采集、不投影；
+- 投影能力缺失：持久采集可继续，跳过增强；
+- 装配失败：原生请求继续；
+- 投影/恢复不变量失败：在安全范围内移除自有增强，然后让宿主继续；
+- finalizer 失败：不能伪造助手行或 Snapshot 覆盖。
+
+## 9. 生命周期与当前限制
+
+初始化阶段迁移数据库并构造持久服务，终止阶段关闭资源；finalizer 在助手事件落盘后提高
+持久压缩意图。
+
+`v0.1.0` 的 `Star` 生命周期仍**没有**启动领取并执行 `compaction_jobs` 的循环。
+编译器、校验器、审计器、调度器、租约/fencing 与原子发布原语已经实现且有测试，但排队意图
+可能一直 pending。当前不能把“自动长程压缩”描述为已启用。
+
+## 10. 修改核对
+
+每次接入变更都要：
+
+1. 查目标 AstrBot 的真实源码与签名，不凭记忆写 API；
+2. 使用私有字段前先更新能力探测；
+3. 跑单元和 SQLite 集成测试；
+4. 通过真实 AstrBot `PluginManager` 加载提交态归档；
+5. 断言 handler 数量、Hook 名、优先级、初始化、请求行为和终止；
+6. 兼容声明至少覆盖下界与最新验证样本；
+7. 同步更新中英文本文及测试矩阵。
+
+相关文档：[架构](./ARCHITECTURE.zh-CN.md)、[数据流](./DATA_FLOW.md)、
+[测试矩阵](./TEST_MATRIX.md)和 [ADR-006](./ADR-006-ASTRBOT-HOOK-OWNERSHIP.md)。

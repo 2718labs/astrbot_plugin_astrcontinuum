@@ -1,9 +1,16 @@
 __pycache__/
 *.py[cod]
+.codegraph/
+.coverage
+.cache/
+.idea/
 .pytest_cache/
 .ruff_cache/
 .mypy_cache/
 .venv/
+.vscode/
+coverage.xml
+htmlcov/
 dist/
 build/
 *.egg-info/
@@ -11,3 +18,6 @@ data/
 *.db
 *.db-wal
 *.db-shm
+*.sqlite3
+*.sqlite3-wal
+*.sqlite3-shm

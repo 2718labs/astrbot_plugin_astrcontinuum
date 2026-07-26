@@ -28,6 +28,8 @@ class FakeLogger:
 
 
 class FakeFilter:
+    PermissionType = SimpleNamespace(ADMIN="ADMIN")
+
     @staticmethod
     def _hook(kind: str, **kwargs: object):
         def decorate(function):
@@ -57,6 +59,14 @@ class FakeFilter:
 
     def command(self, name: str, **kwargs: object):
         return self._hook(f"command:{name}", **kwargs)
+
+    @staticmethod
+    def permission_type(permission: object):
+        def decorate(function):
+            function.__astrbot_permission__ = permission
+            return function
+
+        return decorate
 
 
 class FakeStar:
@@ -249,9 +259,9 @@ def test_main_declares_one_star_and_exact_hook_priorities(
     assert issubclass(plugin_type, FakeStar)
     assert plugin_type.__register_args__ == (
         "astrbot_plugin_astrcontinuum",
-        "Ayleovelle",
+        "2718labs",
         "Non-blocking infinite context runtime for AstrBot",
-        "0.1.0-alpha",
+        "0.1.0",
     )
     assert plugin_type.on_llm_request.__astrbot_priority__ == 2000
     assert plugin_type.on_agent_begin_guard.__astrbot_priority__ == 2000
@@ -291,6 +301,7 @@ async def test_lifecycle_command_and_llm_response_are_idempotent_and_observation
     results = [item async for item in plugin.context_status(event)]
     assert results == [("plain", "AstrContinuum is ready.")]
     assert event.plain_results == ["AstrContinuum is ready."]
+    assert plugin.context_status.__func__.__astrbot_permission__ == "ADMIN"
 
     await plugin.terminate()
     await plugin.terminate()

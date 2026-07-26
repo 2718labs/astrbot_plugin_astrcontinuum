@@ -75,9 +75,9 @@ The event-enum test fixture MUST accept exactly `USER_MESSAGE/USER/ON_LLM_REQUES
 
 | Case | Required assertion |
 | --- | --- |
-| v4.24.2 lower-bound load | Plugin and isolated adapter load; `TextPart`, `extra_user_content_parts`, and `mark_as_temp` probes pass. This remains required until v4.24.1 is separately validated. |
-| v4.24.5 verified sample | Unique writer hooks, tool hooks, duplicate idempotency, and temporary context injection work. |
-| v4.26.7 verified sample | The same checks pass. This is evidence through the version, not a maximum compatibility cap. |
+| v4.24.0 declared lower-bound load | Official `PluginManager` initializes and terminates the committed archive; handler names/priorities, `TextPart`, `extra_user_content_parts`, `mark_as_temp`, projection/restoration, Journal ordering, and durable intent pass. The host's own `StarMetadata.pages` fallback warning is recorded separately and is not an AstrContinuum failure. |
+| v4.24.2 intermediate sample | The same lifecycle, hook, persistence, and projection checks pass. |
+| v4.26.7 newest verified sample | The same checks pass. This is evidence through the sampled version, not a maximum compatibility cap or proof for every intervening/future build. |
 | Missing `TextPart` import | Adapter records a redacted compatibility error and host request proceeds without enhanced context. No fabricated Journal success or coverage change occurs. |
 | Missing `extra_user_content_parts` or `mark_as_temp` | Same fail-open behavior; core persistence and scheduling remain operational. |
 | `on_llm_response` observation | Metrics may be emitted, but Journal row count and coverage are unchanged. |

@@ -25,8 +25,14 @@ class InMemoryEventStore:
     async def read_after(self, session_id: str, sequence: int) -> list[ContextEvent]:
         return [event for event in self._events.get(session_id, []) if event.sequence > sequence]
 
-    async def read_range(self, session_id: str, start_sequence: int, end_sequence: int) -> list[ContextEvent]:
-        return [event for event in self._events.get(session_id, []) if start_sequence <= event.sequence <= end_sequence]
+    async def read_range(
+        self, session_id: str, start_sequence: int, end_sequence: int
+    ) -> list[ContextEvent]:
+        return [
+            event
+            for event in self._events.get(session_id, [])
+            if start_sequence <= event.sequence <= end_sequence
+        ]
 
 
 class InMemorySnapshotStore:
@@ -37,7 +43,9 @@ class InMemorySnapshotStore:
     async def latest_committed(self, session_id: str) -> Snapshot | None:
         return self._active.get(session_id)
 
-    async def commit_candidate(self, candidate: Snapshot, expected_base_version: int | None) -> bool:
+    async def commit_candidate(
+        self, candidate: Snapshot, expected_base_version: int | None
+    ) -> bool:
         if not candidate.committed:
             raise ValueError("candidate must be marked committed")
         async with self._lock:

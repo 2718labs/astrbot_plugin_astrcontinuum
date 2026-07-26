@@ -1,0 +1,89 @@
+name: Bug report / 缺陷报告
+description: Report reproducible incorrect behavior without private conversation data. / 报告可复现问题，请勿提交私密会话数据。
+title: "[Bug] "
+labels:
+  - bug
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thank you for reporting a problem. Search existing issues first. For vulnerabilities, use the private process in SECURITY.md.
+        感谢反馈。请先搜索现有 Issue；安全漏洞请按 SECURITY.md 私密报告。
+
+  - type: input
+    id: plugin_version
+    attributes:
+      label: AstrContinuum version or commit / 插件版本或提交
+      placeholder: v0.1.0 or commit SHA
+    validations:
+      required: true
+
+  - type: input
+    id: astrbot_version
+    attributes:
+      label: AstrBot version / AstrBot 版本
+      placeholder: 4.26.7
+    validations:
+      required: true
+
+  - type: input
+    id: environment
+    attributes:
+      label: Environment / 环境
+      description: Python, operating system, installation method. / Python、系统、安装方式。
+      placeholder: Python 3.12.13, Windows 11, manual clone
+    validations:
+      required: true
+
+  - type: input
+    id: adapter
+    attributes:
+      label: Adapter and platform / 适配器与平台
+      placeholder: aiocqhttp / QQ, or not adapter-specific
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Minimal reproduction / 最小复现
+      description: Use synthetic content only. / 只使用合成内容。
+      placeholder: |
+        1. Configure ...
+        2. Send ...
+        3. Observe ...
+    validations:
+      required: true
+
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior / 预期行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: observed
+    attributes:
+      label: Observed behavior / 实际行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: Redacted logs and durable state / 脱敏日志与持久状态
+      description: Remove messages, IDs, paths, tokens, keys, and database content. / 删除消息、身份、路径、令牌、密钥及数据库内容。
+      render: text
+
+  - type: checkboxes
+    id: confirmation
+    attributes:
+      label: Confirmation / 确认
+      options:
+        - label: I searched existing issues. / 我已搜索现有 Issue。
+          required: true
+        - label: I removed private conversation data and secrets. / 我已移除私密会话数据与密钥。
+          required: true
+        - label: This is not an unpatched security vulnerability. / 这不是尚未修复的安全漏洞。
+          required: true

@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import json
-from datetime import UTC, datetime
+from datetime import datetime, timezone
 from enum import Enum
 from types import SimpleNamespace
 
@@ -66,7 +66,7 @@ def test_extract_host_turn_identity_uses_exact_seven_field_session_key() -> None
 
     assert identity.request_identity == id(request)
     assert identity.host_message_id == "message-42"
-    assert identity.created_at == datetime.fromtimestamp(1_727_000_000, UTC)
+    assert identity.created_at == datetime.fromtimestamp(1_727_000_000, timezone.utc)
     assert identity.session_key.model_dump() == {
         "platform_instance_id": "platform-instance-1",
         "message_type": "FriendMessage",

@@ -1,21 +1,43 @@
-# 路线图
+# Roadmap
 
-## Internal Alpha
+English | [简体中文](./ROADMAP.zh-CN.md)
 
-领域模型、内存 EventStore、Snapshot + Delta、非阻塞 Scheduler、确定性 Assembler、基础测试。
+The roadmap is directional, not a compatibility promise. Maturity claims belong in the README,
+architecture document, changelog, and verification evidence for a concrete commit.
 
-## Technical Preview
+## v0.1.x — repository stabilization
 
-SQLite、LLM Capsule Compiler、Exact Anchors、Loss Auditor、AstrBot hooks、CLI Inspector。
+- Accumulate real AstrBot and adapter compatibility evidence.
+- Wire the background compaction worker into `Star` startup and termination with bounded
+  cancellation.
+- Select production compiler/auditor providers without blocking live hooks.
+- Add provider-aware token counters while preserving conservative fail-safe budgeting.
+- Add operator telemetry for queue depth, coverage, retry, lease, and degradation codes.
+- Exercise upgrade, backup/restore, crash, and long-running WAL behavior on real deployments.
+- Keep releases repository-only until the stabilization gate is explicitly accepted.
 
-## Public v1.0
+## v0.2 — controlled compaction preview
 
-Multi-resolution Context Tree、Query-Aware Reconstruction、Source Trace、Web Inspector、Sylanne Adapter、百万 Token demo、故障并发测试和发布文档。
+- Enable automatic job claiming behind an explicit configuration gate.
+- Provide bounded administration for status, retry, cancellation, and safe rollback.
+- Add adapter-specific evidence and declare only platforms actually verified.
+- Expand multi-version probe automation without publishing provider secrets.
+- Add a safe context inspector that separates provenance from private message content.
 
-## v1.x
+## v1.0 — production contract
 
-混合检索、Provider adapters、Tool artifact store、更精确 tokenizer、多语言评测、用户可编辑 Context Policy。
+- Stable migrations and documented upgrade/rollback policy.
+- Demonstrated non-blocking behavior, crash atomicity, and cross-session isolation under load.
+- Multi-resolution context reconstruction with source trace.
+- Provider-aware budgeting and reproducible long-context evaluation.
+- Operator-facing backup, retention, privacy, and recovery controls.
+- AstrBot market submission only after repository, security, documentation, and compatibility
+  gates pass.
 
-## v2
+## Later exploration
 
-学习型选择器、专用 Context Codec、跨会话项目上下文、多 Agent Context Bus。
+- Hybrid retrieval and tool-artifact storage.
+- User-editable context policies.
+- Cross-session project context with explicit authority boundaries.
+- Multi-agent context exchange.
+- Learned selectors or specialized context codecs, only when deterministic fallbacks remain.

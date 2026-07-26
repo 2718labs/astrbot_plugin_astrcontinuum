@@ -1,10 +1,20 @@
 import pytest
+
 from astrcontinuum.in_memory import InMemorySnapshotStore
 from astrcontinuum.models import Snapshot
 
 
 def snap(version: int, committed: bool = True) -> Snapshot:
-    return Snapshot(f"s{version}", "session", version, version * 10, (), committed, float(version), version - 1 if version > 1 else None)
+    return Snapshot(
+        f"s{version}",
+        "session",
+        version,
+        version * 10,
+        (),
+        committed,
+        float(version),
+        version - 1 if version > 1 else None,
+    )
 
 
 @pytest.mark.asyncio

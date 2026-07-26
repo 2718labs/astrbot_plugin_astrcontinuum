@@ -1,42 +1,22 @@
 {
   "enabled": {
-    "description": "启用 AstrContinuum",
+    "description": "Enable AstrContinuum. / 启用 AstrContinuum。",
     "type": "bool",
     "default": true
   },
   "model_context_limit": {
-    "description": "模型总上下文窗口 Token",
+    "description": "Total model-context budget. v0.1.0 conservatively counts UTF-8 bytes, not provider tokenizer tokens. / 模型总上下文预算；v0.1.0 使用 UTF-8 字节保守计数，并非模型 tokenizer Token。",
     "type": "int",
     "default": 200000
   },
   "target_input_budget": {
-    "description": "普通请求目标输入 Token",
+    "description": "Preferred request-input budget in the same conservative unit. / 普通请求的目标输入预算，计量单位同上。",
     "type": "int",
     "default": 130000
   },
   "hard_input_ceiling": {
-    "description": "硬输入上限 Token",
+    "description": "Hard request-input ceiling in the same conservative unit. / 请求输入硬上限，计量单位同上。",
     "type": "int",
     "default": 150000
-  },
-  "delta_trigger_tokens": {
-    "description": "Delta 达到多少 Token 后安排后台压缩",
-    "type": "int",
-    "default": 12000
-  },
-  "delta_trigger_turns": {
-    "description": "Delta 达到多少轮后安排后台压缩",
-    "type": "int",
-    "default": 24
-  },
-  "strict_audit": {
-    "description": "候选快照必须通过严格损失审计",
-    "type": "bool",
-    "default": true
-  },
-  "enable_sylanne_adapter": {
-    "description": "检测并只读接入 Sylanne 长期记忆",
-    "type": "bool",
-    "default": true
   }
 }

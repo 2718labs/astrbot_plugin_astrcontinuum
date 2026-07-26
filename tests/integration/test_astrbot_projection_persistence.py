@@ -21,6 +21,8 @@ class FakeLogger:
 
 
 class FakeFilter:
+    PermissionType = SimpleNamespace(ADMIN="ADMIN")
+
     @staticmethod
     def _decorator(**_kwargs: object):
         return lambda function: function
@@ -34,6 +36,10 @@ class FakeFilter:
 
     @staticmethod
     def command(_name: str, **_kwargs: object):
+        return lambda function: function
+
+    @staticmethod
+    def permission_type(_permission: object):
         return lambda function: function
 
 
