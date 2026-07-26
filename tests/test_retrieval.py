@@ -248,6 +248,10 @@ def test_retrieval_bounds_query_capsules_delta_and_candidate_count() -> None:
     assert all(candidate.capsule_id != "capsule-2" for candidate in candidates)
     raw = [item for item in candidates if item.kind == kind_type.RAW_EVENT]
     assert [item.event_sequence for item in raw] == [4, 5]
+    assert [item.text for item in raw] == [
+        "[USER_MESSAGE/USER event-4]\nraw delta 4",
+        "[USER_MESSAGE/USER event-5]\nraw delta 5",
+    ]
     assert all("SHOULD-NOT-BE-SCANNED" not in item.reason for item in candidates)
 
 

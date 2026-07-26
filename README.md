@@ -16,10 +16,10 @@ native message objects are restored by identity before AstrBot persists the comp
 
 > [!IMPORTANT]
 > `v0.1.0` is a repository-stage technical preview. It is deliberately **not listed in the
-> AstrBot plugin market**. The AstrBot hook bridge, durable Journal, request-view invariants,
-> reversible projection, storage contracts, and compaction core are implemented and tested.
-> The background compaction worker is not yet started by the plugin lifecycle, so automatic
-> long-running Snapshot production is not complete. See [Current status](#current-status)
+> AstrBot plugin market**. The hook bridge, durable Journal, pressure trigger, reversible
+> projection, background worker, and atomic Snapshot publication loop are implemented and
+> tested. This remains a controlled preview rather than a security-hardened production release.
+> See [Current status](#current-status) and [Operations and privacy](#operations-and-privacy)
 > before installing.
 
 ## Quick navigation
@@ -49,18 +49,18 @@ means “implemented in the core” and “active in the installed plugin” are
 | Idempotent user/assistant/tool Journal capture | Implemented and wired | Four authoritative hook/event mappings only |
 | Stable per-session identity | Implemented and wired | Seven-component `SessionKey` |
 | Snapshot-plus-Delta request reads | Implemented and wired | Uses logical `EMPTY_BASE` before the first Snapshot |
-| Deterministic budget assembly | Implemented and wired | Normal and emergency modes |
+| Pressure trigger and deterministic budget assembly | Implemented and wired | Near-window pressure, not a fixed turn count |
 | Provider-only temporary context projection | Implemented and wired | Uses `_no_save` and exact object-identity restoration |
 | Durable compaction intent | Implemented and wired | Intent is persisted after an assistant completion |
-| Capsule compiler, validator, auditor, and publication contracts | Implemented in the core | Covered by unit, SQLite integration, and crash-atomicity tests |
-| Background compaction worker lifecycle | **Not wired yet** | The Star class does not currently claim and execute queued jobs |
+| Exact-span Capsule compilation and publication | Implemented and wired | The model selects event ids and verbatim spans; code validates and renders |
+| Background compaction worker lifecycle | Implemented and wired | Automatic claim, renewal, retry, cancellation, and atomic publication |
 | Provider-backed semantic audit | **Not wired yet** | Mechanical validation remains mandatory in the core |
 | Time-travel/rollback user interface | **Not exposed yet** | Storage primitives exist; no AstrBot command or WebUI is published |
 | Sylanne external-memory adapter | Experimental core only | No external memory payload is written into the Journal |
 
-The repository is suitable for architecture review, compatibility testing, and controlled
-development environments. It should not yet be treated as the sole production mechanism for
-long-term conversation compaction.
+The repository now exercises the complete automatic loop. At-rest database encryption,
+provider tokenizers, and production administration controls remain unfinished, so this build is
+for controlled trials, architecture review, and compatibility testing.
 
 ## Why AstrContinuum exists
 
@@ -90,7 +90,8 @@ flowchart LR
     X --> H
 
     J --> I["Durable compaction intent"]
-    I -. "worker lifecycle not wired in v0.1.0" .-> C["Compile Capsules"]
+    I --> W["Background worker: claim / renew / retry"]
+    W --> C["Select event ids and exact source spans"]
     C --> A["Mechanical and optional semantic audit"]
     A --> S["Atomic Snapshot publication"]
     S --> V
@@ -101,8 +102,8 @@ The design has three logical lanes:
 - **Live lane:** capture → read committed view → select evidence → assemble budget → project →
   run provider → restore. It must stay bounded and non-blocking.
 - **Compaction lane:** claim durable intent → compile immutable Capsules → validate/audit →
-  publish with fencing and compare-and-swap. Its core exists; automatic plugin lifecycle
-  execution is pending.
+  publish with fencing and compare-and-swap. One worker is started and stopped by the plugin
+  lifecycle.
 - **Archive lane:** preserve immutable user, assistant, tool-call, and tool-result facts with
   provenance.
 
@@ -122,7 +123,7 @@ the real AstrBot handler registry in all verified host versions.
 | `on_agent_begin_guard` | `2000` | Record native request/message identities before projection |
 | `on_agent_begin_project` | `-100` | Append only AstrContinuum-owned temporary provider content |
 | `on_agent_done_restore` | `2000` | Restore the exact native graph plus provider-appended Delta |
-| `on_agent_done_finalize` | `900` | Verify restoration, capture assistant output, persist compaction intent |
+| `on_agent_done_finalize` | `900` | Verify restoration, capture assistant output, and persist intent under pressure |
 | `on_using_llm_tool` | `0` | Capture bounded, deterministic tool-call metadata |
 | `on_llm_tool_respond` | `0` | Capture bounded, deterministic tool-result metadata |
 | `on_llm_response` | `0` | Observation only; never writes a Journal event |
@@ -206,15 +207,21 @@ and stable identifiers. If required material does not fit normally, `EMERGENCY_A
 preserves critical blocks and the longest contiguous recent raw suffix that fits. It never
 deletes Journal rows or changes Snapshot coverage.
 
+The trigger is context pressure, not turn count. At the default `75%`, AstrContinuum queues a
+Checkpoint in the background while the current request still uses native AstrBot context. At
+the default `80%`, the provider input switches to a bounded “published Checkpoint + recent raw
+events + exact evidence” view.
+
 > [!NOTE]
 > `v0.1.0` uses a conservative `Utf8ByteTokenCounter`: one UTF-8 byte equals one budget unit.
 > Configuration values are therefore safety budgets, not exact provider-token counts. A
 > provider-aware tokenizer adapter is future work.
 
-Projection uses AstrBot's internal `Message`/`TextPart` capability only behind a runtime probe.
-The injected part and message are marked `_no_save`. AstrContinuum then restores the exact native
-objects by identity before finalization. If the capability is missing or the identity invariant
-fails, enhancement is skipped and AstrBot continues without AstrContinuum context.
+Injected parts and messages are marked `_no_save`, and AstrContinuum restores the exact native
+objects by identity before finalization. If hard pressure has already been reached but assembly
+or temporary-message support is unavailable, an empty Provider View removes old history while
+preserving system objects and the current input. This avoids sending a known-oversized request;
+the Journal and AstrBot's persisted history remain unchanged.
 
 ## Installation
 
@@ -242,7 +249,11 @@ AstrContinuum initialized
 As an AstrBot administrator, run `/context_status`; a ready instance returns:
 
 ```text
-AstrContinuum is ready.
+AstrContinuum：运行中
+后台归约：运行中
+已记录事件：2
+已发布 Checkpoint：1
+待处理任务：0
 ```
 
 ## Configuration
@@ -256,6 +267,9 @@ lifecycle.
 | `model_context_limit` | `int` | `200000` | Total conservative context budget |
 | `target_input_budget` | `int` | `130000` | Preferred input budget |
 | `hard_input_ceiling` | `int` | `150000` | Hard input ceiling |
+| `compaction_start_ratio` | `float` | `0.75` | Queue a background Checkpoint at this usable-window ratio |
+| `provider_view_switch_ratio` | `float` | `0.80` | Switch to the bounded Provider View at this ratio |
+| `compaction_provider_id` | `string` | empty | Follow the current conversation model, or explicitly select a smaller model |
 
 Invalid budget values fall back to the built-in defaults and emit the content-free warning code
 `BUDGET_CONFIG_INVALID`.
@@ -263,11 +277,17 @@ Invalid budget values fall back to the built-in defaults and emit the content-fr
 Reserved output/tool capacity (`32000`) and the assembly safety margin (`2000`) are fixed in
 `v0.1.0`.
 
+The compaction model does not write a free-form narrative summary. It may return only event ids
+and verbatim source spans; extra fields, missing event acknowledgements, or paraphrases that
+cannot be found in source are rejected and retried within a fixed bound. Selecting a different
+compaction provider sends conversation segments to that provider, so verify its data and privacy
+policy first.
+
 ## Commands
 
 | Command | Permission | Description |
 | --- | --- | --- |
-| `/context_status` | Administrator | Reports whether the durable AstrContinuum bridge is ready |
+| `/context_status` | Administrator | Reports real worker, Journal, Checkpoint, and pending-job counts |
 
 No compaction, rollback, or database-administration command is exposed in `v0.1.0`.
 
@@ -305,27 +325,35 @@ SQLite may also create `-wal` and `-shm` files while the database is active.
 - complete user and assistant text captured from authoritative hooks;
 - bounded deterministic tool metadata;
 - canonical session identity;
-- Snapshot, Capsule, membership, and compaction-job state when produced by the core.
+- Snapshot, Capsule, membership, and compaction-job state.
 
 Tool values are depth- and item-bounded. Oversized metadata falls back to a content-free
 truncation record. External Sylanne memory payloads are not admissible Journal or Capsule
 sources.
+
+> [!WARNING]
+> This technical preview does **not yet encrypt the SQLite database at rest**. Authoritative
+> source text is stored in the AstrBot plugin data directory. Use it only on a controlled
+> machine; do not treat it as suitable for sensitive-data requirements or upload its database
+> and backups to untrusted locations.
 
 ### Backup and recovery
 
 Disable the plugin or stop AstrBot before copying the database files, or use SQLite's online
 backup mechanism. Do not copy only the main `.sqlite3` file while WAL mode is active.
 
-On startup, migrations are idempotent. Expired worker leases can be requeued without mutating
-committed Snapshots or Journal events. The current Star lifecycle does not yet start that worker,
-so queued jobs may remain pending until the worker integration is completed.
+On startup, migrations are idempotent. The worker recovers and requeues expired leases without
+mutating committed Snapshots or Journal events. Long model calls renew their lease, and plugin
+termination cancels and awaits the tracked worker task.
 
 ### Failure behavior
 
 AstrContinuum is designed to fail open on the request path:
 
 - missing host identity → skip AstrContinuum for that request;
-- projection API mismatch → keep the native AstrBot request unchanged;
+- below the pressure threshold → keep the native AstrBot request unchanged;
+- hard pressure plus unavailable assembly/projection → use an empty Provider View rather than
+  sending known-oversized history;
 - projection or restoration invariant failure → record a redacted code and continue;
 - invalid budget configuration → use safe defaults;
 - failed candidate publication → keep the previous active Snapshot.

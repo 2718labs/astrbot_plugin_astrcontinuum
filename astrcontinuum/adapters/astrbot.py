@@ -150,6 +150,7 @@ class PreparedRequest:
     user_event: EventEnvelope = field(repr=False)
     view: RequestView = field(repr=False)
     candidates: tuple[CandidateBlock, ...] = field(repr=False)
+    trusted_token_usage: int | None
 
 
 def _raise(
@@ -683,12 +684,20 @@ class AstrBotHookBridge:
             )
             if user_event.event_id not in candidate.source_event_ids
         )
+        conversation = getattr(request, "conversation", None)
+        raw_usage = getattr(conversation, "token_usage", None)
+        trusted_token_usage = (
+            raw_usage
+            if isinstance(raw_usage, int) and not isinstance(raw_usage, bool) and raw_usage > 0
+            else None
+        )
         return PreparedRequest(
             turn=turn,
             current_input=current_input,
             user_event=user_event,
             view=view,
             candidates=candidates,
+            trusted_token_usage=trusted_token_usage,
         )
 
     def assemble_prepared(

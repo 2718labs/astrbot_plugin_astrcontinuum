@@ -18,10 +18,10 @@ root. It is designed to:
 - restore AstrBot's native message graph before host persistence;
 - compile and atomically publish structured, audited Snapshots in a background lane.
 
-At `v0.1.0`, the first five items are wired into the AstrBot lifecycle. The compaction domain,
-storage transactions, compiler, validator, auditor contracts, job state machine, and scheduler
-primitives exist and are tested, but the `Star` lifecycle does not yet start a worker that claims
-and executes queued compaction jobs. This is the most important current maturity boundary.
+At `v0.1.0`, all six items are wired into the AstrBot lifecycle. The `Star` starts one durable
+worker, binds an AstrBot-backed extractive compiler, renews fenced leases during slow model
+calls, and cancels the tracked task during termination. At-rest database encryption and a
+provider-backed semantic-audit adapter remain outside this preview.
 
 The repository is therefore a technical preview, not yet an AstrBot-market release.
 
@@ -30,8 +30,7 @@ The repository is therefore a technical preview, not yet an AstrBot-market relea
 ### 2.1 Non-blocking live requests
 
 The request path may perform bounded local work and SQLite transactions. It must not wait for a
-compiler, semantic auditor, background worker, remote summarization model, or whole-database
-scan.
+compiler, semantic auditor, background worker, remote extraction model, or whole-database scan.
 
 ### 2.2 Durable authority
 
@@ -51,8 +50,8 @@ Process-local locks, queues, and task ownership are optimizations only.
 ### 2.3 Loss-aware compaction
 
 A Snapshot is not a free-form summary. It is an immutable, structured representation of a
-contiguous Journal prefix with explicit provenance, exact anchors, coverage, quality metrics,
-and audit outcome.
+contiguous Journal prefix. The model may select only event ids and exact source spans; code owns
+identity, validation, deterministic rendering, coverage, quality metrics, and publication.
 
 ### 2.4 Host-history non-interference
 
@@ -72,7 +71,7 @@ Snapshots are never accepted as the price of availability.
 - no user-facing rollback or time-travel command;
 - no WebUI administration page;
 - no provider-backed semantic-audit adapter;
-- no automatically running compaction worker in `AstrContinuumPlugin`;
+- no at-rest encryption for Journal or Snapshot content;
 - no claim that UTF-8 byte counting equals provider tokenization;
 - no platform-adapter-specific behavior or declared adapter support;
 - no import of external Sylanne memory payloads into durable AstrContinuum records.
@@ -93,6 +92,7 @@ flowchart TB
         Project["temporary projection"]
         Restore["native restoration"]
         Finalize["assistant capture and intent"]
+        Worker["tracked compaction worker"]
     end
 
     subgraph Core["astrcontinuum package"]
@@ -127,7 +127,8 @@ flowchart TB
     Restore --> Finalize
     Finalize --> Journal
     Finalize --> Jobs
-    Jobs -. "worker integration pending" .-> Compiler
+    Jobs --> Worker
+    Worker --> Compiler
     Compiler --> Auditor
     Auditor --> Snapshot
     Snapshot --> Pointer
@@ -161,14 +162,15 @@ The domain layer must remain importable without AstrBot.
 4. Run idempotent migrations in a worker thread.
 5. Construct one `SQLiteRepository`.
 6. Construct `AstrBotHookBridge` with the validated budget configuration.
-7. Probe the internal provider-message projection capability once.
-
-No background compaction worker is started in `v0.1.0`.
+7. Construct the bounded per-session provider registry and exact-span compiler backend.
+8. Construct and start one tracked `CompactionWorker`.
+9. Probe the internal provider-message projection capability once.
 
 ### 6.2 Termination
 
-`terminate()` clears the bridge and projection capability under the same lifecycle lock, then
-marks the instance uninitialized. It is safe to call repeatedly.
+`terminate()` first cancels and awaits the tracked worker, then clears the bridge, provider
+registry, and projection capability under the same lifecycle lock. It is safe to call
+repeatedly.
 
 The method is defined directly on the sole `Star` subclass, as required by AstrBot's plugin
 termination behavior.
@@ -193,9 +195,14 @@ sequenceDiagram
     AC->>AC: freeze request and native object identities
 
     AB->>AC: on_agent_begin_project(priority=-100)
-    AC->>RT: retrieve and assemble within budget
-    RT-->>AC: selected blocks + content-free trace
-    AC->>AB: append _no_save provider-only Message
+    AC->>AC: assess provider/fallback context pressure
+    alt below Provider View threshold
+        AC-->>AB: leave native request unchanged
+    else at or above Provider View threshold
+        AC->>RT: retrieve and assemble within budget
+        RT-->>AC: selected blocks + content-free trace
+        AC->>AB: replace native history with bounded temporary view
+    end
 
     AB->>LLM: run agent/provider
     LLM-->>AB: response and provider-appended messages
@@ -206,7 +213,10 @@ sequenceDiagram
     AB->>AC: on_agent_done_finalize(priority=900)
     AC->>AC: verify restored native graph
     AC->>DB: idempotently capture ASSISTANT_MESSAGE
-    AC->>DB: monotonically raise compaction intent
+    opt at or above compaction threshold
+        AC->>DB: monotonically raise compaction intent
+        AC->>AC: wake worker without waiting
+    end
     AC-->>AB: return
 ```
 
@@ -319,12 +329,19 @@ Candidate selection is deterministic. Stable sorting uses:
 - block id;
 - block kind and stable source identity.
 
-### 12.1 Normal assembly
+### 12.1 Pressure policy
+
+Pressure is assessed against usable capacity (`model limit - output/tool reserve`). A positive
+provider usage value is preferred; otherwise the complete native input is estimated
+conservatively. The default compaction and projection ratios are `0.75` and `0.80`. These
+thresholds are independent of conversation turn count.
+
+### 12.2 Normal assembly
 
 Candidates are accepted in deterministic order while the resulting projection fits `B_ac`.
 Duplicate block identifiers are rejected with a content-free reason.
 
-### 12.2 Emergency assembly
+### 12.3 Emergency assembly
 
 If a required block cannot fit under normal selection:
 
@@ -336,7 +353,7 @@ If a required block cannot fit under normal selection:
 The assembly trace contains ids, slots, costs, scores, reasons, coverage, and totals, but not
 message text.
 
-### 12.3 Counting limitation
+### 12.4 Counting limitation
 
 The plugin currently uses `Utf8ByteTokenCounter`, which counts one unit per UTF-8 byte. It is
 deterministic and conservative but not provider-token accurate.
@@ -350,7 +367,9 @@ The adapter probes for:
 - `TextPart`;
 - `TextPart.mark_as_temp`.
 
-If any capability is absent, projection is skipped.
+If temporary message construction is unavailable below the hard-pressure threshold, the native
+request remains unchanged. At or above hard pressure, an empty projection can still remove
+native history while retaining system objects and the current input.
 
 When available:
 
@@ -436,7 +455,7 @@ Mechanical validation is permanent and cannot be disabled. `strict_audit=false` 
 future provider-backed semantic audit; it cannot bypass identity, source, coverage, anchor,
 membership, non-empty-output, or audit-envelope checks.
 
-### 15.1 Implemented core
+### 15.1 Implemented runtime
 
 - durable monotonic intent coalescing;
 - eligible job claim and lease epoch fencing;
@@ -446,21 +465,24 @@ membership, non-empty-output, or audit-envelope checks.
 - atomic Snapshot/Capsule/membership publication;
 - retry/failure transitions;
 - expired-lease recovery;
-- in-memory coalescing scheduler primitive.
+- periodic durable claim loop and non-blocking wake-up;
+- lease renewal while a model call is in flight;
+- exact frozen-base/target reads for every claimed job;
+- bounded redacted retry and failure isolation;
+- tracked startup and cancellation during plugin termination.
 
-### 15.2 Pending plugin integration
+### 15.2 Compiler trust boundary
 
-`AstrContinuumPlugin.initialize()` does not yet:
+The configured compaction provider overrides the current conversation provider only when the
+operator selects it explicitly. Otherwise provider affinity is remembered per session. After a
+restart, a pending job waits until that session is observed again instead of silently choosing
+a different data recipient.
 
-- start a claim loop;
-- bind a production compiler backend;
-- bind a semantic-audit provider;
-- renew leases;
-- execute/recover jobs periodically;
-- stop a worker task during `terminate()`.
-
-The request path persists compaction intent, but queued work may remain pending. This limitation
-must stay visible in README and release notes until the lifecycle integration is complete.
+The provider receives deterministic event segments with role labels and a closed JSON shape. It
+may acknowledge event ids and select exact spans only. Unknown ids, missing acknowledgements,
+extra fields, or text not found in its declared source event reject the segment. Capsule ids,
+claim ids, fallback anchors, rendering, mechanical validation, and publication are owned by
+code. The remaining optional semantic-audit protocol is not bound to a provider in this preview.
 
 ## 16. Concurrency model
 
@@ -493,9 +515,10 @@ if durable intent is still beyond the winner's coverage.
 | --- | --- |
 | Missing event-extra API | Skip AstrContinuum state for the request |
 | Initialization/storage error | Record redacted `INITIALIZE_FAILED`; host request proceeds |
-| Missing projection capability | Do not alter the provider message list |
+| Missing projection capability below hard pressure | Do not alter the provider message list |
+| Assembly/projection unavailable at hard pressure | Remove native history with an empty Provider View |
 | Invalid projection boundary | Record a content-free adapter fault; skip projection |
-| Required input exceeds budget | Fail the enhancement path without truncating host-owned objects |
+| Required input exceeds budget | Retain a bounded recent suffix; durable rows remain unchanged |
 | Restore/verify failure | Record a redacted invariant code; do not claim native verification |
 | Compiler/auditor worker failure | Persist stage/code/redacted message and retry or fail that job |
 | Publication race | Roll back candidate savepoint and persist `SUPERSEDED` |
@@ -508,6 +531,8 @@ logs.
 
 AstrContinuum stores complete user and assistant content because those records are the
 authoritative local Journal. Operators must protect the plugin data directory accordingly.
+The `v0.1.0` SQLite database is not encrypted at rest; this is an explicit preview limitation,
+not a security claim.
 
 Tool metadata is canonicalized with bounded:
 

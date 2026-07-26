@@ -16,9 +16,9 @@ AstrContinuum 将权威会话事件写入只追加的 SQLite Journal，从“已
 
 > [!IMPORTANT]
 > `v0.1.0` 是仅进入代码仓库的技术预览版，**暂未提交 AstrBot 插件市场**。
-> AstrBot 钩子桥、持久 Journal、请求视图不变量、可逆投影、存储契约和压缩核心已经
-> 实现并通过测试；但插件生命周期尚未启动后台压缩 worker，因此自动、持续地产生
-> Snapshot 的闭环还没有完成。安装前请先阅读[当前状态](#当前状态)。
+> AstrBot 钩子桥、持久 Journal、压力触发、可逆投影、后台归约 worker 和 Snapshot
+> 原子发布闭环均已接入并通过测试。它仍是供受控试玩和验证的预览版，不是已完成安全
+> 加固的生产版本；安装前请先阅读[当前状态](#当前状态)和[运维与隐私](#运维与隐私)。
 
 ## 快速导航
 
@@ -47,17 +47,17 @@ AstrContinuum 将可独立验证的持久化核心与 AstrBot 组合入口分开
 | 用户/助手/工具 Journal 幂等采集 | 已实现、已接线 | 只允许四种权威 hook/event 映射 |
 | 会话稳定身份 | 已实现、已接线 | 七元 `SessionKey` |
 | Snapshot + Delta 请求读取 | 已实现、已接线 | 首个 Snapshot 前使用逻辑 `EMPTY_BASE` |
-| 确定性预算装配 | 已实现、已接线 | NORMAL 与 EMERGENCY 两种模式 |
+| 压力触发与确定性预算装配 | 已实现、已接线 | 接近窗口才触发，不依赖固定轮数 |
 | Provider-only 临时上下文投影 | 已实现、已接线 | `_no_save` + 精确对象身份恢复 |
 | 持久化压缩意图 | 已实现、已接线 | 助手完成后写入 durable intent |
-| Capsule 编译、校验、审计、发布契约 | 核心已实现 | 单元、SQLite 集成和崩溃原子性测试覆盖 |
-| 后台压缩 worker 生命周期 | **尚未接线** | 当前 Star 不会自动 claim 并执行排队 job |
+| 精确引文式 Capsule 编译与发布 | 已实现、已接线 | 小模型只选择事件编号和逐字引文，程序负责校验与渲染 |
+| 后台压缩 worker 生命周期 | 已实现、已接线 | 自动 claim、续租、重试、取消与原子发布 |
 | Provider 驱动的语义审计 | **尚未接线** | 核心中的机械校验始终强制执行 |
 | 时间旅行 / 回滚管理界面 | **尚未暴露** | 存储原语存在，但没有发布指令或 WebUI |
 | Sylanne 外部记忆适配 | 仅实验性核心 | 外部记忆正文不会写入 Journal |
 
-当前仓库适合架构评审、兼容性测试和受控开发环境，不应被当成已经完成闭环的生产级
-长期压缩方案。
+当前仓库已经可以验证完整自动闭环，但本地数据库内容加密、Provider tokenizer 和
+生产级运维控制仍未完成，因此只适合受控试玩、架构评审和兼容性测试。
 
 ## 为什么需要 AstrContinuum
 
@@ -86,7 +86,8 @@ flowchart LR
     X --> H
 
     J --> I["持久化压缩意图"]
-    I -. "v0.1.0 尚未接入 worker 生命周期" .-> C["编译 Capsules"]
+    I --> W["后台 worker：claim / 续租 / 重试"]
+    W --> C["逐段选择事件编号与精确引文"]
     C --> A["机械校验与可选语义审计"]
     A --> S["原子发布 Snapshot"]
     S --> V
@@ -97,7 +98,7 @@ flowchart LR
 - **Live Lane：**采集 → 读取已提交视图 → 选择证据 → 预算装配 → 临时投影 →
   Provider 执行 → 恢复。它必须有界且不等待后台工作。
 - **Compaction Lane：**领取持久化意图 → 编译不可变 Capsule → 校验/审计 →
-  带 fencing 与 CAS 的原子发布。核心已经存在，插件生命周期自动执行尚待接入。
+  带 fencing 与 CAS 的原子发布。插件生命周期会自动启动和停止唯一 worker。
 - **Archive Lane：**保留不可变的用户、助手、工具调用和工具结果事实及其来源。
 
 完整设计见[架构](./docs/ARCHITECTURE.zh-CN.md)、
@@ -115,7 +116,7 @@ registry 在三个版本中核验。
 | `on_agent_begin_guard` | `2000` | 投影前记录原生请求/消息对象身份 |
 | `on_agent_begin_project` | `-100` | 只追加 AstrContinuum 自己拥有的临时 Provider 内容 |
 | `on_agent_done_restore` | `2000` | 恢复精确原生对象图和 Provider 新增 Delta |
-| `on_agent_done_finalize` | `900` | 校验恢复、采集助手输出、持久化压缩意图 |
+| `on_agent_done_finalize` | `900` | 校验恢复、采集助手输出，并在有压力时持久化压缩意图 |
 | `on_using_llm_tool` | `0` | 采集有界、确定性的工具调用元数据 |
 | `on_llm_tool_respond` | `0` | 采集有界、确定性的工具结果元数据 |
 | `on_llm_response` | `0` | 仅观测，绝不写 Journal |
@@ -194,14 +195,19 @@ B_ac = max(
 容纳必需信息，就进入 `EMERGENCY_ASSEMBLY`，保留关键块与预算内最长的连续近期原文
 后缀。这个过程不会删 Journal，也不会改变 Snapshot 覆盖。
 
+触发条件来自上下文压力，而不是对话轮数。达到默认 `75%` 时只在后台排队生成
+Checkpoint，当前请求仍使用 AstrBot 原生上下文；达到默认 `80%` 时才把 Provider
+本轮输入切换为“已发布 Checkpoint + 近期原文 + 精确证据”的有界视图。
+
 > [!NOTE]
 > `v0.1.0` 使用保守的 `Utf8ByteTokenCounter`：一个 UTF-8 字节算一个预算单位。
 > 配置值因此是安全预算，不是 Provider tokenizer 的精确 Token 数。Provider-aware
 > tokenizer 适配属于后续工作。
 
-临时投影只在运行时探测到 AstrBot 内部 `Message` / `TextPart` 能力后使用。新建 part
-和 message 都标记 `_no_save`，最终再按身份恢复原生对象。如果能力缺失或身份不变量
-失败，插件会跳过增强，让 AstrBot 使用原请求继续执行。
+临时投影新建的 part 和 message 都标记 `_no_save`，最终再按身份恢复原生对象。
+如果已达到硬压力而装配或 AstrBot 临时消息能力不可用，插件会使用“空 Provider
+View”移除旧历史，只保留系统消息与当前输入，从而避免把已知超限的完整请求继续发给
+模型；Journal 和 AstrBot 持久历史仍保持不变。
 
 ## 安装
 
@@ -228,7 +234,11 @@ AstrContinuum initialized
 由 AstrBot 管理员执行 `/context_status`，就绪时返回：
 
 ```text
-AstrContinuum is ready.
+AstrContinuum：运行中
+后台归约：运行中
+已记录事件：2
+已发布 Checkpoint：1
+待处理任务：0
 ```
 
 ## 配置
@@ -241,17 +251,23 @@ WebUI 只暴露已经接入 `v0.1.0` Star 生命周期的设置。
 | `model_context_limit` | `int` | `200000` | 总保守上下文预算 |
 | `target_input_budget` | `int` | `130000` | 首选输入预算 |
 | `hard_input_ceiling` | `int` | `150000` | 输入硬上限 |
+| `compaction_start_ratio` | `float` | `0.75` | 达到可用窗口比例后，后台生成 Checkpoint |
+| `provider_view_switch_ratio` | `float` | `0.80` | 达到可用窗口比例后，切换到有界 Provider View |
+| `compaction_provider_id` | `string` | 空 | 留空跟随当前对话模型；也可显式选择 MiniMax 等小模型 |
 
 预算配置非法时会回退到内置默认值，并只记录不含正文的
 `BUDGET_CONFIG_INVALID` 警告码。
 
 输出/工具预留预算 `32000` 和装配安全余量 `2000` 在 `v0.1.0` 中固定，不对外配置。
+归约模型不负责写自由文本摘要，只能返回事件编号和逐字引文；额外字段、缺失事件、
+找不到原文的转述都会被拒绝并进入有界重试。若显式选择不同的归约 Provider，对话
+片段会发送给该 Provider，请先确认其数据与隐私策略。
 
 ## 指令
 
 | 指令 | 权限 | 说明 |
 | --- | --- | --- |
-| `/context_status` | 管理员 | 报告持久化 AstrContinuum bridge 是否就绪 |
+| `/context_status` | 管理员 | 显示 worker、Journal、Checkpoint 与待处理任务的真实状态 |
 
 `v0.1.0` 不提供压缩、回滚或数据库管理指令。
 
@@ -288,26 +304,32 @@ AstrBot/data/plugin_data/astrbot_plugin_astrcontinuum/astrcontinuum.sqlite3
 - 权威钩子采集的完整用户和助手文本；
 - 有界、确定性的工具元数据；
 - 规范会话身份；
-- 核心产生的 Snapshot、Capsule、成员关系和压缩任务状态。
+- Snapshot、Capsule、成员关系和压缩任务状态。
 
 工具对象会限制深度、条目数和字符串长度；元数据过大时只保留不含正文的截断记录。
 外部 Sylanne 记忆正文不能成为 Journal 或 Capsule 来源。
+
+> [!WARNING]
+> 当前技术预览版的 SQLite 数据库**尚未实现静态加密**，权威原文会以数据库记录形式
+> 保存在 AstrBot 插件数据目录。只应在受控机器试玩；不要把它当成满足敏感数据保护
+> 要求的版本，也不要把数据库或备份上传到不受信任的位置。
 
 ### 备份与恢复
 
 复制数据库文件前应禁用插件或停止 AstrBot，或者使用 SQLite 在线备份机制。WAL 模式
 运行时不能只复制主 `.sqlite3` 文件。
 
-启动时数据库迁移是幂等的。过期 worker lease 可以重新排队，而不修改已提交 Snapshot
-或 Journal。当前 Star 生命周期尚未启动该 worker，因此在接线完成前，排队 job 可能
-一直保持 pending。
+启动时数据库迁移是幂等的。worker 会恢复过期 lease 并重新排队，不修改已提交
+Snapshot 或 Journal；长时间模型调用期间会主动续租，插件终止时会取消并等待后台
+任务退出。
 
 ### 失败行为
 
 AstrContinuum 的请求路径按 fail-open 设计：
 
 - 缺少宿主身份字段 → 本轮跳过 AstrContinuum；
-- 投影 API 不匹配 → 保持原 AstrBot 请求不变；
+- 未达到压力阈值 → 保持原 AstrBot 请求不变；
+- 达到硬压力但装配/投影能力不可用 → 使用空 Provider View，避免发送已知超限历史；
 - 投影/恢复不变量失败 → 记录脱敏错误码并继续；
 - 预算配置非法 → 使用安全默认值；
 - 候选发布失败 → 旧 active Snapshot 保持不变。

@@ -191,7 +191,6 @@ def project(
     _validate_preserved(checked_messages, guard, stage=ProjectionStage.PROJECT)
     if (
         not isinstance(projection_objects, tuple)
-        or not projection_objects
         or not _identity_is_unique(projection_objects)
         or any(
             message is projection
@@ -239,7 +238,7 @@ def restore(messages: list[object], projected: ProjectedView) -> RestoredView:
     checked_messages = _validate_message_list(
         messages,
         stage=ProjectionStage.RESTORE,
-        expected_identity=projected.message_list_identity,
+        expected_identity=None,
     )
     if projected.request_identity != guard.request_identity:
         _invalid(
@@ -249,17 +248,35 @@ def restore(messages: list[object], projected: ProjectedView) -> RestoredView:
             actual_count=0,
             message_list_identity_match=True,
         )
-    prefix_count = len(projected.projected_objects)
-    actual_prefix = tuple(checked_messages[:prefix_count])
-    if not _same_identity_sequence(actual_prefix, projected.projected_objects):
+    current_positions = tuple(
+        index
+        for target in guard.current_objects
+        for index, message in enumerate(checked_messages)
+        if message is target
+    )
+    if len(current_positions) != len(guard.current_objects) or current_positions != tuple(
+        sorted(current_positions)
+    ):
         _invalid(
             ProjectionErrorCode.PROJECTED_PREFIX_MISMATCH,
             ProjectionStage.RESTORE,
-            expected_count=prefix_count,
-            actual_count=len(actual_prefix),
-            message_list_identity_match=True,
+            expected_count=len(guard.current_objects),
+            actual_count=len(current_positions),
+            message_list_identity_match=(id(checked_messages) == projected.message_list_identity),
         )
-    delta_objects = tuple(checked_messages[prefix_count:])
+    delta_objects = tuple(checked_messages[current_positions[-1] + 1 :])
+    if any(
+        message is projection
+        for projection in projected.projection_objects
+        for message in delta_objects
+    ):
+        _invalid(
+            ProjectionErrorCode.PROJECTED_PREFIX_MISMATCH,
+            ProjectionStage.RESTORE,
+            expected_count=0,
+            actual_count=1,
+            message_list_identity_match=(id(checked_messages) == projected.message_list_identity),
+        )
     restored_objects = (*projected.pre_projection_objects, *delta_objects)
     checked_messages[:] = restored_objects
     return RestoredView(
@@ -275,7 +292,5 @@ def verify_native(messages: list[object], restored: RestoredView) -> bool:
     if not isinstance(messages, list):
         return False
     guard = restored.projected.guard
-    if id(messages) != guard.message_list_identity:
-        return False
     expected = (*guard.native_objects, *restored.delta_objects)
     return _same_identity_sequence(messages, expected)

@@ -17,9 +17,9 @@ AstrContinuum 是通过一个 `Star` 组合入口嵌入 AstrBot 的持久化上�
 - 在宿主持久化前恢复 AstrBot 原生消息对象图；
 - 在后台通道编译并原子发布结构化、经过审计的 Snapshot。
 
-在 `v0.1.0` 中，前五项已经接入 AstrBot 生命周期。压缩领域、存储事务、编译器、
-校验器、审计契约、任务状态机和调度器原语已实现并有测试，但 `Star` 生命周期尚未
-启动会领取并执行压缩任务的 worker。这是当前最重要的成熟度边界。
+在 `v0.1.0` 中，以上六项都已接入 AstrBot 生命周期。`Star` 会启动唯一持久 worker，
+绑定 AstrBot 提供的精确引文式编译后端，在慢模型调用期间续租，并在终止时取消和等待
+受跟踪任务。数据库静态加密与 Provider 语义审计适配器仍不属于本预览版。
 
 因此本仓库仍是技术预览版，暂未提交 AstrBot 插件市场。
 
@@ -28,7 +28,7 @@ AstrContinuum 是通过一个 `Star` 组合入口嵌入 AstrBot 的持久化上�
 ### 2.1 在线请求不等待后台压缩
 
 请求路径可以执行有界的本地计算和 SQLite 事务，但不得等待编译器、语义审计器、
-后台 worker、远程摘要模型或全库扫描。
+后台 worker、远程提取模型或全库扫描。
 
 ### 2.2 持久化事实拥有最终权威
 
@@ -47,8 +47,9 @@ AstrContinuum 是通过一个 `Star` 组合入口嵌入 AstrBot 的持久化上�
 
 ### 2.3 压缩必须可审计、可追溯
 
-Snapshot 不是一段自由文本摘要。它是某个连续 Journal 前缀的不可变结构化表示，
-包含显式来源、精确锚点、覆盖范围、质量指标和审计结论。
+Snapshot 不是一段自由文本摘要。它是某个连续 Journal 前缀的不可变结构化表示。
+模型只能选择事件编号和逐字来源片段；身份、校验、确定性渲染、覆盖、质量指标和发布
+全部由程序拥有。
 
 ### 2.4 不干扰宿主原生历史
 
@@ -66,7 +67,7 @@ AstrBot 原生消息历史。所有注入内容必须标记为临时，并在之
 - 不提供用户可见的回滚或时间旅行指令；
 - 不提供 WebUI 管理页面；
 - 不提供 Provider 驱动的语义审计适配器；
-- `AstrContinuumPlugin` 不会自动启动后台压缩 worker；
+- Journal 与 Snapshot 尚未实现静态加密；
 - 不宣称 UTF-8 字节计数等价于 Provider tokenizer；
 - 不实现平台适配器特定行为，也不声明具体适配器支持；
 - 不把外部 Sylanne 记忆正文导入 AstrContinuum 持久记录。
@@ -87,6 +88,7 @@ flowchart TB
         Project["临时投影"]
         Restore["原生对象恢复"]
         Finalize["助手采集与压缩意图"]
+        Worker["受跟踪的后台归约 worker"]
     end
 
     subgraph Core["astrcontinuum 包"]
@@ -121,7 +123,8 @@ flowchart TB
     Restore --> Finalize
     Finalize --> Journal
     Finalize --> Jobs
-    Jobs -. "worker 接线尚未完成" .-> Compiler
+    Jobs --> Worker
+    Worker --> Compiler
     Compiler --> Auditor
     Auditor --> Snapshot
     Snapshot --> Pointer
@@ -155,14 +158,14 @@ flowchart TB
 4. 在线程中运行幂等迁移；
 5. 创建唯一 `SQLiteRepository`；
 6. 使用通过校验的预算配置创建 `AstrBotHookBridge`；
-7. 对 Provider 消息投影能力执行一次探测。
-
-`v0.1.0` 不会在这里启动后台压缩 worker。
+7. 创建有界的会话 Provider 注册表和精确引文式编译后端；
+8. 创建并启动唯一 `CompactionWorker`；
+9. 对 Provider 消息投影能力执行一次探测。
 
 ### 6.2 终止
 
-`terminate()` 在同一生命周期锁下清空 bridge 和投影能力，并把实例恢复为未初始化。
-重复调用是安全的。
+`terminate()` 先取消并等待后台 worker，再在同一生命周期锁下清空 bridge、Provider
+注册表和投影能力，并把实例恢复为未初始化。重复调用是安全的。
 
 该方法直接定义在唯一 `Star` 子类中，符合 AstrBot 对插件终止方法的查找行为。
 
@@ -186,9 +189,14 @@ sequenceDiagram
     AC->>AC: 冻结请求与原生对象身份
 
     AB->>AC: on_agent_begin_project(priority=-100)
-    AC->>RT: 在预算内检索和装配
-    RT-->>AC: 已选块 + 不含正文的 trace
-    AC->>AB: 追加 _no_save Provider-only Message
+    AC->>AC: 评估 Provider usage / 保守回退压力
+    alt 未达到 Provider View 阈值
+        AC-->>AB: 保持原生请求不变
+    else 达到 Provider View 阈值
+        AC->>RT: 在预算内检索和装配
+        RT-->>AC: 已选块 + 不含正文的 trace
+        AC->>AB: 用有界临时视图替换原生历史
+    end
 
     AB->>LLM: 执行 Agent / Provider
     LLM-->>AB: 返回响应与 Provider 新增消息
@@ -199,7 +207,10 @@ sequenceDiagram
     AB->>AC: on_agent_done_finalize(priority=900)
     AC->>AC: 校验恢复后的原生图
     AC->>DB: 幂等采集 ASSISTANT_MESSAGE
-    AC->>DB: 单调提升压缩意图
+    opt 达到后台归约阈值
+        AC->>DB: 单调提升压缩意图
+        AC->>AC: 唤醒 worker，不等待
+    end
     AC-->>AB: 返回
 ```
 
@@ -307,12 +318,18 @@ B_ac = max(0, B_input - opaque_host_history - B_required)
 - block id；
 - block kind 与稳定来源身份。
 
-### 12.1 普通装配
+### 12.1 压力策略
+
+压力以可用容量（模型窗口减去输出/工具预留）计算。优先使用正数的 Provider usage；
+拿不到时才保守估算完整原生输入。后台归约和 Provider View 的默认阈值分别为 `0.75`
+与 `0.80`，与对话轮数无关。
+
+### 12.2 普通装配
 
 按确定性顺序加入候选，直到投影即将超过 `B_ac`。重复 block id 使用不含正文的原因码
 拒绝。
 
-### 12.2 紧急装配
+### 12.3 紧急装配
 
 如果普通选择无法放入某个必需块：
 
@@ -323,7 +340,7 @@ B_ac = max(0, B_input - opaque_host_history - B_required)
 
 装配 trace 记录 id、slot、cost、score、reason、coverage 与总量，但不记录消息正文。
 
-### 12.3 计数限制
+### 12.4 计数限制
 
 插件当前使用 `Utf8ByteTokenCounter`，每个 UTF-8 字节计一个单位。它确定、保守，但
 不等于 Provider tokenizer 的精确 Token 数。
@@ -337,7 +354,8 @@ B_ac = max(0, B_input - opaque_host_history - B_required)
 - `TextPart`；
 - `TextPart.mark_as_temp`。
 
-任一能力缺失时，插件跳过投影。
+在硬压力阈值以下，临时消息能力缺失时保持原生请求不变；达到硬压力后，即使不能创建
+临时消息，也可以用空投影移除原生历史，同时保留 system 对象和当前输入。
 
 能力可用时：
 
@@ -421,7 +439,7 @@ CANCELLED
 机械校验永久强制，不能关闭。`strict_audit=false` 最多只能跳过未来的 Provider 语义
 审计，不能绕过身份、来源、覆盖、精确锚点、成员关系、非空输出或审计信封校验。
 
-### 15.1 已实现核心
+### 15.1 已实现运行时
 
 - 持久化、单调合并的压缩意图；
 - 可领取任务与 lease-epoch fencing；
@@ -431,21 +449,22 @@ CANCELLED
 - Snapshot/Capsule/membership 原子发布；
 - 重试/失败状态迁移；
 - 过期 lease 恢复；
-- 进程内 coalescing scheduler 原语。
+- 周期持久 claim loop 与非阻塞唤醒；
+- 模型调用期间续租；
+- 每个 job 按冻结 base/target 精确读取；
+- 有界脱敏重试与失败隔离；
+- 插件启动时跟踪、终止时取消并等待 worker。
 
-### 15.2 尚待插件接入
+### 15.2 编译器信任边界
 
-`AstrContinuumPlugin.initialize()` 尚未：
+只有运维者显式选择时，配置的归约 Provider 才会覆盖当前对话 Provider；否则按会话
+记住当前 Provider。进程重启后，pending job 会等该会话再次出现，而不是悄悄选择另一
+个数据接收方。
 
-- 启动 claim loop；
-- 绑定生产编译器后端；
-- 绑定语义审计 Provider；
-- 续租 lease；
-- 周期执行/恢复 job；
-- 在 `terminate()` 中停止 worker task。
-
-请求路径会持久化 compaction intent，但排队任务可能一直 pending。在完成生命周期接线
-前，这条限制必须持续显示在 README 和发布说明中。
+Provider 接收带角色标签的确定性事件分段和封闭 JSON 结构，只能确认事件编号并选择
+逐字片段。未知编号、缺失确认、额外字段或不在声明来源事件中的文本都会拒绝该分段。
+Capsule/claim 标识、回退锚点、渲染、机械校验和发布均由程序负责。本预览版仍未给可选
+语义审计协议绑定 Provider。
 
 ## 16. 并发模型
 
@@ -477,9 +496,10 @@ sequence 冲突。
 | --- | --- |
 | event extra API 缺失 | 本轮跳过 AstrContinuum 状态 |
 | 初始化/存储失败 | 记录脱敏 `INITIALIZE_FAILED`，宿主请求继续 |
-| 投影能力缺失 | 不修改 Provider 消息列表 |
+| 硬压力以下投影能力缺失 | 不修改 Provider 消息列表 |
+| 硬压力下装配/投影不可用 | 用空 Provider View 移除原生历史 |
 | 投影边界非法 | 记录不含正文的适配错误，跳过投影 |
-| 必需输入超过预算 | 结束增强路径，不裁剪宿主持有对象 |
+| 必需输入超过预算 | 保留有界近期后缀，持久数据不变 |
 | 恢复/校验失败 | 记录脱敏不变量码，不宣称原生恢复通过 |
 | compiler/auditor worker 失败 | 持久化 stage/code/脱敏 message，重试或终止该 job |
 | 发布竞争 | 回滚候选 savepoint，持久化 `SUPERSEDED` |
@@ -491,6 +511,7 @@ sequence 冲突。
 
 AstrContinuum 会存储完整用户与助手内容，因为这些记录构成本地权威 Journal。运维者
 必须相应保护插件数据目录。
+`v0.1.0` 的 SQLite 数据库没有静态加密；这是明确的预览限制，不是安全承诺。
 
 工具元数据会限制：
 

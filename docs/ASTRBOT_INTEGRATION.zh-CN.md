@@ -16,7 +16,8 @@ API 清单”。凡是修改 Hook 职责、优先级、消息投影、请求身�
 - 在事件对象中保存仅当前请求可见的状态；
 - 执行有界上下文装配与临时投影；
 - 验证恢复、写入助手事件并持久化压缩意图；
-- 插件终止时关闭资源。
+- 维护当前 Provider 亲和性并适配 AstrBot 精确引文生成；
+- 启动、唤醒并在插件终止时关闭受跟踪 worker。
 
 领域、运行时、压缩和存储包不导入 AstrBot。宿主私有对象统一隔离在
 `astrcontinuum.adapters.astrbot` 后面。
@@ -52,11 +53,11 @@ AstrBot `4.24.0` 会对缺失的 `StarMetadata.pages` 打印宿主自身回退�
 
 | Handler | 优先级 | 职责 | 禁止事项 |
 | --- | ---: | --- | --- |
-| `on_llm_request` | `2000` | 写用户事件、冻结 `H`、读取 Snapshot+Delta、预算装配 | 远程审计/编译、等待 worker、全库扫描、迁移 |
-| `on_agent_begin_guard` | `2000` | 在投影前记录原生对象的精确身份 | 替换或复制宿主历史 |
-| `on_agent_begin_project` | `-100` | 追加一个插件自有临时 Provider 消息 | 修改原生消息或持久历史 |
+| `on_llm_request` | `2000` | 写用户事件、冻结 `H`、读取 Snapshot+Delta、记住当前 Provider | 远程审计/编译、等待 worker、全库扫描、迁移 |
+| `on_agent_begin_guard` | `2000` | 在投影前记录 request/message 的精确身份 | 替换或复制宿主历史 |
+| `on_agent_begin_project` | `-100` | 评估压力；必要时用有界临时 Provider View 替换原生历史 | 修改原生消息或持久历史 |
 | `on_agent_done_restore` | `2000` | 删除自有投影并保留 Provider 新增 Delta | 按值重建宿主历史 |
-| `on_agent_done_finalize` | `900` | 验证恢复、写助手事件、持久化压缩意图 | 在线发布候选 Snapshot |
+| `on_agent_done_finalize` | `900` | 验证恢复、写助手事件，并在有压力时持久化/唤醒归约意图 | 在线发布候选 Snapshot |
 | `on_using_llm_tool` | `0` | 保存有界工具调用元数据 | 保存任意对象表示 |
 | `on_llm_tool_respond` | `0` | 保存有界工具结果元数据 | 保存无限结果 |
 | `on_llm_response` | `0` | 可选的无内容观测 | 任何 Journal 写入 |
@@ -67,8 +68,9 @@ AstrBot `4.24.0` 会对缺失的 `StarMetadata.pages` 打印宿主自身回退�
 ## 5. 请求级状态
 
 AstrContinuum 在带命名空间的 event extra 中保存私有 `_RequestState`，其中只有当前请求
-需要的引用：原始 request、冻结读视图、投影 guard、投影/恢复结果、助手事件、工具序号与
-脱敏故障。它不是持久真源，不能进入 SQLite 或日志；缺失时应有界 fail-open。
+需要的引用：原始 request、冻结读视图、投影 guard、投影/恢复结果、压力决策、请求局部
+Conversation 副本、助手事件、工具序号与脱敏故障。它不是持久真源，不能进入 SQLite
+或日志；缺失时应有界 fail-open。
 
 ## 6. 会话身份
 
@@ -90,16 +92,18 @@ persona_id
 ## 7. 投影能力边界
 
 当前投影依赖 AstrBot 的 `Message`、`TextPart`、`extra_user_content_parts` 和
-`mark_as_temp` / `_no_save`，使用前必须运行时探测。
+`mark_as_temp` / `_no_save`，使用前必须运行时探测。未达到 Provider View 阈值时完全
+不动原生列表；达到阈值后，只为本轮 Provider 调用移除原生历史并加入临时视图。临时
+消息无法创建时，空 Provider View 仍会保留 system 对象和当前输入。
 
 恢复必须按对象身份进行：
 
-1. 保存 request、contexts list 和每个原生 message 的身份；
-2. 只追加 AstrContinuum 自己拥有的临时 message；
-3. 允许 Provider/Agent 追加自己的 Delta；
-4. 删除精确的自有对象；
-5. 验证原 request、list 和原生 message 身份不变；
-6. 保留 Provider 合法新增对象。
+1. 保存 request 和每个原生 message 的身份；
+2. 保留 system/current 对象，移除原生历史，只追加自有临时对象；
+3. 允许 AstrBot 替换 list，也允许 Provider/Agent 追加自己的 Delta；
+4. 按对象身份定位精确 current-user 边界；
+5. 恢复精确原生对象序列，并保留 Provider 合法新增对象；
+6. 校验消息身份，不要求 list 容器身份或序列化值相等。
 
 “值相等”不能替代“同一个对象”；即使重建的字典内容一样，也会侵犯宿主所有权并可能破坏
 后续持久化。
@@ -110,19 +114,19 @@ persona_id
 对象表示。在线请求保持可用：
 
 - 身份提取失败：本请求不采集、不投影；
-- 投影能力缺失：持久采集可继续，跳过增强；
-- 装配失败：原生请求继续；
+- 硬压力以下投影能力缺失：持久采集继续，使用原生上下文；
+- 硬压力下装配/临时消息失败：使用有界空 Provider View；
 - 投影/恢复不变量失败：在安全范围内移除自有增强，然后让宿主继续；
 - finalizer 失败：不能伪造助手行或 Snapshot 覆盖。
 
 ## 9. 生命周期与当前限制
 
-初始化阶段迁移数据库并构造持久服务，终止阶段关闭资源；finalizer 在助手事件落盘后提高
-持久压缩意图。
+初始化阶段迁移数据库、构造持久服务与精确引文式编译器，并启动唯一受跟踪 worker。
+finalizer 只在上下文压力需要时提高并唤醒持久归约意图；终止阶段先取消和等待 worker，
+再清理服务。
 
-`v0.1.0` 的 `Star` 生命周期仍**没有**启动领取并执行 `compaction_jobs` 的循环。
-编译器、校验器、审计器、调度器、租约/fencing 与原子发布原语已经实现且有测试，但排队意图
-可能一直 pending。当前不能把“自动长程压缩”描述为已启用。
+剩余接入限制是可选的 Provider 语义审计适配器。逐字来源校验、机械校验、fencing 与
+原子发布已经启用。
 
 ## 10. 修改核对
 

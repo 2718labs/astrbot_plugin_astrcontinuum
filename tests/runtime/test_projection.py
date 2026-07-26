@@ -140,6 +140,65 @@ def test_restore_is_exact_preprojection_plus_delta_then_native_verifies() -> Non
     _assert_identity_sequence(messages, before_failed_verify)
 
 
+def test_empty_projection_strips_native_history_and_restores_after_list_replacement() -> None:
+    request, messages, system, history_a, history_b, current = _native_turn()
+    guard = guard_projection(
+        request,
+        messages,
+        system_objects=(system,),
+        current_objects=(current,),
+    )
+
+    projected = project(messages, guard, ())
+    _assert_identity_sequence(messages, (system, current))
+
+    replacement_list = list(messages)
+    assistant_delta = EqualBox("assistant-delta")
+    replacement_list.append(assistant_delta)
+
+    restored = restore(replacement_list, projected)
+
+    _assert_identity_sequence(
+        replacement_list,
+        (system, history_a, history_b, current, assistant_delta),
+    )
+    _assert_identity_sequence(restored.delta_objects, (assistant_delta,))
+    assert verify_native(replacement_list, restored) is True
+
+
+def test_restore_uses_current_object_boundary_after_host_rewrites_projected_prefix() -> None:
+    request, messages, system, history_a, history_b, current = _native_turn()
+    guard = guard_projection(
+        request,
+        messages,
+        system_objects=(system,),
+        current_objects=(current,),
+    )
+    projection = EqualBox("projection")
+    projected = project(messages, guard, (projection,))
+
+    replacement_system = EqualBox("host-rebuilt-system")
+    replacement_list = [replacement_system, projection, current]
+    tool_delta = EqualBox("tool-delta")
+    assistant_delta = EqualBox("assistant-delta")
+    replacement_list.extend((tool_delta, assistant_delta))
+
+    restored = restore(replacement_list, projected)
+
+    _assert_identity_sequence(
+        replacement_list,
+        (
+            system,
+            history_a,
+            history_b,
+            current,
+            tool_delta,
+            assistant_delta,
+        ),
+    )
+    assert verify_native(replacement_list, restored) is True
+
+
 def test_projection_is_deterministic_for_the_same_identity_graph() -> None:
     request, messages, system, history_a, history_b, current = _native_turn()
     guard = guard_projection(
@@ -214,7 +273,7 @@ def test_project_preserved_identity_mismatch_is_content_free_and_no_mutation() -
     _assert_identity_sequence(messages, before)
 
 
-def test_restore_prefix_mismatch_never_guesses_or_mutates() -> None:
+def test_restore_missing_current_boundary_never_guesses_or_mutates() -> None:
     request, messages, system, _history_a, _history_b, current = _native_turn()
     guard = guard_projection(
         request,
@@ -223,7 +282,7 @@ def test_restore_prefix_mismatch_never_guesses_or_mutates() -> None:
         current_objects=(current,),
     )
     projected = project(messages, guard, (EqualBox("projection"),))
-    messages[0] = EqualBox("replacement-system")
+    messages.remove(current)
     messages.append(EqualBox("assistant-delta"))
     before = tuple(messages)
 

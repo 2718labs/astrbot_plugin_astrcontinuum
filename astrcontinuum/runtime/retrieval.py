@@ -91,6 +91,14 @@ def _task_text(capsule: ContextCapsuleEnvelope, config: RetrievalConfig) -> str:
     return "\n".join(sections)
 
 
+def _raw_event_text(event: object) -> str:
+    event_type = getattr(getattr(event, "event_type", None), "value", "UNKNOWN_EVENT")
+    role = getattr(getattr(event, "role", None), "value", "UNKNOWN_ROLE")
+    event_id = getattr(event, "event_id", "unknown-event")
+    content = getattr(event, "content", "")
+    return f"[{event_type}/{role} {event_id}]\n{content}"
+
+
 def _candidate_sort_key(candidate: CandidateBlock) -> tuple[int, float, int, str]:
     slot_rank = _SLOT_RANK[candidate.slot]
     if candidate.slot == RuntimeSlot.RAW_DELTA:
@@ -166,15 +174,16 @@ def select_candidates(
                 break
 
     for item in view.delta[-config.max_delta_events :] if config.max_delta_events else ():
+        raw_text = _raw_event_text(item)
         if not add(
             CandidateBlock(
                 block_id=f"event:{item.event_id}",
                 slot=RuntimeSlot.RAW_DELTA,
                 kind=CandidateKind.RAW_EVENT,
-                text=item.content,
+                text=raw_text,
                 source_event_ids=(item.event_id,),
                 score=_score(
-                    item.content,
+                    raw_text,
                     base_weight=config.raw_delta_weight,
                     query=normalized_query,
                     config=config,

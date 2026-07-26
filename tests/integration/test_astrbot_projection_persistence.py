@@ -99,11 +99,15 @@ class FakeEvent:
         return ("plain", text)
 
 
-def _request(prompt: str) -> SimpleNamespace:
+def _request(prompt: str, *, token_usage: int = 0) -> SimpleNamespace:
     return SimpleNamespace(
         prompt=prompt,
         contexts=[FakeMessage(role="assistant", content="immutable request contexts")],
-        conversation=SimpleNamespace(cid="conversation-1", persona_id=None),
+        conversation=SimpleNamespace(
+            cid="conversation-1",
+            persona_id=None,
+            token_usage=token_usage,
+        ),
     )
 
 
@@ -187,7 +191,15 @@ async def test_projection_restores_native_history_and_never_persists_projection(
     tmp_path: Path,
 ) -> None:
     module, _logger = _load_main(monkeypatch, tmp_path)
-    plugin = module.AstrContinuumPlugin(object(), {"enabled": True})
+    plugin = module.AstrContinuumPlugin(
+        object(),
+        {
+            "enabled": True,
+            "model_context_limit": 100_000,
+            "compaction_start_ratio": 0.75,
+            "provider_view_switch_ratio": 0.80,
+        },
+    )
     await plugin.initialize()
 
     prior_event = FakeEvent("message-prior")
@@ -197,7 +209,7 @@ async def test_projection_restores_native_history_and_never_persists_projection(
     await plugin._bridge.capture_assistant(prior_state.prepared, "old assistant")
 
     event = FakeEvent("message-current")
-    request = _request("fresh user")
+    request = _request("fresh user", token_usage=60_000)
     request_contexts = request.contexts
     request_context_bytes = _dump_messages(request.contexts)
     await plugin.on_llm_request(event, request)
@@ -289,7 +301,15 @@ async def test_missing_projection_capability_fails_open_after_user_capture(
         tmp_path,
         projection_capability=False,
     )
-    plugin = module.AstrContinuumPlugin(object(), {"enabled": True})
+    plugin = module.AstrContinuumPlugin(
+        object(),
+        {
+            "enabled": True,
+            "model_context_limit": 100_000,
+            "compaction_start_ratio": 0.75,
+            "provider_view_switch_ratio": 0.80,
+        },
+    )
     await plugin.initialize()
 
     prior_event = FakeEvent("message-prior")
@@ -298,7 +318,7 @@ async def test_missing_projection_capability_fails_open_after_user_capture(
     await plugin._bridge.capture_assistant(prior_state.prepared, "old assistant")
 
     event = FakeEvent("message-current")
-    request = _request("fresh user")
+    request = _request("fresh user", token_usage=60_000)
     await plugin.on_llm_request(event, request)
     state = next(iter(event._extras.values()))
     messages = [
@@ -307,13 +327,13 @@ async def test_missing_projection_capability_fails_open_after_user_capture(
         FakeMessage(role="assistant", content="old assistant"),
         FakeMessage(role="user", content="fresh user"),
     ]
-    before = tuple(messages)
     run_context = SimpleNamespace(messages=messages)
 
     await plugin.on_agent_begin_guard(event, run_context)
     await plugin.on_agent_begin_project(event, run_context)
 
-    assert tuple(messages) == before
+    assert messages == [messages[0], messages[-1]]
+    assert state.projected is not None
     assert state.faults[-1].code == "PROJECTION_API_UNAVAILABLE"
     bridge = plugin._bridge
     assert bridge is not None

@@ -269,6 +269,75 @@ class SQLiteRepository:
                 connection.commit()
                 return view
 
+    def read_compaction_view(
+        self,
+        *,
+        job_id: str,
+        owner: str,
+        lease_epoch: int,
+        now: datetime,
+    ) -> RequestView:
+        """Read the exact base and Delta frozen by one live compaction lease."""
+
+        now_text = _normalize_datetime(now)
+        with self._factory.connection(read_only=True) as connection:
+            connection.execute("BEGIN")
+            try:
+                row = self._require_live_fence(
+                    connection,
+                    job_id=job_id,
+                    owner=owner,
+                    lease_epoch=lease_epoch,
+                    now=now_text,
+                )
+                state = CompactionJobState(row["state"])
+                if state not in {
+                    CompactionJobState.COMPILING,
+                    CompactionJobState.AUDITING,
+                }:
+                    raise JobTransitionError(
+                        "compaction input requires a COMPILING or AUDITING Job"
+                    )
+                job = self._job_by_id(connection, job_id)
+                if job.base_snapshot_id is None:
+                    snapshot = None
+                    memberships: tuple[SnapshotCapsuleMembership, ...] = ()
+                    covered_event_end = 0
+                else:
+                    snapshot, memberships = self._snapshot_bundle_by_id(
+                        connection,
+                        job.base_snapshot_id,
+                    )
+                    covered_event_end = snapshot.covered_event_end
+                delta = self._events_between(
+                    connection,
+                    session_key=job.session_key,
+                    start_exclusive=covered_event_end,
+                    end_inclusive=job.target_high_water_mark,
+                )
+                expected_sequences = tuple(
+                    range(covered_event_end + 1, job.target_high_water_mark + 1)
+                )
+                if tuple(item.sequence for item in delta) != expected_sequences:
+                    raise RepositoryInvariantError(
+                        "frozen compaction input is not a contiguous complete Delta"
+                    )
+                view = RequestView(
+                    session_key=job.session_key,
+                    snapshot=snapshot,
+                    memberships=memberships,
+                    pointer_version=job.base_pointer_version,
+                    covered_event_end=covered_event_end,
+                    high_water_mark=job.target_high_water_mark,
+                    delta=delta,
+                )
+            except BaseException:
+                connection.rollback()
+                raise
+            else:
+                connection.commit()
+                return view
+
     def raise_compaction_intent(
         self,
         *,

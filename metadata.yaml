@@ -1,7 +1,7 @@
 name: astrbot_plugin_astrcontinuum
 display_name: AstrContinuum
-desc: "Repository-stage technical preview of a non-blocking, durable long-context runtime for AstrBot."
-short_desc: "Durable Journal, reversible context projection, and snapshot-plus-Delta architecture."
+desc: "Technical preview of a non-blocking long-context runtime with pressure-triggered exact-source checkpoints."
+short_desc: "Durable Journal, reversible Provider View, and background Checkpoint publication."
 version: v0.1.0
 author: 2718labs
 license: AGPL-3.0-or-later

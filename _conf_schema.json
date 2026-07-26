@@ -1,22 +1,58 @@
 {
   "enabled": {
-    "description": "Enable AstrContinuum. / 启用 AstrContinuum。",
+    "description": "启用 AstrContinuum 长对话保护",
+    "hint": "只改变发给大模型的临时上下文，不会删除或改写 AstrBot 保存的对话历史。可用 /context_status 查看是否生效。",
+    "obvious_hint": true,
     "type": "bool",
     "default": true
   },
   "model_context_limit": {
-    "description": "Total model-context budget. v0.1.0 conservatively counts UTF-8 bytes, not provider tokenizer tokens. / 模型总上下文预算；v0.1.0 使用 UTF-8 字节保守计数，并非模型 tokenizer Token。",
+    "description": "主模型的上下文窗口",
+    "hint": "填写模型标称的最大上下文 Token。拿不到 Provider usage 时，插件会用 UTF-8 字节保守估算，因此中文会更早触发保护。",
+    "obvious_hint": true,
     "type": "int",
     "default": 200000
   },
   "target_input_budget": {
-    "description": "Preferred request-input budget in the same conservative unit. / 普通请求的目标输入预算，计量单位同上。",
+    "description": "归约后希望保留的输入量",
+    "hint": "Checkpoint、近期原文和精确证据会优先装进这个预算。通常保持默认即可。",
     "type": "int",
     "default": 130000
   },
   "hard_input_ceiling": {
-    "description": "Hard request-input ceiling in the same conservative unit. / 请求输入硬上限，计量单位同上。",
+    "description": "归约后输入的安全上限",
+    "hint": "受控请求视图不会主动超过这个值；必须小于主模型上下文窗口，并为回复和工具调用留出空间。",
     "type": "int",
     "default": 150000
+  },
+  "compaction_start_ratio": {
+    "description": "提前生成 Checkpoint 的时机",
+    "hint": "上下文预计占满可用窗口的 75% 时，在后台开始归约。聊天不会等待后台任务。",
+    "type": "float",
+    "default": 0.75,
+    "slider": {
+      "min": 0.5,
+      "max": 0.9,
+      "step": 0.01
+    }
+  },
+  "provider_view_switch_ratio": {
+    "description": "切换到受控请求视图的时机",
+    "hint": "上下文预计占满可用窗口的 80% 时，改用 Checkpoint + 近期原文 + 精确证据发送请求。应略高于“提前生成 Checkpoint”的比例。",
+    "type": "float",
+    "default": 0.8,
+    "slider": {
+      "min": 0.55,
+      "max": 0.95,
+      "step": 0.01
+    }
+  },
+  "compaction_provider_id": {
+    "description": "后台归约模型（留空则跟随当前对话模型）",
+    "hint": "可选择 MiniMax 等小模型。归约模型只能返回原文事件编号和逐字引文，不能自由转述。若选择与对话不同的 Provider，对话片段会发送给该 Provider；请确认其数据与隐私策略。",
+    "obvious_hint": true,
+    "type": "string",
+    "default": "",
+    "_special": "select_provider"
   }
 }

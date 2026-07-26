@@ -22,6 +22,7 @@ from .types import (
     CompilationCandidate,
     CompilationRequest,
     CompilerBackend,
+    CompilerBackendDeferred,
     CompilerErrorCode,
     CompilerInvariantError,
     CompilerOutput,
@@ -73,6 +74,8 @@ async def compile_candidate(
 
     try:
         output = await backend.compile(request)
+    except CompilerBackendDeferred:
+        raise
     except Exception:  # noqa: BLE001 - adapter boundary maps arbitrary failures.
         raise CompilerInvariantError(CompilerErrorCode.BACKEND_FAILURE) from None
 
