@@ -37,6 +37,12 @@ from .models import (
     ExactAnchor,
     Snapshot,
 )
+from .runtime import (
+    RequestViewErrorCode,
+    RequestViewInvariantError,
+    RequestViewSource,
+    read_request_view,
+)
 from .storage import (
     MIGRATIONS,
     EventIdentityConflict,
@@ -103,6 +109,9 @@ __all__ = [
     "RepositoryError",
     "RepositoryInvariantError",
     "RequestView",
+    "RequestViewErrorCode",
+    "RequestViewInvariantError",
+    "RequestViewSource",
     "SQLiteConnectionFactory",
     "SQLiteMigrator",
     "SQLiteRepository",
@@ -117,5 +126,6 @@ __all__ = [
     "SnapshotState",
     "SourceHook",
     "StaleLeaseError",
+    "read_request_view",
     "validate_permanent",
 ]
