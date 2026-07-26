@@ -1,5 +1,5 @@
 name: astrbot_plugin_astrcontinuum
-display_name: AstrContinuum / 星续
+display_name: AstrContinuum
 desc: "Repository-stage technical preview of a non-blocking, durable long-context runtime for AstrBot."
 short_desc: "Durable Journal, reversible context projection, and snapshot-plus-Delta architecture."
 version: v0.1.0

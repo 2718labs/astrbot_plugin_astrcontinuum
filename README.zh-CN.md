@@ -1,4 +1,4 @@
-# AstrContinuum / 星续
+# AstrContinuum
 
 [English](./README.md) | 简体中文
 

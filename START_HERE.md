@@ -18,7 +18,7 @@
 
 ## 已固定的产品决策
 
-- 产品名：AstrContinuum / 星续
+- 产品名：AstrContinuum
 - 仓库名：`astrbot_plugin_astrcontinuum`
 - 独立插件，专门负责上下文，不复制 Sylanne 记忆系统
 - 无 Sylanne 时独立运行；有 Sylanne 时通过只读适配器协作
