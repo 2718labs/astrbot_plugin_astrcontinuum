@@ -10,7 +10,7 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
 
-from astrcontinuum.domain import (
+from ..domain import (
     CompactionJobEnvelope,
     CompactionJobState,
     ContextCapsuleEnvelope,
@@ -25,7 +25,6 @@ from astrcontinuum.domain import (
     SourceHook,
     validate_permanent,
 )
-
 from .sqlite import SQLiteConnectionFactory
 
 FaultInjector = Callable[[str], None]

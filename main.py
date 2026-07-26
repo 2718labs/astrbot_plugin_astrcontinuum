@@ -4,37 +4,72 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
-from typing import Any
+from typing import TYPE_CHECKING, Any, cast
 
-from astrbot.api import logger
-from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, StarTools, register
+from astrbot.api import logger  # type: ignore[import-not-found]
+from astrbot.api.event import AstrMessageEvent, filter  # type: ignore[import-not-found]
+from astrbot.api.star import Context, Star, StarTools, register  # type: ignore[import-not-found]
 
-from astrcontinuum.adapters import (
-    AdapterFault,
-    AstrBotAdapterError,
-    AstrBotHookBridge,
-    PreparedRequest,
-    ProjectionCapability,
-    build_projection_objects,
-    estimate_opaque_token_cost,
-    probe_projection_capability,
-    select_projection_boundaries,
-)
-from astrcontinuum.domain import EventEnvelope
-from astrcontinuum.runtime import (
-    BudgetConfig,
-    ProjectedView,
-    ProjectionGuard,
-    ProjectionInvariantError,
-    RestoredView,
-    Utf8ByteTokenCounter,
-    guard_projection,
-    project,
-    restore,
-    verify_native,
-)
-from astrcontinuum.storage import SQLiteConnectionFactory, SQLiteMigrator, SQLiteRepository
+if TYPE_CHECKING or not __package__:
+    from astrcontinuum.adapters import (
+        AdapterFault,
+        AstrBotAdapterError,
+        AstrBotHookBridge,
+        PreparedRequest,
+        ProjectionCapability,
+        build_projection_objects,
+        estimate_opaque_token_cost,
+        probe_projection_capability,
+        select_projection_boundaries,
+    )
+    from astrcontinuum.domain import EventEnvelope
+    from astrcontinuum.runtime import (
+        BudgetConfig,
+        ProjectedView,
+        ProjectionGuard,
+        ProjectionInvariantError,
+        RestoredView,
+        Utf8ByteTokenCounter,
+        guard_projection,
+        project,
+        restore,
+        verify_native,
+    )
+    from astrcontinuum.storage import (
+        SQLiteConnectionFactory,
+        SQLiteMigrator,
+        SQLiteRepository,
+    )
+else:
+    from .astrcontinuum.adapters import (
+        AdapterFault,
+        AstrBotAdapterError,
+        AstrBotHookBridge,
+        PreparedRequest,
+        ProjectionCapability,
+        build_projection_objects,
+        estimate_opaque_token_cost,
+        probe_projection_capability,
+        select_projection_boundaries,
+    )
+    from .astrcontinuum.domain import EventEnvelope
+    from .astrcontinuum.runtime import (
+        BudgetConfig,
+        ProjectedView,
+        ProjectionGuard,
+        ProjectionInvariantError,
+        RestoredView,
+        Utf8ByteTokenCounter,
+        guard_projection,
+        project,
+        restore,
+        verify_native,
+    )
+    from .astrcontinuum.storage import (
+        SQLiteConnectionFactory,
+        SQLiteMigrator,
+        SQLiteRepository,
+    )
 
 _PLUGIN_NAME = "astrbot_plugin_astrcontinuum"
 _REQUEST_STATE_KEY = "astrcontinuum.v1.request-state"
@@ -246,7 +281,7 @@ class AstrContinuumPlugin(Star):
         state = self._state(event)
         if state is None or state.prepared is None or state.guard is not None:
             return
-        messages = getattr(run_context, "messages", None)
+        messages = cast(list[object], getattr(run_context, "messages", None))
         try:
             system_objects, current_objects = select_projection_boundaries(messages)
             guard = guard_projection(
@@ -292,7 +327,7 @@ class AstrContinuumPlugin(Star):
             or capability is None
         ):
             return
-        messages = getattr(run_context, "messages", None)
+        messages = cast(list[object], getattr(run_context, "messages", None))
         if not isinstance(messages, list):
             self._record_fault(
                 state,
@@ -352,7 +387,7 @@ class AstrContinuumPlugin(Star):
         state = self._state(event)
         if state is None or state.projected is None or state.restored is not None:
             return
-        messages = getattr(run_context, "messages", None)
+        messages = cast(list[object], getattr(run_context, "messages", None))
         try:
             state.restored = restore(messages, state.projected)
         except ProjectionInvariantError as error:
@@ -376,7 +411,7 @@ class AstrContinuumPlugin(Star):
         bridge = self._bridge
         if state is None or state.prepared is None or bridge is None:
             return
-        messages = getattr(run_context, "messages", None)
+        messages = cast(list[object], getattr(run_context, "messages", None))
         if state.projected is not None:
             if state.restored is None:
                 self._record_fault(

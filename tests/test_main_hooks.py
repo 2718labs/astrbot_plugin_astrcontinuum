@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import shutil
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
@@ -129,6 +130,7 @@ def load_main(
     data_dir: Path,
     *,
     projection_capability: bool = True,
+    module_name: str = "main",
 ) -> tuple[ModuleType, FakeLogger]:
     logger = FakeLogger()
     fake_filter = FakeFilter()
@@ -186,9 +188,55 @@ def load_main(
     }
     for name, module in modules.items():
         monkeypatch.setitem(sys.modules, name, module)
-    monkeypatch.delitem(sys.modules, "main", raising=False)
-    imported = importlib.import_module("main")
+    monkeypatch.delitem(sys.modules, module_name, raising=False)
+    imported = importlib.import_module(module_name)
     return imported, logger
+
+
+def test_main_imports_from_real_astrbot_plugin_package_layout(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class BlockTopLevelAstrContinuum:
+        def find_spec(
+            self,
+            fullname: str,
+            _path: object = None,
+            _target: object = None,
+        ) -> None:
+            if fullname == "astrcontinuum" or fullname.startswith("astrcontinuum."):
+                raise ModuleNotFoundError(
+                    "top-level astrcontinuum is unavailable in an AstrBot plugin install"
+                )
+
+    project_root = Path(__file__).resolve().parents[1]
+    plugin_root = tmp_path / "data" / "plugins" / "astrbot_plugin_astrcontinuum"
+    plugin_root.mkdir(parents=True)
+    shutil.copy2(project_root / "main.py", plugin_root / "main.py")
+    shutil.copytree(project_root / "astrcontinuum", plugin_root / "astrcontinuum")
+
+    isolated_sys_path = [
+        entry for entry in sys.path if Path(entry or ".").resolve() != project_root
+    ]
+    monkeypatch.setattr(sys, "path", [str(tmp_path), *isolated_sys_path])
+    monkeypatch.setattr(
+        sys,
+        "meta_path",
+        [BlockTopLevelAstrContinuum(), *sys.meta_path],
+    )
+    for name in tuple(sys.modules):
+        if name == "astrcontinuum" or name.startswith("astrcontinuum."):
+            monkeypatch.delitem(sys.modules, name)
+
+    module, _logger = load_main(
+        monkeypatch,
+        tmp_path / "plugin-data",
+        module_name="data.plugins.astrbot_plugin_astrcontinuum.main",
+    )
+
+    assert module.AstrContinuumPlugin.__module__ == (
+        "data.plugins.astrbot_plugin_astrcontinuum.main"
+    )
 
 
 def test_main_declares_one_star_and_exact_hook_priorities(
