@@ -106,5 +106,63 @@ class CompilationCandidate:
     permanent_report: PermanentValidationReport
 
 
+@dataclass(frozen=True, slots=True)
+class SemanticAuditRequest:
+    snapshot: SnapshotEnvelope
+    capsules: tuple[ContextCapsuleEnvelope, ...]
+    segments: tuple[EventSegment, ...]
+    permanent_report: PermanentValidationReport
+
+
+@dataclass(frozen=True, slots=True)
+class SemanticAuditReport:
+    passed: bool
+    failure_codes: tuple[str, ...]
+
+
+class SemanticAuditBackend(Protocol):
+    async def audit(self, request: SemanticAuditRequest) -> SemanticAuditReport: ...
+
+
+@dataclass(frozen=True, slots=True)
+class AuditedCandidate:
+    snapshot: SnapshotEnvelope
+    memberships: tuple[SnapshotCapsuleMembership, ...]
+    segments: tuple[EventSegment, ...]
+    permanent_report: PermanentValidationReport
+    semantic_report: SemanticAuditReport | None
+
+
+class SemanticAuditErrorCode(str, Enum):
+    MECHANICAL_INVALID = "SEMANTIC_AUDIT_MECHANICAL_INVALID"
+    STRICT_AUDIT_INVALID = "SEMANTIC_AUDIT_STRICT_AUDIT_INVALID"
+    BACKEND_REQUIRED = "SEMANTIC_AUDIT_BACKEND_REQUIRED"
+    BACKEND_FAILURE = "SEMANTIC_AUDIT_BACKEND_FAILURE"
+    BACKEND_OUTPUT_INVALID = "SEMANTIC_AUDIT_BACKEND_OUTPUT_INVALID"
+    SEMANTIC_REJECTED = "SEMANTIC_AUDIT_SEMANTIC_REJECTED"
+
+
+class SemanticAuditInvariantError(ValueError):
+    __slots__ = ("_code", "_failed_candidate")
+
+    def __init__(
+        self,
+        code: SemanticAuditErrorCode,
+        *,
+        failed_candidate: AuditedCandidate | None = None,
+    ) -> None:
+        self._code = code
+        self._failed_candidate = failed_candidate
+        super().__init__(code.value)
+
+    @property
+    def code(self) -> SemanticAuditErrorCode:
+        return self._code
+
+    @property
+    def failed_candidate(self) -> AuditedCandidate | None:
+        return self._failed_candidate
+
+
 def _is_non_bool_int(value: object) -> bool:
     return isinstance(value, int) and not isinstance(value, bool)
