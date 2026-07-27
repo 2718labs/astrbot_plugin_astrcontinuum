@@ -3,16 +3,31 @@ from __future__ import annotations
 import importlib
 import json
 import sys
+from collections.abc import AsyncIterator
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Protocol
 
 import pytest
+import pytest_asyncio
 
 import astrcontinuum.adapters.astrbot as astrbot_adapter
 from astrcontinuum.storage import SecureCodec
 
 TEST_MASTER_KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
 TEST_CODEC = SecureCodec(bytes(range(32)))
+
+
+class TerminablePlugin(Protocol):
+    async def terminate(self) -> None: ...
+
+
+@pytest_asyncio.fixture
+async def plugin_cleanup() -> AsyncIterator[list[TerminablePlugin]]:
+    plugins: list[TerminablePlugin] = []
+    yield plugins
+    for plugin in reversed(plugins):
+        await plugin.terminate()
 
 
 class FakeLogger:
@@ -198,6 +213,7 @@ def _dump_messages(messages: list[object]) -> bytes:
 @pytest.mark.asyncio
 async def test_projection_restores_native_history_and_never_persists_projection(
     monkeypatch: pytest.MonkeyPatch,
+    plugin_cleanup: list[TerminablePlugin],
     tmp_path: Path,
 ) -> None:
     read_count = 0
@@ -238,6 +254,7 @@ async def test_projection_restores_native_history_and_never_persists_projection(
             "provider_view_switch_ratio": 0.80,
         },
     )
+    plugin_cleanup.append(plugin)
     await plugin.initialize()
 
     prior_event = FakeEvent("message-prior")
@@ -352,6 +369,7 @@ async def test_projection_restores_native_history_and_never_persists_projection(
 @pytest.mark.asyncio
 async def test_missing_projection_capability_fails_open_after_user_capture(
     monkeypatch: pytest.MonkeyPatch,
+    plugin_cleanup: list[TerminablePlugin],
     tmp_path: Path,
 ) -> None:
     module, _logger = _load_main(
@@ -368,6 +386,7 @@ async def test_missing_projection_capability_fails_open_after_user_capture(
             "provider_view_switch_ratio": 0.80,
         },
     )
+    plugin_cleanup.append(plugin)
     await plugin.initialize()
 
     prior_event = FakeEvent("message-prior")
