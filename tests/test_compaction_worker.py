@@ -1,13 +1,19 @@
 from __future__ import annotations
 
 import asyncio
+import threading
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 import pytest
 
 import astrcontinuum as ac
+import astrcontinuum.compaction.worker as worker_module
 from astrcontinuum.compaction import CompactionWorker, CompactionWorkerConfig
+from astrcontinuum.context_graph.candidate_verification import (
+    CandidateVerificationError,
+    CandidateVerificationErrorCode,
+)
 
 NOW = datetime(2026, 7, 27, 4, 0, tzinfo=timezone.utc)
 TEST_KEY = bytes(range(32))
@@ -244,6 +250,34 @@ async def test_worker_compiles_and_atomically_publishes_checkpoint(
 
 
 @pytest.mark.asyncio
+async def test_worker_rejects_unverified_candidate_before_ready_to_commit(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    session_key = key("verification-rejected")
+    capture(store, session_key, 1)
+    raise_intent(store, session_key, 1, job_id="job-verification-rejected")
+    observed: list[object] = []
+
+    def reject(candidate: object) -> None:
+        observed.append(candidate)
+        raise CandidateVerificationError(CandidateVerificationErrorCode.REJECTED)
+
+    monkeypatch.setattr(worker_module, "verify_candidate", reject)
+
+    assert await worker(store, ExactBackend()).run_iteration() is True
+
+    failed = job_row(store, "job-verification-rejected")
+    assert observed
+    assert failed[0] == "RETRY_WAIT"
+    assert failed[2] == "VERIFYING"
+    assert failed[3] == "CANDIDATE_GRAPH_VERIFICATION_FAILED"
+    assert failed[4] == "CANDIDATE_GRAPH_VERIFICATION_FAILED"
+    assert store.read_request_view(session_key).snapshot is None
+
+
+@pytest.mark.asyncio
 async def test_worker_persists_redacted_retry_and_keeps_scheduler_usable(
     tmp_path: Path,
 ) -> None:
@@ -362,3 +396,252 @@ async def test_missing_session_provider_waits_without_exhausting_attempts(
     second_wait = job_row(store, "job-provider-wait")
     assert second_wait[0] == "RETRY_WAIT"
     assert second_wait[1] == 2
+
+
+@pytest.mark.asyncio
+async def test_storage_authentication_failure_is_fatal_and_never_retried() -> None:
+    class AuthenticationFailingRepository:
+        def __init__(self) -> None:
+            self.fail_job_calls = 0
+
+        def recover_expired_leases(self, **_kwargs: object) -> None:
+            return None
+
+        def claim_job(self, **_kwargs: object) -> None:
+            raise ac.StorageSecurityError(ac.SecurityErrorCode.STORAGE_AUTHENTICATION_FAILED)
+
+        def fail_job(self, **_kwargs: object) -> None:
+            self.fail_job_calls += 1
+
+    repository = AuthenticationFailingRepository()
+    fatal_codes: list[str] = []
+
+    async def on_fatal(error: ac.StorageSecurityError) -> None:
+        fatal_codes.append(error.code.value)
+
+    instance = CompactionWorker(
+        repository=repository,
+        backend=ExactBackend(),
+        counter=LengthCounter(),
+        worker_id="worker-auth-failure",
+        config=CompactionWorkerConfig(
+            token_ceiling=10_000,
+            poll_interval_seconds=0.01,
+        ),
+        fatal_storage_callback=on_fatal,
+    )
+
+    await instance.start()
+    task = instance.task
+    assert task is not None
+    await asyncio.wait_for(task, timeout=1)
+
+    assert fatal_codes == ["STORAGE_AUTHENTICATION_FAILED"]
+    assert repository.fail_job_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_lease_heartbeat_authentication_failure_escapes_iteration(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    session_key = key("heartbeat-auth-failure")
+    capture(store, session_key, 1)
+    raise_intent(store, session_key, 1, job_id="job-heartbeat-auth-failure")
+    loop = asyncio.get_running_loop()
+    renewal_attempted = asyncio.Event()
+
+    def fail_renewal(**_kwargs: object) -> None:
+        loop.call_soon_threadsafe(renewal_attempted.set)
+        raise ac.StorageSecurityError(ac.SecurityErrorCode.STORAGE_AUTHENTICATION_FAILED)
+
+    class WaitForHeartbeatBackend(ExactBackend):
+        async def compile(self, request: ac.CompilationRequest) -> ac.CompilerOutput:
+            await asyncio.wait_for(renewal_attempted.wait(), timeout=1)
+            return await super().compile(request)
+
+    monkeypatch.setattr(store, "renew_job_lease", fail_renewal)
+    instance = CompactionWorker(
+        repository=store,
+        backend=WaitForHeartbeatBackend(),
+        counter=LengthCounter(),
+        worker_id="worker-heartbeat-auth-failure",
+        clock=lambda: datetime.now(timezone.utc),
+        config=CompactionWorkerConfig(
+            token_ceiling=10_000,
+            lease_seconds=0.03,
+            poll_interval_seconds=0.01,
+        ),
+    )
+
+    with pytest.raises(ac.StorageSecurityError) as captured:
+        await instance.run_iteration()
+
+    assert captured.value.code is ac.SecurityErrorCode.STORAGE_AUTHENTICATION_FAILED
+
+
+@pytest.mark.asyncio
+async def test_iteration_cancellation_wins_over_heartbeat_authentication_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    session_key = key("heartbeat-cancel-race")
+    capture(store, session_key, 1)
+    raise_intent(store, session_key, 1, job_id="job-heartbeat-cancel-race")
+    compiling_started = asyncio.Event()
+    heartbeat_failed = asyncio.Event()
+    keep_compiling = asyncio.Event()
+
+    class BlockingBackend(ExactBackend):
+        async def compile(self, request: ac.CompilationRequest) -> ac.CompilerOutput:
+            compiling_started.set()
+            await heartbeat_failed.wait()
+            await keep_compiling.wait()
+            return await super().compile(request)
+
+    instance = CompactionWorker(
+        repository=store,
+        backend=BlockingBackend(),
+        counter=LengthCounter(),
+        worker_id="worker-heartbeat-cancel-race",
+        config=CompactionWorkerConfig(token_ceiling=10_000),
+    )
+
+    async def fail_heartbeat(_leased: ac.CompactionJobEnvelope) -> None:
+        await compiling_started.wait()
+        heartbeat_failed.set()
+        raise ac.StorageSecurityError(ac.SecurityErrorCode.STORAGE_AUTHENTICATION_FAILED)
+
+    monkeypatch.setattr(instance, "_renew_lease", fail_heartbeat)
+    iteration = asyncio.create_task(instance.run_iteration())
+    await asyncio.wait_for(heartbeat_failed.wait(), timeout=1)
+    iteration.cancel()
+
+    with pytest.raises(asyncio.CancelledError):
+        await iteration
+
+
+@pytest.mark.asyncio
+async def test_primary_storage_error_wins_over_heartbeat_authentication_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    session_key = key("heartbeat-primary-error")
+    capture(store, session_key, 1)
+    raise_intent(store, session_key, 1, job_id="job-heartbeat-primary-error")
+    loop = asyncio.get_running_loop()
+    transition_started = asyncio.Event()
+    heartbeat_failed = threading.Event()
+
+    def fail_transition(**_kwargs: object) -> None:
+        loop.call_soon_threadsafe(transition_started.set)
+        if not heartbeat_failed.wait(timeout=1):
+            raise AssertionError("heartbeat did not fail before the primary exception")
+        raise ac.StorageSecurityError(ac.SecurityErrorCode.STORAGE_KEY_MISMATCH)
+
+    instance = CompactionWorker(
+        repository=store,
+        backend=ExactBackend(),
+        counter=LengthCounter(),
+        worker_id="worker-heartbeat-primary-error",
+        config=CompactionWorkerConfig(token_ceiling=10_000),
+    )
+
+    async def fail_heartbeat(_leased: ac.CompactionJobEnvelope) -> None:
+        await transition_started.wait()
+        heartbeat_failed.set()
+        raise ac.StorageSecurityError(ac.SecurityErrorCode.STORAGE_AUTHENTICATION_FAILED)
+
+    monkeypatch.setattr(store, "transition_job", fail_transition)
+    monkeypatch.setattr(instance, "_renew_lease", fail_heartbeat)
+
+    with pytest.raises(ac.StorageSecurityError) as captured:
+        await instance.run_iteration()
+
+    assert captured.value.code is ac.SecurityErrorCode.STORAGE_KEY_MISMATCH
+
+
+@pytest.mark.asyncio
+async def test_unopposed_heartbeat_authentication_failure_reaches_fatal_callback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    session_key = key("heartbeat-fatal-callback")
+    capture(store, session_key, 1)
+    raise_intent(store, session_key, 1, job_id="job-heartbeat-fatal-callback")
+    heartbeat_failed = asyncio.Event()
+    fatal_codes: list[str] = []
+
+    class WaitForHeartbeatBackend(ExactBackend):
+        async def compile(self, request: ac.CompilationRequest) -> ac.CompilerOutput:
+            await heartbeat_failed.wait()
+            return await super().compile(request)
+
+    async def on_fatal(error: ac.StorageSecurityError) -> None:
+        fatal_codes.append(error.code.value)
+
+    instance = CompactionWorker(
+        repository=store,
+        backend=WaitForHeartbeatBackend(),
+        counter=LengthCounter(),
+        worker_id="worker-heartbeat-fatal-callback",
+        config=CompactionWorkerConfig(token_ceiling=10_000),
+        fatal_storage_callback=on_fatal,
+    )
+
+    async def fail_heartbeat(_leased: ac.CompactionJobEnvelope) -> None:
+        heartbeat_failed.set()
+        raise ac.StorageSecurityError(ac.SecurityErrorCode.STORAGE_AUTHENTICATION_FAILED)
+
+    monkeypatch.setattr(instance, "_renew_lease", fail_heartbeat)
+    await instance.start()
+    task = instance.task
+    assert task is not None
+
+    await asyncio.wait_for(task, timeout=1)
+
+    assert fatal_codes == ["STORAGE_AUTHENTICATION_FAILED"]
+    assert instance.task is None
+
+
+@pytest.mark.asyncio
+async def test_caller_exception_context_does_not_hide_heartbeat_authentication_failure(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    session_key = key("heartbeat-caller-exception")
+    capture(store, session_key, 1)
+    raise_intent(store, session_key, 1, job_id="job-heartbeat-caller-exception")
+    heartbeat_failed = asyncio.Event()
+
+    class WaitForHeartbeatBackend(ExactBackend):
+        async def compile(self, request: ac.CompilationRequest) -> ac.CompilerOutput:
+            await heartbeat_failed.wait()
+            return await super().compile(request)
+
+    instance = CompactionWorker(
+        repository=store,
+        backend=WaitForHeartbeatBackend(),
+        counter=LengthCounter(),
+        worker_id="worker-heartbeat-caller-exception",
+        config=CompactionWorkerConfig(token_ceiling=10_000),
+    )
+
+    async def fail_heartbeat(_leased: ac.CompactionJobEnvelope) -> None:
+        heartbeat_failed.set()
+        raise ac.StorageSecurityError(ac.SecurityErrorCode.STORAGE_AUTHENTICATION_FAILED)
+
+    monkeypatch.setattr(instance, "_renew_lease", fail_heartbeat)
+
+    try:
+        raise LookupError("caller exception context")
+    except LookupError:
+        with pytest.raises(ac.StorageSecurityError) as captured:
+            await instance.run_iteration()
+
+    assert captured.value.code is ac.SecurityErrorCode.STORAGE_AUTHENTICATION_FAILED

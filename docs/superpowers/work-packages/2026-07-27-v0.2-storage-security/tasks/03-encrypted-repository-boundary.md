@@ -78,20 +78,23 @@ assert plaintext synthetic markers do not appear in DB/WAL/SHM after startup scr
 Evidence: `190 passed, 1 skipped`; the focused encrypted-boundary and migration set reports
 `19 passed`.
 
-- [ ] **Step 7: Run S3 quality gates**
+- [x] **Step 7: Run S3 quality gates**
 
 Run lock, Ruff, mypy, focused tests, and the complete suite once S4 has updated the sole
 production constructor call in `main.py`.
 
-- [ ] **Step 8: Commit S3**
+Evidence after S4 constructor wiring: Ruff passed, mypy passed for all 44 source files, and
+the complete suite reported `448 passed, 1 skipped`.
 
-Commit the repository boundary and its tests with:
+- [x] **Step 8: Commit S3**
+
+Committed the repository boundary and its tests as:
 
 ```text
-feat: enforce encrypted repository boundary
+7178226 feat: encrypt repository persistence boundary
 ```
 
-Verify both author and committer are
+Both author and committer are
 `Ayleovelle <273111507+Ayleovelle@users.noreply.github.com>`.
 
 ## Acceptance

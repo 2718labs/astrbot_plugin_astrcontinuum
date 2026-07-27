@@ -1,8 +1,17 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
+from dataclasses import replace
 
-from ..domain import AnchorStatus, CapsuleLevel, ContextCapsuleEnvelope, SemanticStatus
+from ..domain import (
+    AnchorStatus,
+    CapsuleLevel,
+    ContextCapsuleEnvelope,
+    EventEnvelope,
+    EventType,
+    SemanticStatus,
+)
 from ..storage import RequestView
 from .types import (
     RUNTIME_SLOT_PRIORITY,
@@ -99,11 +108,62 @@ def _raw_event_text(event: object) -> str:
     return f"[{event_type}/{role} {event_id}]\n{content}"
 
 
+def _raw_tool_name(event: EventEnvelope) -> str | None:
+    expected_kind = {
+        EventType.TOOL_CALL: "call",
+        EventType.TOOL_RESULT: "result",
+    }.get(event.event_type)
+    if expected_kind is None:
+        return None
+    try:
+        value = json.loads(event.content)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict) or value.get("kind") != expected_kind:
+        return None
+    tool = value.get("tool")
+    return tool if isinstance(tool, str) and tool else None
+
+
 def _candidate_sort_key(candidate: CandidateBlock) -> tuple[int, float, int, str]:
     slot_rank = _SLOT_RANK[candidate.slot]
     if candidate.slot == RuntimeSlot.RAW_DELTA:
         return (slot_rank, 0.0, candidate.event_sequence or 0, candidate.block_id)
     return (slot_rank, -candidate.score, 0, candidate.block_id)
+
+
+def required_candidates_complete(
+    view: RequestView,
+    candidates: Iterable[CandidateBlock],
+    *,
+    satisfied_event_ids: Iterable[str] = (),
+) -> bool:
+    """Prove that every required source in the immutable view has a candidate."""
+
+    satisfied = set(satisfied_event_ids)
+    expected: set[str] = set()
+    for membership in view.memberships:
+        capsule = membership.capsule
+        expected.update(
+            f"goal:{capsule.capsule_id}:{claim.claim_id}"
+            for claim in capsule.goals
+            if claim.status is SemanticStatus.ACTIVE
+        )
+        expected.update(
+            f"constraint:{capsule.capsule_id}:{claim.claim_id}"
+            for claim in capsule.constraints
+            if claim.status is SemanticStatus.ACTIVE
+        )
+        expected.update(
+            f"anchor:{capsule.capsule_id}:{anchor.anchor_id}"
+            for anchor in capsule.exact_anchors
+            if anchor.status is AnchorStatus.ACTIVE
+        )
+    expected.update(
+        f"event:{event.event_id}" for event in view.delta if event.event_id not in satisfied
+    )
+    present = {candidate.block_id for candidate in candidates}
+    return expected.issubset(present)
 
 
 def select_candidates(
@@ -192,6 +252,8 @@ def select_candidates(
                 required=True,
                 capsule_id=None,
                 event_sequence=item.sequence,
+                event_type=item.event_type,
+                tool_name=_raw_tool_name(item),
             )
         ):
             break
@@ -371,4 +433,7 @@ def select_candidates(
         ):
             break
 
-    return tuple(sorted(selected, key=_candidate_sort_key))
+    ordered = tuple(sorted(selected, key=_candidate_sort_key))
+    if not required_candidates_complete(view, ordered):
+        return tuple(replace(candidate, required_selection_complete=False) for candidate in ordered)
+    return ordered

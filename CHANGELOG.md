@@ -6,6 +6,50 @@ All notable changes to AstrContinuum are documented in this file. The format fol
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and version numbers follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.2.0 — 2026-07-27
+
+Architectural refactor of the encrypted, pressure-triggered context runtime. The authoritative
+Journal and reversible AstrBot boundary remain intact, while request-time selection, verification,
+recovery, background publication, and observability are rebuilt as separate fail-open planes.
+No remote release or plugin-market submission is implied by this entry.
+
+### Added
+
+- A bounded request-local sparse context engine with `active`, `shadow`, and `off` modes.
+  Active may use graph-selected context only after verification; Shadow records content-free
+  evidence while sending deterministic fallback; Off skips graph computation.
+- Required NumPy numerical baseline and an optional SciPy sparse accelerator without vendored
+  third-party binaries.
+- Authenticated AES-256-GCM envelopes for conversation-derived durable values, explicit locked
+  startup, plaintext migration, atomic rotation, post-maintenance scrub, and an offline key-file
+  helper that never prints raw key material.
+- Administrator-only `/context_inspect` evidence for the current conversation, alongside expanded
+  `/context_status` mode, outcome, storage, worker, and aggregate health.
+- Content-free engine evidence covering candidate and selected counts, reduction, bounded residual
+  bands, recovery passes, and required/provenance coverage.
+
+### Changed
+
+- The context runtime is now separated into authoritative storage, deterministic fallback,
+  request-local verified graph selection, and background candidate-verification planes.
+- Public package, plugin metadata, configuration, and documentation now identify `v0.2.0`.
+- Context work remains pressure-triggered rather than turn-count-triggered. Background compilation
+  accepts only closed structured fields backed by exact source spans.
+- The WebUI adds one understandable `context_engine_mode` choice and keeps solver tolerances,
+  relation weights, matrix limits, and recovery bounds internal.
+- Key provisioning separates host administrators from chat administrators. Environment injection
+  remains the default; external files are supported for manual deployments; local convenience
+  mode is explicitly reported as degraded.
+
+### Fixed
+
+- Graph, solver, certificate, dependency-closure, or budget-pack failure cannot replace the
+  deterministic fallback and is reported as `DEGRADED_RAW`.
+- Temporary provider context remains excluded from AstrBot persistence and the authoritative
+  Journal remains append-only.
+- Rotation requires the authentic previous key and changes protected rows plus the verifier
+  atomically; failure locks storage without a partial rewrite.
+
 ## v0.1.0 — 2026-07-27
 
 Repository-stage technical preview. This version is available from the source repository for
@@ -58,8 +102,6 @@ AstrBot plugin market, tagged as a stable release, or published as a GitHub Rele
 
 - Provider-backed semantic auditing is not connected to an AstrBot provider.
 - The budget counter is conservative UTF-8 byte length, not an exact tokenizer.
-- The SQLite database is not encrypted at rest; this preview is unsuitable for sensitive-data
-  protection requirements.
 - No rollback/time-travel administration UI is exposed.
 - No platform adapter is claimed in `metadata.yaml` until adapter-specific evidence exists.
 - This technical preview must not be treated as the sole production mechanism for permanent
@@ -70,6 +112,43 @@ AstrBot plugin market, tagged as a stable release, or published as a GitHub Rele
 本文件记录 AstrContinuum 的重要变更，格式参考
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循
 [语义化版本](https://semver.org/lang/zh-CN/)。
+
+### v0.2.0 — 2026-07-27
+
+这是对加密、压力触发上下文运行时的一次架构重构。权威 Journal 与可逆 AstrBot 边界
+保持不变，请求时选择、验证、恢复、后台发布和可观测性被重建为相互分离的 fail-open
+平面。本条目不表示已经远程发布或提交插件市场。
+
+#### 新增
+
+- 有界、请求局部的稀疏上下文引擎，支持 `active`、`shadow`、`off`。主动模式只有在
+  完整校验通过后才使用图选择结果；影子模式记录无内容证据但发送确定性回退结果；
+  关闭模式跳过图计算。
+- NumPy 必需数值基线，以及不随插件打包第三方二进制的可选 SciPy 稀疏加速器。
+- 对话派生持久数据的 AES-256-GCM 认证加密、显式锁定启动、明文迁移、原子换钥、
+  维护后清理，以及不会打印原始密钥的离线密钥文件工具。
+- 管理员 `/context_inspect` 当前会话证据，并扩展 `/context_status` 的模式、结果、
+  存储、后台 worker 与汇总健康信息。
+- 候选数、选择数、归约比例、有界残差等级、恢复次数、必需块和来源覆盖等无内容指标。
+
+#### 变更
+
+- 上下文运行时拆分为权威存储、确定性回退、请求内验证图选择与后台候选验证平面。
+- 包版本、插件元数据、配置与文档统一为 `v0.2.0`。
+- 上下文工作仍按窗口压力触发，不按固定轮数触发；后台编译只接受带逐字来源片段的
+  闭合结构字段。
+- WebUI 只新增一个易懂的 `context_engine_mode`，不暴露求解容差、关系权重、矩阵上限
+  或恢复边界。
+- 密钥由宿主机管理员配置，聊天管理员只能看无内容状态。环境变量仍是默认来源，
+  手动部署可用外部文件，本机便捷模式会明确显示为较弱保护。
+
+#### 修复
+
+- 图、求解器、证书、依赖闭包或预算装配失败都不能替换确定性回退结果，并报告
+  `DEGRADED_RAW`。
+- 临时 Provider 上下文仍不会写入 AstrBot 历史，权威 Journal 仍保持只追加。
+- 换钥必须提供能认证旧数据库的旧密钥，并原子更新受保护行与校验器；失败时锁定存储，
+  不会留下部分换钥状态。
 
 ### v0.1.0 — 2026-07-27
 
@@ -106,7 +185,6 @@ AstrBot plugin market, tagged as a stable release, or published as a GitHub Rele
 
 - Provider 语义审计尚未接入。
 - 预算计数仍是保守的 UTF-8 字节长度。
-- SQLite 数据库尚未静态加密，不适合有敏感数据保护要求的环境。
 - 尚未暴露回滚/时间旅行管理界面。
 - 在取得适配器专项证据前，`metadata.yaml` 不宣称支持具体平台。
 - 当前技术预览不能作为生产环境唯一的永久长上下文压缩机制。

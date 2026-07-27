@@ -8,6 +8,12 @@ from types import ModuleType, SimpleNamespace
 
 import pytest
 
+import astrcontinuum.adapters.astrbot as astrbot_adapter
+from astrcontinuum.storage import SecureCodec
+
+TEST_MASTER_KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+TEST_CODEC = SecureCodec(bytes(range(32)))
+
 
 class FakeLogger:
     def __init__(self) -> None:
@@ -71,6 +77,8 @@ class FakeEvent:
         self.message_obj = SimpleNamespace(
             message_id=message_id,
             timestamp=1_727_000_000,
+            type=SimpleNamespace(value="FriendMessage"),
+            session_id="session-1",
         )
         self._extras: dict[str, object] = {}
 
@@ -117,6 +125,8 @@ def _load_main(
     *,
     projection_capability: bool = True,
 ) -> tuple[ModuleType, FakeLogger]:
+    monkeypatch.setenv("ASTRCONTINUUM_MASTER_KEY", TEST_MASTER_KEY)
+    monkeypatch.delenv("ASTRCONTINUUM_PREVIOUS_KEY", raising=False)
     logger = FakeLogger()
     astrbot = ModuleType("astrbot")
     astrbot.__path__ = []
@@ -190,6 +200,34 @@ async def test_projection_restores_native_history_and_never_persists_projection(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
+    read_count = 0
+    live_assembly_count = 0
+    original_read_request_view = astrbot_adapter.read_request_view
+    original_assemble_live_context = astrbot_adapter.assemble_live_context
+
+    def counted_read_request_view(*args: object, **kwargs: object) -> object:
+        nonlocal read_count
+        read_count += 1
+        return original_read_request_view(*args, **kwargs)  # type: ignore[arg-type]
+
+    def counted_assemble_live_context(
+        *args: object,
+        **kwargs: object,
+    ) -> tuple[object, object]:
+        nonlocal live_assembly_count
+        live_assembly_count += 1
+        return original_assemble_live_context(*args, **kwargs)  # type: ignore[arg-type, return-value]
+
+    monkeypatch.setattr(
+        astrbot_adapter,
+        "read_request_view",
+        counted_read_request_view,
+    )
+    monkeypatch.setattr(
+        astrbot_adapter,
+        "assemble_live_context",
+        counted_assemble_live_context,
+    )
     module, _logger = _load_main(monkeypatch, tmp_path)
     plugin = module.AstrContinuumPlugin(
         object(),
@@ -213,6 +251,7 @@ async def test_projection_restores_native_history_and_never_persists_projection(
     request_contexts = request.contexts
     request_context_bytes = _dump_messages(request.contexts)
     await plugin.on_llm_request(event, request)
+    reads_before_projection = read_count
 
     system = FakeMessage(role="system", content="system prompt")
     history_user = FakeMessage(role="user", content="old user")
@@ -227,6 +266,8 @@ async def test_projection_restores_native_history_and_never_persists_projection(
     messages.insert(1, opaque)
     await plugin.on_agent_begin_project(event, run_context)
 
+    assert live_assembly_count == 1
+    assert read_count == reads_before_projection
     assert request.contexts is request_contexts
     assert _dump_messages(request.contexts) == request_context_bytes
     assert messages[0] is system
@@ -269,15 +310,32 @@ async def test_projection_restores_native_history_and_never_persists_projection(
     assert bridge is not None
     with bridge.repository.factory.connection(read_only=True) as connection:
         rows = connection.execute(
-            "SELECT sequence, event_type, content FROM journal_events ORDER BY sequence"
+            """
+            SELECT event_id, sequence, event_type, content
+            FROM journal_events
+            ORDER BY sequence
+            """
         ).fetchall()
-        assert [tuple(row) for row in rows] == [
+        decoded_rows = [
+            (
+                row["sequence"],
+                row["event_type"],
+                TEST_CODEC.decrypt_text(
+                    "journal_events",
+                    "content",
+                    row["event_id"],
+                    row["content"],
+                ),
+            )
+            for row in rows
+        ]
+        assert decoded_rows == [
             (1, "USER_MESSAGE", "old user"),
             (2, "ASSISTANT_MESSAGE", "old assistant"),
             (3, "USER_MESSAGE", "fresh user"),
             (4, "ASSISTANT_MESSAGE", "fresh assistant"),
         ]
-        assert all(row["content"] != projected_text for row in rows)
+        assert all(row["content"] not in {projected_text, "old user", "fresh user"} for row in rows)
         before_response = len(rows)
 
     await plugin.on_llm_response(

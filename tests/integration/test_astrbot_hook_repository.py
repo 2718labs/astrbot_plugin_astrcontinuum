@@ -39,6 +39,8 @@ class FakeEvent:
         self.message_obj = SimpleNamespace(
             message_id=message_id,
             timestamp=1_727_000_000,
+            type=FakeMessageType.FRIEND,
+            session_id="session-9",
         )
         self._sender_id = sender_id
 

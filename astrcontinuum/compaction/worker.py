@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
+from ..context_graph.candidate_verification import (
+    CandidateVerificationError,
+    verify_candidate,
+)
 from ..domain import CompactionJobEnvelope, CompactionJobState
 from ..runtime.types import TokenCounter
-from ..storage import SQLiteRepository, StaleLeaseError
+from ..storage import SQLiteRepository, StaleLeaseError, StorageSecurityError
 from .auditor import audit_semantic
 from .compiler import compile_candidate
 from .types import (
@@ -20,6 +24,7 @@ from .types import (
 )
 
 Clock = Callable[[], datetime]
+FatalStorageCallback = Callable[[StorageSecurityError], Awaitable[None]]
 
 
 def _utc_now() -> datetime:
@@ -80,6 +85,7 @@ class CompactionWorker:
         config: CompactionWorkerConfig,
         semantic_backend: SemanticAuditBackend | None = None,
         clock: Clock = _utc_now,
+        fatal_storage_callback: FatalStorageCallback | None = None,
     ) -> None:
         if not worker_id.strip():
             raise ValueError("worker_id must be non-empty")
@@ -90,6 +96,7 @@ class CompactionWorker:
         self._config = config
         self._semantic_backend = semantic_backend
         self._clock = clock
+        self._fatal_storage_callback = fatal_storage_callback
         self._wake_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._closed = False
@@ -141,83 +148,97 @@ class CompactionWorker:
             name=f"astrcontinuum-lease:{leased.job_id}",
         )
         stage = "LEASED"
+        primary_exception_escaping = False
         try:
-            stage = "COMPILING"
-            compiling = await asyncio.to_thread(
-                self._repository.transition_job,
-                job_id=leased.job_id,
-                owner=self._worker_id,
-                lease_epoch=leased.lease_epoch,
-                to_state=CompactionJobState.COMPILING,
-                now=self._clock(),
-            )
-            view = await asyncio.to_thread(
-                self._repository.read_compaction_view,
-                job_id=compiling.job_id,
-                owner=self._worker_id,
-                lease_epoch=compiling.lease_epoch,
-                now=self._clock(),
-            )
-            candidate = await compile_candidate(
-                base_snapshot=view.snapshot,
-                base_capsules=view.capsules,
-                source_events=view.delta,
-                target_high_water_mark=compiling.target_high_water_mark,
-                token_ceiling=self._config.token_ceiling,
-                backend=self._backend,
-                counter=self._counter,
-                now=self._clock(),
-                segmenter_config=self._config.segmenter_config,
-            )
+            try:
+                stage = "COMPILING"
+                compiling = await asyncio.to_thread(
+                    self._repository.transition_job,
+                    job_id=leased.job_id,
+                    owner=self._worker_id,
+                    lease_epoch=leased.lease_epoch,
+                    to_state=CompactionJobState.COMPILING,
+                    now=self._clock(),
+                )
+                view = await asyncio.to_thread(
+                    self._repository.read_compaction_view,
+                    job_id=compiling.job_id,
+                    owner=self._worker_id,
+                    lease_epoch=compiling.lease_epoch,
+                    now=self._clock(),
+                )
+                candidate = await compile_candidate(
+                    base_snapshot=view.snapshot,
+                    base_capsules=view.capsules,
+                    source_events=view.delta,
+                    target_high_water_mark=compiling.target_high_water_mark,
+                    token_ceiling=self._config.token_ceiling,
+                    backend=self._backend,
+                    counter=self._counter,
+                    now=self._clock(),
+                    segmenter_config=self._config.segmenter_config,
+                )
 
-            if self._config.strict_audit:
-                stage = "AUDITING"
-                await asyncio.to_thread(
+                if self._config.strict_audit:
+                    stage = "AUDITING"
+                    await asyncio.to_thread(
+                        self._repository.transition_job,
+                        job_id=compiling.job_id,
+                        owner=self._worker_id,
+                        lease_epoch=compiling.lease_epoch,
+                        to_state=CompactionJobState.AUDITING,
+                        now=self._clock(),
+                    )
+                audited = await audit_semantic(
+                    candidate,
+                    strict_audit=self._config.strict_audit,
+                    backend=self._semantic_backend,
+                )
+
+                stage = "VERIFYING"
+                await asyncio.to_thread(verify_candidate, audited)
+
+                stage = "READY_TO_COMMIT"
+                ready = await asyncio.to_thread(
                     self._repository.transition_job,
                     job_id=compiling.job_id,
                     owner=self._worker_id,
                     lease_epoch=compiling.lease_epoch,
-                    to_state=CompactionJobState.AUDITING,
+                    to_state=CompactionJobState.READY_TO_COMMIT,
+                    candidate_snapshot_id=audited.snapshot.snapshot_id,
                     now=self._clock(),
                 )
-            audited = await audit_semantic(
-                candidate,
-                strict_audit=self._config.strict_audit,
-                backend=self._semantic_backend,
-            )
-
-            stage = "READY_TO_COMMIT"
-            ready = await asyncio.to_thread(
-                self._repository.transition_job,
-                job_id=compiling.job_id,
-                owner=self._worker_id,
-                lease_epoch=compiling.lease_epoch,
-                to_state=CompactionJobState.READY_TO_COMMIT,
-                candidate_snapshot_id=audited.snapshot.snapshot_id,
-                now=self._clock(),
-            )
-            stage = "PUBLISHING"
-            await asyncio.to_thread(
-                self._repository.publish_snapshot,
-                job_id=ready.job_id,
-                owner=self._worker_id,
-                lease_epoch=ready.lease_epoch,
-                candidate_snapshot=audited.snapshot,
-                memberships=audited.memberships,
-                token_ceiling=self._config.token_ceiling,
-                now=self._clock(),
-            )
-        except asyncio.CancelledError:
+                stage = "PUBLISHING"
+                await asyncio.to_thread(
+                    self._repository.publish_snapshot,
+                    job_id=ready.job_id,
+                    owner=self._worker_id,
+                    lease_epoch=ready.lease_epoch,
+                    candidate_snapshot=audited.snapshot,
+                    memberships=audited.memberships,
+                    token_ceiling=self._config.token_ceiling,
+                    now=self._clock(),
+                )
+            except asyncio.CancelledError:
+                raise
+            except StorageSecurityError:
+                raise
+            except CompilerBackendDeferred as error:
+                await self._persist_deferred(leased, stage=stage, error=error)
+            except StaleLeaseError:
+                return True
+            except Exception as error:  # noqa: BLE001 - iteration boundary persists stable data
+                await self._persist_failure(leased, stage=stage, error=error)
+        except BaseException:
+            primary_exception_escaping = True
             raise
-        except CompilerBackendDeferred as error:
-            await self._persist_deferred(leased, stage=stage, error=error)
-        except StaleLeaseError:
-            return True
-        except Exception as error:  # noqa: BLE001 - iteration boundary persists stable data
-            await self._persist_failure(leased, stage=stage, error=error)
         finally:
             heartbeat.cancel()
-            await asyncio.gather(heartbeat, return_exceptions=True)
+            heartbeat_result = (await asyncio.gather(heartbeat, return_exceptions=True))[0]
+            if not primary_exception_escaping and isinstance(
+                heartbeat_result, StorageSecurityError
+            ):
+                raise heartbeat_result
         return True
 
     async def _persist_deferred(
@@ -293,6 +314,8 @@ class CompactionWorker:
             return error.code.value
         if isinstance(error, SemanticAuditInvariantError):
             return error.code.value
+        if isinstance(error, CandidateVerificationError):
+            return error.code.value
         return "COMPACTION_WORKER_FAILURE"
 
     async def _run(self) -> None:
@@ -306,6 +329,15 @@ class CompactionWorker:
                 did_work = await self.run_iteration()
             except asyncio.CancelledError:
                 raise
+            except StorageSecurityError as error:
+                self._closed = True
+                callback = self._fatal_storage_callback
+                try:
+                    if callback is not None:
+                        await callback(error)
+                finally:
+                    self._task = None
+                return
             except Exception:  # noqa: BLE001 - scheduler must survive unrelated failures
                 did_work = False
             if did_work:

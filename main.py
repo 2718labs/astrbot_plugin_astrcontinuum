@@ -5,8 +5,10 @@ from __future__ import annotations
 import asyncio
 import copy
 import uuid
+from collections import Counter
+from collections.abc import Callable
 from dataclasses import dataclass, field
-from typing import TYPE_CHECKING, Any, cast
+from typing import TYPE_CHECKING, Any, TypeVar, cast
 
 from astrbot.api import logger  # type: ignore[import-not-found]
 from astrbot.api.event import AstrMessageEvent, filter  # type: ignore[import-not-found]
@@ -21,6 +23,7 @@ if TYPE_CHECKING or not __package__:
         ProjectionCapability,
         build_projection_objects,
         estimate_opaque_token_cost,
+        extract_host_session_key,
         probe_projection_capability,
         select_projection_boundaries,
     )
@@ -30,7 +33,8 @@ if TYPE_CHECKING or not __package__:
         CompactionWorkerConfig,
         SessionProviderRegistry,
     )
-    from astrcontinuum.domain import EventEnvelope
+    from astrcontinuum.context_graph import ContextEngineMode, LiveContextTrace
+    from astrcontinuum.domain import EventEnvelope, SessionKey
     from astrcontinuum.runtime import (
         BudgetConfig,
         PressureConfig,
@@ -47,9 +51,14 @@ if TYPE_CHECKING or not __package__:
         verify_native,
     )
     from astrcontinuum.storage import (
+        KeySource,
+        SecurityErrorCode,
         SQLiteConnectionFactory,
-        SQLiteMigrator,
         SQLiteRepository,
+        StorageMaintenanceState,
+        StorageSecurityError,
+        activate_storage_security,
+        resolve_key_material,
     )
 else:
     from .astrcontinuum.adapters import (
@@ -60,6 +69,7 @@ else:
         ProjectionCapability,
         build_projection_objects,
         estimate_opaque_token_cost,
+        extract_host_session_key,
         probe_projection_capability,
         select_projection_boundaries,
     )
@@ -69,7 +79,8 @@ else:
         CompactionWorkerConfig,
         SessionProviderRegistry,
     )
-    from .astrcontinuum.domain import EventEnvelope
+    from .astrcontinuum.context_graph import ContextEngineMode, LiveContextTrace
+    from .astrcontinuum.domain import EventEnvelope, SessionKey
     from .astrcontinuum.runtime import (
         BudgetConfig,
         PressureConfig,
@@ -86,13 +97,27 @@ else:
         verify_native,
     )
     from .astrcontinuum.storage import (
+        KeySource,
+        SecurityErrorCode,
         SQLiteConnectionFactory,
-        SQLiteMigrator,
         SQLiteRepository,
+        StorageMaintenanceState,
+        StorageSecurityError,
+        activate_storage_security,
+        resolve_key_material,
     )
 
 _PLUGIN_NAME = "astrbot_plugin_astrcontinuum"
 _REQUEST_STATE_KEY = "astrcontinuum.v1.request-state"
+_ENCRYPTION_FORMAT = "AES-256-GCM / envelope-v1"
+_TRACE_INTEGER_LIMIT = 1_000_000
+_EVENT_TYPES = (
+    "USER_MESSAGE",
+    "ASSISTANT_MESSAGE",
+    "TOOL_CALL",
+    "TOOL_RESULT",
+)
+_T = TypeVar("_T")
 
 
 @dataclass(slots=True, repr=False)
@@ -109,6 +134,62 @@ class _RequestState:
     next_tool_ordinal: int = 0
     pending_tool_ordinals: list[int] = field(default_factory=list, repr=False)
     faults: list[AdapterFault] = field(default_factory=list, repr=False)
+
+
+@dataclass(frozen=True, slots=True)
+class _StorageRuntimeStatus:
+    protection: str
+    key_source: str
+    key_id: str
+    maintenance: str
+    security_code: str
+
+
+@dataclass(frozen=True, slots=True)
+class _SessionInspection:
+    snapshot_suffix: str
+    pointer_version: int
+    covered_range: str
+    high_water_mark: int
+    delta_range: str
+    event_counts: tuple[tuple[str, int], ...]
+    capsule_slots: tuple[tuple[str, int], ...]
+    pending_job_state: str
+    retry_code: str
+
+
+@dataclass(frozen=True, slots=True)
+class _ContextEngineInspection:
+    mode: str
+    state: str
+    stable_code: str
+    candidate_count: str
+    selected_count: str
+    relation_count: str
+    constraint_count: str
+    retained_count: str
+    reduced_count: str
+    selected_budget_units: str
+    reduction_ratio: str
+    residual_band: str
+    recovery_count: str
+    required_coverage: str
+    provenance_coverage: str
+
+
+async def _complete_thread_call(
+    function: Callable[..., _T],
+    /,
+    *args: object,
+) -> _T:
+    """Wait for startup-only blocking work even if the lifecycle task is cancelled."""
+
+    task = asyncio.create_task(asyncio.to_thread(function, *args))
+    try:
+        return await asyncio.shield(task)
+    except asyncio.CancelledError:
+        await asyncio.gather(task, return_exceptions=True)
+        raise
 
 
 def _generic_fault(code: str, stage: str, *, capability_available: bool = False) -> AdapterFault:
@@ -135,9 +216,9 @@ def _contains_identity(objects: tuple[object, ...], target: object) -> bool:
 
 @register(
     "astrbot_plugin_astrcontinuum",
-    "2718labs",
+    "Ayleovelle",
     "Non-blocking infinite context runtime for AstrBot",
-    "0.1.0",
+    "0.2.0",
 )
 class AstrContinuumPlugin(Star):
     """One standards-compliant Star with reversible provider projection."""
@@ -157,6 +238,65 @@ class AstrContinuumPlugin(Star):
         self._providers: SessionProviderRegistry | None = None
         self._worker: CompactionWorker | None = None
         self._counter = Utf8ByteTokenCounter()
+        self._context_engine_mode = self._configured_context_engine_mode()
+        self._storage_status = self._initial_storage_status()
+
+    def _configured_context_engine_mode(self) -> ContextEngineMode:
+        value = self.config.get("context_engine_mode", ContextEngineMode.ACTIVE.value)
+        if not isinstance(value, str):
+            return ContextEngineMode.ACTIVE
+        try:
+            return ContextEngineMode(value.strip().upper())
+        except ValueError:
+            return ContextEngineMode.ACTIVE
+
+    @staticmethod
+    def _key_source_label(source: KeySource) -> str:
+        if source is KeySource.FILE:
+            return "external file"
+        if source is KeySource.LOCAL:
+            return "local convenience"
+        return "environment"
+
+    def _configured_key_source_label(self) -> str:
+        value = self.config.get("encryption_key_source", KeySource.ENVIRONMENT.value)
+        try:
+            return self._key_source_label(KeySource(value))
+        except (TypeError, ValueError):
+            return "unknown"
+
+    def _initial_storage_status(self) -> _StorageRuntimeStatus:
+        if not self._enabled:
+            return _StorageRuntimeStatus(
+                protection="DISABLED",
+                key_source="none",
+                key_id="NONE",
+                maintenance="INACTIVE",
+                security_code="NONE",
+            )
+        return _StorageRuntimeStatus(
+            protection="LOCKED",
+            key_source=self._configured_key_source_label(),
+            key_id="NONE",
+            maintenance="UNKNOWN",
+            security_code="STORAGE_NOT_INITIALIZED",
+        )
+
+    def _locked_storage_status(
+        self,
+        code: str,
+        *,
+        key_source: str | None = None,
+        key_id: str | None = None,
+    ) -> _StorageRuntimeStatus:
+        current = self._storage_status
+        return _StorageRuntimeStatus(
+            protection="LOCKED",
+            key_source=key_source or current.key_source,
+            key_id=key_id or current.key_id,
+            maintenance="UNKNOWN",
+            security_code=code,
+        )
 
     def _budget_config(self) -> BudgetConfig:
         defaults = BudgetConfig()
@@ -336,62 +476,166 @@ class AstrContinuumPlugin(Star):
                 _generic_fault("EMPTY_PROJECTION_FAILED", "PROJECT"),
             )
 
+    @staticmethod
+    async def _close_worker_safely(worker: CompactionWorker | None) -> None:
+        if worker is None:
+            return
+        try:
+            await worker.close()
+        except Exception:  # noqa: BLE001 - never expose worker internals
+            logger.error(
+                "AstrContinuum worker close failed code=%s",
+                "WORKER_CLOSE_FAILED",
+            )
+
     async def initialize(self) -> None:
-        """Initialize durable storage exactly once per active lifecycle."""
+        """Authenticate storage and initialize runtime components exactly once."""
 
         async with self._initialize_lock:
             if self._initialized:
                 return
             if not self._enabled:
+                self._storage_status = self._initial_storage_status()
                 self._initialized = True
                 return
-            data_dir = await asyncio.to_thread(StarTools.get_data_dir, _PLUGIN_NAME)
-            factory = SQLiteConnectionFactory(data_dir)
-            await asyncio.to_thread(SQLiteMigrator(factory).migrate)
-            repository = SQLiteRepository(factory)
-            bridge = AstrBotHookBridge(
-                repository,
-                budget_config=self._budget_config(),
-                counter=self._counter,
-            )
-            provider_override = self.config.get("compaction_provider_id", "")
-            providers = SessionProviderRegistry(
-                provider_override=(
-                    provider_override if isinstance(provider_override, str) else None
-                ),
-            )
-            backend = AstrBotExtractiveCompilerBackend(
-                generator=self._generate_compaction,
-                providers=providers,
-                counter=self._counter,
-            )
-            worker = CompactionWorker(
-                repository=repository,
-                backend=backend,
-                counter=self._counter,
-                worker_id=f"astrbot-{uuid.uuid4().hex}",
-                config=self._worker_config(),
-            )
-            await worker.start()
+
+            worker: CompactionWorker | None = None
+            key_source = self._configured_key_source_label()
+            key_id = "NONE"
+            try:
+                data_dir = await asyncio.to_thread(StarTools.get_data_dir, _PLUGIN_NAME)
+                keys = await _complete_thread_call(
+                    resolve_key_material,
+                    self.config,
+                    data_dir,
+                )
+                key_source = self._key_source_label(keys.source)
+                factory = SQLiteConnectionFactory(data_dir)
+                activation = await _complete_thread_call(
+                    activate_storage_security,
+                    factory,
+                    keys,
+                )
+                if activation.state is not StorageMaintenanceState.ACTIVE:
+                    raise StorageSecurityError(SecurityErrorCode.STORAGE_MIGRATION_FAILED)
+                key_id = activation.key_id
+                repository = SQLiteRepository(factory, codec=activation.codec)
+                bridge = AstrBotHookBridge(
+                    repository,
+                    budget_config=self._budget_config(),
+                    counter=self._counter,
+                    context_engine_mode=self._context_engine_mode,
+                )
+                provider_override = self.config.get("compaction_provider_id", "")
+                providers = SessionProviderRegistry(
+                    provider_override=(
+                        provider_override if isinstance(provider_override, str) else None
+                    ),
+                )
+                backend = AstrBotExtractiveCompilerBackend(
+                    generator=self._generate_compaction,
+                    providers=providers,
+                    counter=self._counter,
+                )
+                capability = probe_projection_capability()
+                worker = CompactionWorker(
+                    repository=repository,
+                    backend=backend,
+                    counter=self._counter,
+                    worker_id=f"astrbot-{uuid.uuid4().hex}",
+                    config=self._worker_config(),
+                    fatal_storage_callback=self._on_worker_storage_failure,
+                )
+                await worker.start()
+            except asyncio.CancelledError:
+                await self._close_worker_safely(worker)
+                raise
+            except StorageSecurityError as error:
+                await self._close_worker_safely(worker)
+                self._bridge = None
+                self._providers = None
+                self._worker = None
+                self._capability = None
+                self._storage_status = self._locked_storage_status(
+                    error.code.value,
+                    key_source=key_source,
+                    key_id=key_id,
+                )
+                self._initialized = True
+                logger.error(
+                    "AstrContinuum storage locked code=%s",
+                    error.code.value,
+                )
+                return
+            except Exception:  # noqa: BLE001 - startup details stay private
+                await self._close_worker_safely(worker)
+                self._bridge = None
+                self._providers = None
+                self._worker = None
+                self._capability = None
+                self._storage_status = self._locked_storage_status(
+                    "STORAGE_STARTUP_FAILED",
+                    key_source=key_source,
+                    key_id=key_id,
+                )
+                self._initialized = True
+                logger.error(
+                    "AstrContinuum storage locked code=%s",
+                    "STORAGE_STARTUP_FAILED",
+                )
+                return
+
             self._bridge = bridge
             self._providers = providers
             self._worker = worker
-            self._capability = probe_projection_capability()
+            self._capability = capability
+            self._storage_status = _StorageRuntimeStatus(
+                protection=("LOCAL_KEY_DEGRADED" if keys.local_degraded else "ACTIVE"),
+                key_source=key_source,
+                key_id=activation.key_id,
+                maintenance=activation.state.value,
+                security_code="NONE",
+            )
             self._initialized = True
-            logger.info("AstrContinuum initialized")
+            logger.info(
+                "AstrContinuum initialized protection=%s key_source=%s key_id=%s",
+                self._storage_status.protection,
+                self._storage_status.key_source,
+                self._storage_status.key_id,
+            )
+
+    async def _enter_storage_locked(self, error: StorageSecurityError) -> None:
+        current_task = asyncio.current_task()
+        async with self._initialize_lock:
+            worker = self._worker
+            self._bridge = None
+            self._providers = None
+            self._worker = None
+            self._capability = None
+            self._storage_status = self._locked_storage_status(error.code.value)
+            self._initialized = True
+            if worker is not None and worker.task is not current_task:
+                await self._close_worker_safely(worker)
+        logger.error(
+            "AstrContinuum storage locked code=%s",
+            error.code.value,
+        )
+
+    async def _on_worker_storage_failure(self, error: StorageSecurityError) -> None:
+        await self._enter_storage_locked(error)
 
     async def terminate(self) -> None:
         """Release request composition state idempotently."""
 
         async with self._initialize_lock:
             worker = self._worker
-            self._worker = None
-            if worker is not None:
-                await worker.close()
             self._bridge = None
             self._capability = None
             self._providers = None
+            self._worker = None
             self._initialized = False
+            self._storage_status = self._initial_storage_status()
+            await self._close_worker_safely(worker)
 
     def _record_fault(
         self,
@@ -466,6 +710,12 @@ class AstrContinuumPlugin(Star):
         try:
             state.prepared = await bridge.prepare_request(event, req)
             await self._remember_current_provider(event, state)
+        except StorageSecurityError as error:
+            await self._enter_storage_locked(error)
+            self._record_fault(
+                state,
+                _generic_fault(error.code.value, "STORAGE"),
+            )
         except AstrBotAdapterError as error:
             self._record_fault(state, error.fault)
         except Exception:  # noqa: BLE001 - persistence details stay private
@@ -558,7 +808,7 @@ class AstrContinuumPlugin(Star):
             self._mask_request_token_usage(state)
             opaque_cost = estimate_opaque_token_cost(opaque_objects, self._counter)
             fixed_cost = estimate_opaque_token_cost(guard.system_objects, self._counter)
-            assembly = bridge.assemble_prepared(
+            assembly = await bridge.assemble_prepared(
                 state.prepared,
                 opaque_token_cost=opaque_cost,
                 fixed_required_cost=fixed_cost,
@@ -659,6 +909,13 @@ class AstrContinuumPlugin(Star):
                     state.prepared,
                     content,
                 )
+            except StorageSecurityError as error:
+                await self._enter_storage_locked(error)
+                self._record_fault(
+                    state,
+                    _generic_fault(error.code.value, "STORAGE"),
+                )
+                return
             except AstrBotAdapterError as error:
                 self._record_fault(state, error.fault)
                 return
@@ -677,6 +934,12 @@ class AstrContinuumPlugin(Star):
                 state.intent_raised = True
                 if job is not None and self._worker is not None:
                     self._worker.wake()
+            except StorageSecurityError as error:
+                await self._enter_storage_locked(error)
+                self._record_fault(
+                    state,
+                    _generic_fault(error.code.value, "STORAGE"),
+                )
             except AstrBotAdapterError as error:
                 self._record_fault(state, error.fault)
             except Exception:  # noqa: BLE001 - scheduling details stay private
@@ -713,6 +976,12 @@ class AstrContinuumPlugin(Star):
                 tool,
                 tool_args,
                 ordinal=ordinal,
+            )
+        except StorageSecurityError as error:
+            await self._enter_storage_locked(error)
+            self._record_fault(
+                state,
+                _generic_fault(error.code.value, "STORAGE"),
             )
         except AstrBotAdapterError as error:
             self._record_fault(state, error.fault)
@@ -756,6 +1025,12 @@ class AstrContinuumPlugin(Star):
                 tool_result,
                 ordinal=ordinal,
             )
+        except StorageSecurityError as error:
+            await self._enter_storage_locked(error)
+            self._record_fault(
+                state,
+                _generic_fault(error.code.value, "STORAGE"),
+            )
         except AstrBotAdapterError as error:
             self._record_fault(state, error.fault)
         except Exception:  # noqa: BLE001 - persistence details stay private
@@ -777,29 +1052,320 @@ class AstrContinuumPlugin(Star):
         if state is not None:
             self._restore_request_conversation(state)
 
+    @staticmethod
+    def _security_status_lines(status: _StorageRuntimeStatus) -> tuple[str, ...]:
+        return (
+            f"数据保护：{status.protection}",
+            f"加密格式：{_ENCRYPTION_FORMAT}",
+            f"密钥来源：{status.key_source}",
+            f"活动密钥标识：{status.key_id}",
+            f"存储维护：{status.maintenance}",
+            f"安全代码：{status.security_code}",
+        )
+
+    @staticmethod
+    def _safe_operational_label(value: object, *, fallback: str = "INVALID") -> str:
+        if not isinstance(value, str) or not 1 <= len(value) <= 64:
+            return fallback
+        if not value.isascii() or any(
+            not (character.isalnum() or character in "_-") for character in value
+        ):
+            return fallback
+        return value
+
+    @classmethod
+    def _enum_operational_label(
+        cls,
+        value: object,
+        *,
+        fallback: str = "INVALID",
+    ) -> str:
+        return cls._safe_operational_label(
+            getattr(value, "value", value),
+            fallback=fallback,
+        )
+
+    @staticmethod
+    def _bounded_integer_label(value: object) -> str:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return "INVALID"
+        if value > _TRACE_INTEGER_LIMIT:
+            return f"{_TRACE_INTEGER_LIMIT}+"
+        return str(value)
+
+    @staticmethod
+    def _bounded_reduction_ratio(
+        candidate_count: object,
+        reduced_count: object,
+    ) -> str:
+        if (
+            isinstance(candidate_count, bool)
+            or not isinstance(candidate_count, int)
+            or candidate_count < 0
+            or isinstance(reduced_count, bool)
+            or not isinstance(reduced_count, int)
+            or reduced_count < 0
+        ):
+            return "INVALID"
+        if candidate_count == 0:
+            return "0.00%" if reduced_count == 0 else "INVALID"
+        bounded_reduced = min(candidate_count, reduced_count)
+        hundredths = bounded_reduced * 10_000 // candidate_count
+        return f"{hundredths // 100}.{hundredths % 100:02d}%"
+
+    @staticmethod
+    def _coverage_label(value: object) -> str:
+        if value is True:
+            return "PASS"
+        if value is False:
+            return "FAIL"
+        return "UNKNOWN"
+
+    def _latest_engine_state(self, trace: LiveContextTrace | None) -> str:
+        if trace is None:
+            return "NONE"
+        mode = self._enum_operational_label(getattr(trace, "mode", None))
+        outcome = self._enum_operational_label(getattr(trace, "outcome", None))
+        if mode != self._context_engine_mode.value:
+            return "UNVERIFIED"
+        if mode == ContextEngineMode.OFF.value or outcome == "OFF":
+            return "NONE"
+        if outcome == "DEGRADED_RAW":
+            return "DEGRADED_RAW"
+        if mode == ContextEngineMode.SHADOW.value or outcome == "SHADOW":
+            return "UNVERIFIED"
+        if outcome != "ACTIVE":
+            return "UNVERIFIED"
+        if (
+            getattr(trace, "required_passed", None) is not True
+            or getattr(trace, "provenance_passed", None) is not True
+        ):
+            return "UNVERIFIED"
+        recovery_count = getattr(trace, "adaptive_retry_count", None)
+        if isinstance(recovery_count, bool) or not isinstance(recovery_count, int):
+            return "UNVERIFIED"
+        return "REFINED" if recovery_count > 0 else "VERIFIED"
+
+    @staticmethod
+    def _latest_context_trace(bridge: AstrBotHookBridge | None) -> LiveContextTrace | None:
+        if bridge is None:
+            return None
+        try:
+            return bridge.last_context_trace
+        except Exception:  # noqa: BLE001 - observability is content-free and fail-open
+            return None
+
+    def _engine_status_lines(
+        self,
+        trace: LiveContextTrace | None,
+    ) -> tuple[str, str]:
+        return (
+            f"上下文引擎：{self._context_engine_mode.value}",
+            f"最近引擎状态：{self._latest_engine_state(trace)}",
+        )
+
+    def _normalize_context_trace(
+        self,
+        trace: LiveContextTrace | None,
+    ) -> _ContextEngineInspection:
+        if trace is None:
+            return _ContextEngineInspection(
+                mode=self._context_engine_mode.value,
+                state="NONE",
+                stable_code="CONTEXT_TRACE_UNAVAILABLE",
+                candidate_count="UNAVAILABLE",
+                selected_count="UNAVAILABLE",
+                relation_count="UNAVAILABLE",
+                constraint_count="UNAVAILABLE",
+                retained_count="UNAVAILABLE",
+                reduced_count="UNAVAILABLE",
+                selected_budget_units="UNAVAILABLE",
+                reduction_ratio="UNAVAILABLE",
+                residual_band="UNAVAILABLE",
+                recovery_count="UNAVAILABLE",
+                required_coverage="UNKNOWN",
+                provenance_coverage="UNKNOWN",
+            )
+        error_code = getattr(trace, "error_code", None)
+        stable_code = "NONE" if error_code is None else self._safe_operational_label(error_code)
+        return _ContextEngineInspection(
+            mode=self._context_engine_mode.value,
+            state=self._latest_engine_state(trace),
+            stable_code=stable_code,
+            candidate_count=self._bounded_integer_label(getattr(trace, "candidate_count", None)),
+            selected_count=self._bounded_integer_label(getattr(trace, "selected_count", None)),
+            relation_count=self._bounded_integer_label(getattr(trace, "relation_count", None)),
+            constraint_count=self._bounded_integer_label(getattr(trace, "constraint_count", None)),
+            retained_count=self._bounded_integer_label(getattr(trace, "retained_count", None)),
+            reduced_count=self._bounded_integer_label(getattr(trace, "reduced_count", None)),
+            selected_budget_units=self._bounded_integer_label(
+                getattr(trace, "selected_budget_units", None)
+            ),
+            reduction_ratio=self._bounded_reduction_ratio(
+                getattr(trace, "candidate_count", None),
+                getattr(trace, "reduced_count", None),
+            ),
+            residual_band=self._enum_operational_label(getattr(trace, "residual_band", None)),
+            recovery_count=self._bounded_integer_label(
+                getattr(trace, "adaptive_retry_count", None)
+            ),
+            required_coverage=self._coverage_label(getattr(trace, "required_passed", None)),
+            provenance_coverage=self._coverage_label(getattr(trace, "provenance_passed", None)),
+        )
+
+    @staticmethod
+    def _snapshot_suffix(value: str) -> str:
+        suffix = value[-12:]
+        if len(suffix) == 12 and all(character in "0123456789abcdef" for character in suffix):
+            return suffix
+        return "REDACTED"
+
+    @classmethod
+    def _read_session_inspection(
+        cls,
+        bridge: AstrBotHookBridge,
+        session_key: SessionKey,
+    ) -> _SessionInspection:
+        view = bridge.repository.read_request_view(session_key)
+        with bridge.repository.factory.connection(read_only=True) as connection:
+            event_rows = connection.execute(
+                """
+                SELECT event_type, count(*)
+                FROM journal_events
+                WHERE session_key_hash = ?
+                GROUP BY event_type
+                """,
+                (session_key.session_key_hash,),
+            ).fetchall()
+            pending_row = connection.execute(
+                """
+                SELECT state, error_code
+                FROM compaction_jobs
+                WHERE session_key_hash = ?
+                  AND state IN (
+                      'PENDING',
+                      'LEASED',
+                      'COMPILING',
+                      'AUDITING',
+                      'READY_TO_COMMIT',
+                      'RETRY_WAIT'
+                  )
+                ORDER BY updated_at DESC, job_id DESC
+                LIMIT 1
+                """,
+                (session_key.session_key_hash,),
+            ).fetchone()
+
+        event_count_map = {cls._safe_operational_label(row[0]): int(row[1]) for row in event_rows}
+        event_counts = tuple(
+            (event_type, event_count_map.get(event_type, 0)) for event_type in _EVENT_TYPES
+        )
+        capsule_counter = Counter(
+            cls._safe_operational_label(membership.slot) for membership in view.memberships
+        )
+        capsule_slots = tuple(sorted(capsule_counter.items()))
+        snapshot = view.snapshot
+        snapshot_suffix = (
+            cls._snapshot_suffix(snapshot.snapshot_id) if snapshot is not None else "NONE"
+        )
+        covered_range = f"1-{view.covered_event_end}" if snapshot is not None else "EMPTY"
+        delta_range = (
+            f"{view.delta[0].sequence}-{view.delta[-1].sequence}" if view.delta else "EMPTY"
+        )
+        pending_job_state = "NONE"
+        retry_code = "NONE"
+        if pending_row is not None:
+            pending_job_state = cls._safe_operational_label(pending_row[0])
+            if pending_row[1] is not None:
+                retry_code = cls._safe_operational_label(pending_row[1])
+        return _SessionInspection(
+            snapshot_suffix=snapshot_suffix,
+            pointer_version=view.pointer_version,
+            covered_range=covered_range,
+            high_water_mark=view.high_water_mark,
+            delta_range=delta_range,
+            event_counts=event_counts,
+            capsule_slots=capsule_slots,
+            pending_job_state=pending_job_state,
+            retry_code=retry_code,
+        )
+
+    def _read_session_observability(
+        self,
+        bridge: AstrBotHookBridge,
+        session_key: SessionKey,
+    ) -> tuple[_SessionInspection, _ContextEngineInspection]:
+        inspection = self._read_session_inspection(bridge, session_key)
+        trace = bridge.inspect_context_trace(session_key)
+        return inspection, self._normalize_context_trace(trace)
+
+    async def _current_session_key(
+        self,
+        event: AstrMessageEvent,
+    ) -> tuple[SessionKey | None, str]:
+        umo = getattr(event, "unified_msg_origin", None)
+        manager = getattr(self.context, "conversation_manager", None)
+        get_current = getattr(manager, "get_curr_conversation_id", None)
+        get_conversation = getattr(manager, "get_conversation", None)
+        if (
+            not isinstance(umo, str)
+            or not umo.strip()
+            or not callable(get_current)
+            or not callable(get_conversation)
+        ):
+            return None, "CURRENT_SESSION_API_UNAVAILABLE"
+        try:
+            cid_before = await get_current(umo)
+            if not isinstance(cid_before, str) or not cid_before.strip():
+                return None, "NO_CURRENT_CONVERSATION"
+            conversation = await get_conversation(umo, cid_before)
+            if conversation is None:
+                return None, "CURRENT_CONVERSATION_UNAVAILABLE"
+            if getattr(conversation, "cid", None) != cid_before:
+                return None, "CURRENT_CONVERSATION_CHANGED"
+            cid_after = await get_current(umo)
+            if cid_after != cid_before:
+                return None, "CURRENT_CONVERSATION_CHANGED"
+            return extract_host_session_key(event, conversation), "NONE"
+        except AstrBotAdapterError as error:
+            return None, error.code
+        except Exception:  # noqa: BLE001 - host conversation details stay private
+            logger.error(
+                "AstrContinuum current-session lookup failed code=%s",
+                "CURRENT_SESSION_LOOKUP_FAILED",
+            )
+            return None, "CURRENT_SESSION_LOOKUP_FAILED"
+
     @filter.permission_type(filter.PermissionType.ADMIN)
     @filter.command("context_status")
     async def context_status(self, event: AstrMessageEvent):
+        """Show content-free runtime and encrypted-storage health."""
+
         if not self._enabled:
+            engine_lines = self._engine_status_lines(None)
             yield event.plain_result(
-                "AstrContinuum：已停用\n"
+                "AstrContinuum：已停用\n" + "\n".join(engine_lines) + "\n"
                 "后台归约：已停止\n"
                 "提示：插件不会改写 AstrBot 保存的对话历史。"
             )
             return
 
-        bridge = self._bridge
-        if bridge is None:
+        async with self._initialize_lock:
+            status = self._storage_status
+            bridge = self._bridge
+        security_lines = self._security_status_lines(status)
+        engine_lines = self._engine_status_lines(self._latest_context_trace(bridge))
+        if status.protection == "LOCKED" or bridge is None:
             yield event.plain_result(
-                "AstrContinuum：尚未就绪\n"
+                "AstrContinuum：已锁定\n"
+                + "\n".join((*security_lines,))
+                + "\n"
+                + "\n".join(engine_lines)
+                + "\n"
                 "后台归约：未启动\n"
-                "提示：请检查 AstrBot 日志中的 AstrContinuum 初始化记录。"
+                "提示：修复密钥配置后重载插件；不要在 WebUI 或聊天中粘贴密钥。"
             )
             return
-
-        worker = self._worker
-        worker_task = worker.task if worker is not None else None
-        worker_status = "运行中" if worker_task is not None and not worker_task.done() else "已停止"
 
         def read_counts() -> tuple[int, int, int]:
             with bridge.repository.factory.connection(read_only=True) as connection:
@@ -827,6 +1393,7 @@ class AstrContinuumPlugin(Star):
                 )
                 return event_count, checkpoint_count, pending_count
 
+        query_failed = False
         try:
             event_count, checkpoint_count, pending_count = await asyncio.to_thread(read_counts)
         except Exception:  # noqa: BLE001 - never expose storage details to chat
@@ -834,15 +1401,194 @@ class AstrContinuumPlugin(Star):
                 "AstrContinuum status query failed code=%s",
                 "STATUS_QUERY_FAILED",
             )
+            query_failed = True
+
+        async with self._initialize_lock:
+            current_status = self._storage_status
+            current_bridge = self._bridge
+            current_worker = self._worker
+        if current_bridge is not bridge or current_status != status:
+            current_security_lines = self._security_status_lines(current_status)
+            current_engine_lines = self._engine_status_lines(
+                self._latest_context_trace(current_bridge)
+            )
+            if current_status.protection == "LOCKED" or current_bridge is None:
+                yield event.plain_result(
+                    "AstrContinuum：已锁定\n"
+                    + "\n".join((*current_security_lines,))
+                    + "\n"
+                    + "\n".join(current_engine_lines)
+                    + "\n后台归约：未启动\n"
+                    "提示：修复密钥配置后重载插件；不要在 WebUI 或聊天中粘贴密钥。"
+                )
+            else:
+                current_worker_task = current_worker.task if current_worker is not None else None
+                current_worker_status = (
+                    "运行中"
+                    if current_worker_task is not None and not current_worker_task.done()
+                    else "已停止"
+                )
+                yield event.plain_result(
+                    "AstrContinuum：状态已变化\n"
+                    + "\n".join((*current_security_lines,))
+                    + "\n"
+                    + "\n".join(current_engine_lines)
+                    + f"\n后台归约：{current_worker_status}\n统计信息：请重试"
+                )
+            return
+
+        worker_task = current_worker.task if current_worker is not None else None
+        worker_status = "运行中" if worker_task is not None and not worker_task.done() else "已停止"
+        security_lines = self._security_status_lines(current_status)
+        engine_lines = self._engine_status_lines(self._latest_context_trace(current_bridge))
+        if query_failed:
             yield event.plain_result(
-                f"AstrContinuum：运行中\n后台归约：{worker_status}\n统计信息：暂时无法读取"
+                "AstrContinuum：运行中\n"
+                + "\n".join((*security_lines,))
+                + "\n"
+                + "\n".join(engine_lines)
+                + f"\n后台归约：{worker_status}\n统计信息：暂时无法读取"
             )
             return
 
         yield event.plain_result(
             "AstrContinuum：运行中\n"
+            + "\n".join((*security_lines,))
+            + "\n"
+            + "\n".join(engine_lines)
+            + "\n"
             f"后台归约：{worker_status}\n"
             f"已记录事件：{event_count}\n"
             f"已发布 Checkpoint：{checkpoint_count}\n"
             f"待处理任务：{pending_count}"
+        )
+
+    @filter.permission_type(filter.PermissionType.ADMIN)
+    @filter.command("context_inspect")
+    async def context_inspect(self, event: AstrMessageEvent):
+        """Inspect only content-free provenance for the current AstrBot conversation."""
+
+        if not self._enabled:
+            yield event.plain_result(
+                "AstrContinuum 当前会话检查\n检查状态：不可用\n检查代码：PLUGIN_DISABLED"
+            )
+            return
+
+        async with self._initialize_lock:
+            status = self._storage_status
+            bridge = self._bridge
+        if status.protection == "LOCKED" or bridge is None:
+            yield event.plain_result(
+                "AstrContinuum 当前会话检查\n"
+                "检查状态：不可用\n"
+                f"检查代码：{status.security_code}\n"
+                f"数据保护：{status.protection}"
+            )
+            return
+
+        session_key, lookup_code = await self._current_session_key(event)
+        if session_key is None:
+            yield event.plain_result(
+                "AstrContinuum 当前会话检查\n"
+                "检查状态：不可用\n"
+                f"检查代码：{lookup_code}\n"
+                f"数据保护：{status.protection}"
+            )
+            return
+
+        try:
+            inspection, engine_inspection = await asyncio.to_thread(
+                self._read_session_observability,
+                bridge,
+                session_key,
+            )
+        except StorageSecurityError as error:
+            await self._enter_storage_locked(error)
+            yield event.plain_result(
+                "AstrContinuum 当前会话检查\n"
+                "检查状态：不可用\n"
+                f"检查代码：{error.code.value}\n"
+                "数据保护：LOCKED"
+            )
+            return
+        except Exception:  # noqa: BLE001 - never expose storage details to chat
+            logger.error(
+                "AstrContinuum inspection failed code=%s",
+                "INSPECTION_QUERY_FAILED",
+            )
+            yield event.plain_result(
+                "AstrContinuum 当前会话检查\n"
+                "检查状态：不可用\n"
+                "检查代码：INSPECTION_QUERY_FAILED\n"
+                f"数据保护：{status.protection}"
+            )
+            return
+
+        confirmed_key, confirmation_code = await self._current_session_key(event)
+        if confirmed_key is None:
+            yield event.plain_result(
+                "AstrContinuum 当前会话检查\n"
+                "检查状态：不可用\n"
+                f"检查代码：{confirmation_code}\n"
+                f"数据保护：{status.protection}"
+            )
+            return
+        if confirmed_key != session_key:
+            yield event.plain_result(
+                "AstrContinuum 当前会话检查\n"
+                "检查状态：不可用\n"
+                "检查代码：CURRENT_CONVERSATION_CHANGED\n"
+                f"数据保护：{status.protection}"
+            )
+            return
+        async with self._initialize_lock:
+            current_status = self._storage_status
+            current_bridge = self._bridge
+        if current_bridge is not bridge or current_status.protection == "LOCKED":
+            yield event.plain_result(
+                "AstrContinuum 当前会话检查\n"
+                "检查状态：不可用\n"
+                f"检查代码：{current_status.security_code}\n"
+                f"数据保护：{current_status.protection}"
+            )
+            return
+        status = current_status
+
+        event_counts = ", ".join(
+            f"{event_type}={count}" for event_type, count in inspection.event_counts
+        )
+        capsule_slots = (
+            ", ".join(f"{slot}={count}" for slot, count in inspection.capsule_slots)
+            if inspection.capsule_slots
+            else "NONE"
+        )
+        yield event.plain_result(
+            "AstrContinuum 当前会话检查\n"
+            "检查状态：可用\n"
+            f"数据保护：{status.protection}\n"
+            f"安全代码：{status.security_code}\n"
+            f"活动 Checkpoint：{inspection.snapshot_suffix}\n"
+            f"指针版本：{inspection.pointer_version}\n"
+            f"覆盖范围：{inspection.covered_range}\n"
+            f"Journal 高水位：{inspection.high_water_mark}\n"
+            f"Delta 范围：{inspection.delta_range}\n"
+            f"事件计数：{event_counts}\n"
+            f"Capsule 槽位：{capsule_slots}\n"
+            f"待处理任务：{inspection.pending_job_state}\n"
+            f"重试代码：{inspection.retry_code}\n"
+            f"上下文引擎：{engine_inspection.mode}\n"
+            f"最近引擎状态：{engine_inspection.state}\n"
+            f"候选块：{engine_inspection.candidate_count}\n"
+            f"选中块：{engine_inspection.selected_count}\n"
+            f"关系数：{engine_inspection.relation_count}\n"
+            f"约束数：{engine_inspection.constraint_count}\n"
+            f"保留块：{engine_inspection.retained_count}\n"
+            f"归约块：{engine_inspection.reduced_count}\n"
+            f"选择预算单位：{engine_inspection.selected_budget_units}\n"
+            f"归约比例：{engine_inspection.reduction_ratio}\n"
+            f"残差带：{engine_inspection.residual_band}\n"
+            f"恢复次数：{engine_inspection.recovery_count}\n"
+            f"必选覆盖：{engine_inspection.required_coverage}\n"
+            f"来源覆盖：{engine_inspection.provenance_coverage}\n"
+            f"稳定代码：{engine_inspection.stable_code}"
         )

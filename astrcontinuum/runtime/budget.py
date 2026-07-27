@@ -4,6 +4,7 @@ from collections.abc import Iterable
 from dataclasses import dataclass
 from typing import NoReturn
 
+from ..domain import EventType
 from ..storage import RequestView
 from .types import (
     RUNTIME_SLOT_PRIORITY,
@@ -197,8 +198,31 @@ def _longest_raw_suffix(
     counter: TokenCounter,
     b_ac: int,
 ) -> tuple[CandidateBlock, ...]:
-    for start in range(len(raw_tail) + 1):
-        suffix = raw_tail[start:]
+    units: list[tuple[CandidateBlock, ...]] = []
+    index = 0
+    while index < len(raw_tail):
+        current = raw_tail[index]
+        if index + 1 < len(raw_tail):
+            following = raw_tail[index + 1]
+            if (
+                current.event_type is EventType.TOOL_CALL
+                and following.event_type is EventType.TOOL_RESULT
+                and current.tool_name is not None
+                and current.tool_name == following.tool_name
+                and current.event_sequence is not None
+                and following.event_sequence == current.event_sequence + 1
+            ):
+                units.append((current, following))
+                index += 2
+                continue
+        if current.event_type in {EventType.TOOL_CALL, EventType.TOOL_RESULT}:
+            index += 1
+            continue
+        units.append((current,))
+        index += 1
+
+    for start in range(len(units) + 1):
+        suffix = tuple(block for unit in units[start:] for block in unit)
         proposed = _ordered((*critical, *suffix))
         if _projection_cost(proposed, counter) <= b_ac:
             return suffix
