@@ -1,22 +1,106 @@
 {
   "enabled": {
-    "description": "Enable AstrContinuum. / 启用 AstrContinuum。",
+    "description": "启用 AstrContinuum 长对话保护",
+    "hint": "只改变发给大模型的临时上下文，不会删除或改写 AstrBot 保存的对话历史。可用 /context_status 查看是否生效。",
+    "obvious_hint": true,
     "type": "bool",
     "default": true
   },
+  "context_engine_mode": {
+    "description": "上下文引擎运行方式",
+    "hint": "主动模式只会在结果通过完整校验后替换确定性回退结果；影子模式会计算并记录无内容指标，但实际仍发送确定性回退结果；关闭模式完全不运行图引擎，只使用确定性路径。管理员可用 /context_status 查看当前模式和最近结果，用 /context_inspect 查看当前会话的无内容归约证据。",
+    "obvious_hint": true,
+    "type": "string",
+    "options": [
+      "active",
+      "shadow",
+      "off"
+    ],
+    "labels": [
+      "主动（校验通过才使用）",
+      "影子（只测量，不替换）",
+      "关闭（仅确定性路径）"
+    ],
+    "default": "active"
+  },
+  "encryption_key_source": {
+    "description": "数据库加密密钥的保存位置",
+    "hint": "选择插件启动时从哪里读取数据库加密密钥。默认“环境变量”要求在启动 AstrBot 前设置 ASTRCONTINUUM_MASTER_KEY；未设置时 AstrContinuum 会保持锁定，不读写数据库，AstrBot 原生聊天仍可继续。不要把密钥粘贴到 WebUI、聊天、日志或命令行参数。只有个人试玩且能接受密钥与数据库处于同一目录边界时，才选择“本机便捷模式”。",
+    "obvious_hint": true,
+    "type": "string",
+    "options": [
+      "environment",
+      "file",
+      "local"
+    ],
+    "labels": [
+      "环境变量（推荐）",
+      "外部密钥文件",
+      "本机便捷模式（较弱）"
+    ],
+    "default": "environment"
+  },
+  "encryption_key_file": {
+    "description": "当前加密密钥文件（仅外部文件模式）",
+    "hint": "这里只选择服务器上已经准备好的密钥文件，不要粘贴密钥内容。请先停止 AstrBot，再运行 python -m astrcontinuum.keyctl generate --output <外部密钥文件>；文件必须位于插件数据目录之外。使用环境变量或本机便捷模式时保持为空。",
+    "obvious_hint": true,
+    "type": "file",
+    "default": ""
+  },
+  "encryption_previous_key_file": {
+    "description": "旧加密密钥文件（仅换钥时）",
+    "hint": "换钥时先停止 AstrBot：把新密钥设为当前密钥，把仍能解锁数据库的旧密钥文件选在这里，然后启动或重载。确认 /context_status 显示数据保护为 ACTIVE、新密钥标识已生效且维护完成后，清空旧密钥文件并再次重载。环境变量模式对应 ASTRCONTINUUM_PREVIOUS_KEY。不要在 WebUI、聊天、日志或命令参数中粘贴任何密钥。",
+    "obvious_hint": true,
+    "type": "file",
+    "default": ""
+  },
   "model_context_limit": {
-    "description": "Total model-context budget. v0.1.0 conservatively counts UTF-8 bytes, not provider tokenizer tokens. / 模型总上下文预算；v0.1.0 使用 UTF-8 字节保守计数，并非模型 tokenizer Token。",
+    "description": "主模型的上下文窗口",
+    "hint": "填写模型标称的最大上下文 Token。拿不到 Provider usage 时，插件会用 UTF-8 字节保守估算，因此中文会更早触发保护。",
+    "obvious_hint": true,
     "type": "int",
     "default": 200000
   },
   "target_input_budget": {
-    "description": "Preferred request-input budget in the same conservative unit. / 普通请求的目标输入预算，计量单位同上。",
+    "description": "归约后希望保留的输入量",
+    "hint": "Checkpoint、近期原文和精确证据会优先装进这个预算。通常保持默认即可。",
     "type": "int",
     "default": 130000
   },
   "hard_input_ceiling": {
-    "description": "Hard request-input ceiling in the same conservative unit. / 请求输入硬上限，计量单位同上。",
+    "description": "归约后输入的安全上限",
+    "hint": "受控请求视图不会主动超过这个值；必须小于主模型上下文窗口，并为回复和工具调用留出空间。",
     "type": "int",
     "default": 150000
+  },
+  "compaction_start_ratio": {
+    "description": "提前生成 Checkpoint 的时机",
+    "hint": "上下文预计占满可用窗口的 75% 时，在后台开始归约。聊天不会等待后台任务。",
+    "type": "float",
+    "default": 0.75,
+    "slider": {
+      "min": 0.5,
+      "max": 0.9,
+      "step": 0.01
+    }
+  },
+  "provider_view_switch_ratio": {
+    "description": "切换到受控请求视图的时机",
+    "hint": "上下文预计占满可用窗口的 80% 时，改用 Checkpoint + 近期原文 + 精确证据发送请求。应略高于“提前生成 Checkpoint”的比例。",
+    "type": "float",
+    "default": 0.8,
+    "slider": {
+      "min": 0.55,
+      "max": 0.95,
+      "step": 0.01
+    }
+  },
+  "compaction_provider_id": {
+    "description": "后台归约模型（留空则跟随当前对话模型）",
+    "hint": "可选择 MiniMax 等小模型。归约模型只能返回原文事件编号和逐字引文，不能自由转述。若选择与对话不同的 Provider，对话片段会发送给该 Provider；请确认其数据与隐私策略。",
+    "obvious_hint": true,
+    "type": "string",
+    "default": "",
+    "_special": "select_provider"
   }
 }

@@ -8,6 +8,7 @@ from typing import Any
 import pytest
 
 import astrcontinuum as ac
+from tests.storage.security_testkit import activate_test_storage, secure_repository
 
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
 LEASE_END = NOW + timedelta(minutes=10)
@@ -31,7 +32,7 @@ def session_key() -> ac.SessionKey:
 
 def migrated_factory(data_dir: Path) -> ac.SQLiteConnectionFactory:
     factory = ac.SQLiteConnectionFactory(data_dir, busy_timeout_ms=5_000)
-    ac.SQLiteMigrator(factory).migrate()
+    activate_test_storage(factory)
     return factory
 
 
@@ -240,7 +241,7 @@ def pointer_conflict_setup(
     tuple[ac.SnapshotCapsuleMembership, ...],
 ]:
     factory = migrated_factory(data_dir)
-    stable = ac.SQLiteRepository(factory)
+    stable = secure_repository(factory)
     capture(stable, 1)
     first_item = capsule(1)
     first_snapshot, first_memberships = candidate_bundle(
@@ -339,7 +340,7 @@ def test_capture_crash_rolls_back_session_sequence_and_event(
     boundary: str,
 ) -> None:
     factory = migrated_factory(tmp_path)
-    crashing = ac.SQLiteRepository(factory, fault_injector=fail_at(boundary))
+    crashing = secure_repository(factory, fault_injector=fail_at(boundary))
 
     with pytest.raises(InjectedCrash, match=boundary):
         capture(crashing, 1)
@@ -348,13 +349,13 @@ def test_capture_crash_rolls_back_session_sequence_and_event(
         assert connection.execute("SELECT count(*) FROM sessions").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 0
 
-    recovered = capture(ac.SQLiteRepository(factory), 1)
+    recovered = capture(secure_repository(factory), 1)
     assert recovered.sequence == 1
 
 
 def test_claim_crash_rolls_back_owner_epoch_and_attempt(tmp_path: Path) -> None:
     factory = migrated_factory(tmp_path)
-    stable = ac.SQLiteRepository(factory)
+    stable = secure_repository(factory)
     capture(stable, 1)
     raised = stable.raise_compaction_intent(
         job_id="job-1",
@@ -363,7 +364,7 @@ def test_claim_crash_rolls_back_owner_epoch_and_attempt(tmp_path: Path) -> None:
         now=NOW,
     )
     assert raised is not None
-    crashing = ac.SQLiteRepository(
+    crashing = secure_repository(
         factory,
         fault_injector=fail_at("claim.after_update"),
     )
@@ -409,11 +410,11 @@ def test_publish_crash_rolls_back_every_candidate_and_terminal_boundary(
     boundary: str,
 ) -> None:
     factory = migrated_factory(tmp_path)
-    stable = ac.SQLiteRepository(factory)
+    stable = secure_repository(factory)
     capture(stable, 1)
     snapshot, memberships = candidate_bundle()
     job = ready_job(stable, candidate_snapshot_id=snapshot.snapshot_id)
-    crashing = ac.SQLiteRepository(factory, fault_injector=fail_at(boundary))
+    crashing = secure_repository(factory, fault_injector=fail_at(boundary))
 
     with pytest.raises(InjectedCrash, match=boundary):
         publish(crashing, job, snapshot, memberships)
@@ -427,7 +428,7 @@ def test_follow_up_creation_crash_rolls_back_publication_and_pending_job(
     tmp_path: Path,
 ) -> None:
     factory = migrated_factory(tmp_path)
-    stable = ac.SQLiteRepository(factory)
+    stable = secure_repository(factory)
     capture(stable, 1)
     snapshot, memberships = candidate_bundle()
     job = ready_job(stable, candidate_snapshot_id=snapshot.snapshot_id)
@@ -440,7 +441,7 @@ def test_follow_up_creation_crash_rolls_back_publication_and_pending_job(
     )
     assert raised is not None
     assert raised.intent_target_high_water_mark == 2
-    crashing = ac.SQLiteRepository(
+    crashing = secure_repository(
         factory,
         fault_injector=fail_at("publish.after_follow_up"),
     )
@@ -467,7 +468,7 @@ def test_follow_up_creation_crash_rolls_back_publication_and_pending_job(
 
 def test_conflict_terminal_crash_rolls_back_superseded_job(tmp_path: Path) -> None:
     factory, stable, job, snapshot, memberships = pointer_conflict_setup(tmp_path)
-    crashing = ac.SQLiteRepository(
+    crashing = secure_repository(
         factory,
         fault_injector=fail_at("publish.after_terminal"),
     )
@@ -502,7 +503,7 @@ def test_conflict_follow_up_crash_rolls_back_superseded_and_pending_job(
     )
     assert raised is not None
     assert raised.intent_target_high_water_mark == 3
-    crashing = ac.SQLiteRepository(
+    crashing = secure_repository(
         factory,
         fault_injector=fail_at("publish.after_follow_up"),
     )
@@ -529,7 +530,7 @@ def test_injected_integrity_error_is_not_misclassified_as_publish_conflict(
     tmp_path: Path,
 ) -> None:
     factory = migrated_factory(tmp_path)
-    stable = ac.SQLiteRepository(factory)
+    stable = secure_repository(factory)
     capture(stable, 1)
     snapshot, memberships = candidate_bundle()
     job = ready_job(stable, candidate_snapshot_id=snapshot.snapshot_id)
@@ -538,7 +539,7 @@ def test_injected_integrity_error_is_not_misclassified_as_publish_conflict(
         if name == "publish.after_snapshot":
             raise sqlite3.IntegrityError("injected crash after Snapshot insert")
 
-    crashing = ac.SQLiteRepository(factory, fault_injector=crash_after_snapshot)
+    crashing = secure_repository(factory, fault_injector=crash_after_snapshot)
 
     with pytest.raises(sqlite3.IntegrityError, match="injected crash"):
         publish(crashing, job, snapshot, memberships)

@@ -91,3 +91,30 @@ class SQLiteConnectionFactory:
                 raise
             else:
                 connection.commit()
+
+    @contextmanager
+    def startup_exclusive_transaction(
+        self,
+        *,
+        enforce_foreign_keys: bool = True,
+    ) -> Iterator[sqlite3.Connection]:
+        """Run one startup-only exclusive transaction with explicit FK policy."""
+
+        with self.connection() as connection:
+            if not enforce_foreign_keys:
+                connection.execute("PRAGMA foreign_keys = OFF")
+                if connection.execute("PRAGMA foreign_keys").fetchone()[0] != 0:
+                    raise RuntimeError("SQLite refused to disable foreign keys")
+            connection.execute("BEGIN EXCLUSIVE")
+            try:
+                yield connection
+            except BaseException:
+                connection.rollback()
+                raise
+            else:
+                connection.commit()
+            finally:
+                if not enforce_foreign_keys and not connection.in_transaction:
+                    connection.execute("PRAGMA foreign_keys = ON")
+                    if connection.execute("PRAGMA foreign_keys").fetchone()[0] != 1:
+                        raise RuntimeError("SQLite refused to restore foreign keys")

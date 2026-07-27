@@ -25,6 +25,7 @@ from ..domain import (
     SourceHook,
     validate_permanent,
 )
+from .crypto import SecureCodec
 from .sqlite import SQLiteConnectionFactory
 
 FaultInjector = Callable[[str], None]
@@ -175,9 +176,13 @@ class SQLiteRepository:
         self,
         factory: SQLiteConnectionFactory,
         *,
+        codec: SecureCodec,
         fault_injector: FaultInjector | None = None,
     ) -> None:
+        if not isinstance(codec, SecureCodec):
+            raise TypeError("codec must be a SecureCodec")
         self._factory = factory
+        self._codec = codec
         self._fault_injector = fault_injector
 
     @property
@@ -185,6 +190,33 @@ class SQLiteRepository:
         """Return the connection factory owned by this repository."""
 
         return self._factory
+
+    @property
+    def key_id(self) -> str:
+        """Return the non-secret identifier of the repository codec."""
+
+        return self._codec.key_id
+
+    def _session_key_from_storage(
+        self,
+        session_key_hash: str,
+        sentinel_json: str,
+    ) -> SessionKey:
+        canonical = self._codec.decrypt_object_json(
+            "sessions",
+            "canonical_session_key_json",
+            session_key_hash,
+            sentinel_json,
+        )
+        try:
+            session_key = SessionKey.model_validate_json(canonical)
+        except ValueError:
+            raise RepositoryInvariantError("durable SessionKey cannot be reconstructed") from None
+        if session_key.session_key_hash != session_key_hash:
+            raise RepositoryInvariantError(
+                "durable SessionKey hash does not match canonical identity"
+            )
+        return session_key
 
     def capture_user_event(
         self,
@@ -269,6 +301,76 @@ class SQLiteRepository:
                 connection.commit()
                 return view
 
+    def read_compaction_view(
+        self,
+        *,
+        job_id: str,
+        owner: str,
+        lease_epoch: int,
+        now: datetime,
+    ) -> RequestView:
+        """Read the exact base and Delta frozen by one live compaction lease."""
+
+        now_text = _normalize_datetime(now)
+        with self._factory.connection(read_only=True) as connection:
+            connection.execute("BEGIN")
+            try:
+                row = self._require_live_fence(
+                    connection,
+                    job_id=job_id,
+                    owner=owner,
+                    lease_epoch=lease_epoch,
+                    now=now_text,
+                )
+                state = CompactionJobState(row["state"])
+                if state not in {
+                    CompactionJobState.COMPILING,
+                    CompactionJobState.AUDITING,
+                }:
+                    raise JobTransitionError(
+                        "compaction input requires a COMPILING or AUDITING Job"
+                    )
+                job = self._job_by_id(connection, job_id)
+                if job.base_snapshot_id is None:
+                    snapshot = None
+                    memberships: tuple[SnapshotCapsuleMembership, ...] = ()
+                    covered_event_end = 0
+                else:
+                    snapshot, memberships = self._snapshot_bundle_by_id(
+                        connection,
+                        job.base_snapshot_id,
+                        session_key=job.session_key,
+                    )
+                    covered_event_end = snapshot.covered_event_end
+                delta = self._events_between(
+                    connection,
+                    session_key=job.session_key,
+                    start_exclusive=covered_event_end,
+                    end_inclusive=job.target_high_water_mark,
+                )
+                expected_sequences = tuple(
+                    range(covered_event_end + 1, job.target_high_water_mark + 1)
+                )
+                if tuple(item.sequence for item in delta) != expected_sequences:
+                    raise RepositoryInvariantError(
+                        "frozen compaction input is not a contiguous complete Delta"
+                    )
+                view = RequestView(
+                    session_key=job.session_key,
+                    snapshot=snapshot,
+                    memberships=memberships,
+                    pointer_version=job.base_pointer_version,
+                    covered_event_end=covered_event_end,
+                    high_water_mark=job.target_high_water_mark,
+                    delta=delta,
+                )
+            except BaseException:
+                connection.rollback()
+                raise
+            else:
+                connection.commit()
+                return view
+
     def raise_compaction_intent(
         self,
         *,
@@ -298,7 +400,11 @@ class SQLiteRepository:
                 raise RepositoryInvariantError(
                     "compaction intent requires a durable session with Journal events"
                 )
-            if session_row["canonical_session_key_json"] != session_key.canonical_json():
+            stored_session = self._session_key_from_storage(
+                session_key.session_key_hash,
+                str(session_row["canonical_session_key_json"]),
+            )
+            if stored_session != session_key:
                 raise SessionIdentityConflict(
                     "session hash does not resolve to the exact canonical SessionKey"
                 )
@@ -384,10 +490,10 @@ class SQLiteRepository:
                         now_text,
                     ),
                 )
-            except sqlite3.IntegrityError as error:
+            except sqlite3.IntegrityError:
                 raise RepositoryConflict(
                     "compaction Job identity conflicts with durable state"
-                ) from error
+                ) from None
             self._inject("intent.after_insert")
             return self._job_by_id(connection, job_id)
 
@@ -766,6 +872,7 @@ class SQLiteRepository:
                 previous_snapshot, previous_memberships = self._snapshot_bundle_by_id(
                     connection,
                     job.base_snapshot_id,
+                    session_key=job.session_key,
                 )
             source_events = self._events_between(
                 connection,
@@ -930,7 +1037,11 @@ class SQLiteRepository:
                 high_water_mark=0,
                 delta=(),
             )
-        if session_row["canonical_session_key_json"] != session_key.canonical_json():
+        stored_session = self._session_key_from_storage(
+            session_key.session_key_hash,
+            str(session_row["canonical_session_key_json"]),
+        )
+        if stored_session != session_key:
             raise SessionIdentityConflict(
                 "session hash does not resolve to the exact canonical SessionKey"
             )
@@ -978,16 +1089,12 @@ class SQLiteRepository:
 
         rows = connection.execute(
             """
-            SELECT
-                event.*,
-                session.canonical_session_key_json
-            FROM journal_events AS event
-            JOIN sessions AS session
-              ON session.session_key_hash = event.session_key_hash
-            WHERE event.session_key_hash = ?
-              AND event.sequence > ?
-              AND event.sequence <= ?
-            ORDER BY event.sequence
+            SELECT *
+            FROM journal_events
+            WHERE session_key_hash = ?
+              AND sequence > ?
+              AND sequence <= ?
+            ORDER BY sequence
             """,
             (
                 session_key.session_key_hash,
@@ -995,7 +1102,7 @@ class SQLiteRepository:
                 high_water_mark,
             ),
         ).fetchall()
-        delta = tuple(self._event_from_row(row) for row in rows)
+        delta = tuple(self._event_from_row(row, session_key=session_key) for row in rows)
         expected_sequences = tuple(range(covered_event_end + 1, high_water_mark + 1))
         if tuple(event.sequence for event in delta) != expected_sequences:
             raise RepositoryInvariantError(
@@ -1044,7 +1151,7 @@ class SQLiteRepository:
             self._inject("capture.after_session")
             existing = self._find_idempotent_event(
                 connection,
-                session_key_hash=session_key.session_key_hash,
+                session_key=session_key,
                 source_hook=requested.source_hook,
                 idempotency_key=idempotency_key,
             )
@@ -1115,17 +1222,22 @@ class SQLiteRepository:
                         event.sequence,
                         event.event_type.value,
                         event.role.value,
-                        event.content,
+                        self._codec.encrypt_text(
+                            "journal_events",
+                            "content",
+                            event.event_id,
+                            event.content,
+                        ),
                         event.source_hook.value,
                         event.idempotency_key,
                         event.token_count,
                         normalized_created_at,
                     ),
                 )
-            except sqlite3.IntegrityError as error:
+            except sqlite3.IntegrityError:
                 raise EventIdentityConflict(
                     "event identity or sequence conflicts with durable state"
-                ) from error
+                ) from None
             self._inject("capture.after_insert")
             return event
 
@@ -1136,6 +1248,36 @@ class SQLiteRepository:
         session_key: SessionKey,
         timestamp: str,
     ) -> None:
+        record_key = session_key.session_key_hash
+        existing = connection.execute(
+            """
+            SELECT canonical_session_key_json
+            FROM sessions
+            WHERE session_key_hash = ?
+            """,
+            (record_key,),
+        ).fetchone()
+        if existing is not None:
+            stored_session = self._session_key_from_storage(
+                record_key,
+                str(existing["canonical_session_key_json"]),
+            )
+            if stored_session != session_key:
+                raise SessionIdentityConflict(
+                    "session hash does not resolve to the exact canonical SessionKey"
+                )
+            return
+
+        def encrypt_identity(column: str, value: str | None) -> str | None:
+            if value is None:
+                return None
+            return self._codec.encrypt_text(
+                "sessions",
+                column,
+                record_key,
+                value,
+            )
+
         try:
             connection.execute(
                 """
@@ -1156,23 +1298,34 @@ class SQLiteRepository:
                 ON CONFLICT(session_key_hash) DO NOTHING
                 """,
                 (
-                    session_key.session_key_hash,
-                    session_key.canonical_json(),
-                    session_key.platform_instance_id,
-                    session_key.message_type,
-                    session_key.session_id,
-                    session_key.group_id,
-                    session_key.user_id,
-                    session_key.conversation_id,
-                    session_key.persona_id,
+                    record_key,
+                    self._codec.encrypt_object_json(
+                        "sessions",
+                        "canonical_session_key_json",
+                        record_key,
+                        session_key.canonical_json(),
+                    ),
+                    encrypt_identity(
+                        "platform_instance_id",
+                        session_key.platform_instance_id,
+                    ),
+                    encrypt_identity("message_type", session_key.message_type),
+                    encrypt_identity("session_id", session_key.session_id),
+                    encrypt_identity("group_id", session_key.group_id),
+                    encrypt_identity("user_id", session_key.user_id),
+                    encrypt_identity(
+                        "conversation_id",
+                        session_key.conversation_id,
+                    ),
+                    encrypt_identity("persona_id", session_key.persona_id),
                     timestamp,
                     timestamp,
                 ),
             )
-        except sqlite3.IntegrityError as error:
+        except sqlite3.IntegrityError:
             raise SessionIdentityConflict(
                 "canonical SessionKey conflicts with durable session identity"
-            ) from error
+            ) from None
 
         row = connection.execute(
             """
@@ -1180,9 +1333,17 @@ class SQLiteRepository:
             FROM sessions
             WHERE session_key_hash = ?
             """,
-            (session_key.session_key_hash,),
+            (record_key,),
         ).fetchone()
-        if row is None or str(row["canonical_session_key_json"]) != session_key.canonical_json():
+        if row is None:
+            raise SessionIdentityConflict(
+                "session hash does not resolve to the exact canonical SessionKey"
+            )
+        stored_session = self._session_key_from_storage(
+            record_key,
+            str(row["canonical_session_key_json"]),
+        )
+        if stored_session != session_key:
             raise SessionIdentityConflict(
                 "session hash does not resolve to the exact canonical SessionKey"
             )
@@ -1218,8 +1379,8 @@ class SQLiteRepository:
             int(row["covered_event_end"]),
         )
 
-    @staticmethod
     def _job_by_id(
+        self,
         connection: sqlite3.Connection,
         job_id: str,
     ) -> CompactionJobEnvelope:
@@ -1237,12 +1398,14 @@ class SQLiteRepository:
         ).fetchone()
         if row is None:
             raise RepositoryInvariantError("durable compaction Job is missing")
-        return SQLiteRepository._job_from_row(row)
+        return self._job_from_row(row)
 
-    @staticmethod
-    def _job_from_row(row: sqlite3.Row) -> CompactionJobEnvelope:
+    def _job_from_row(self, row: sqlite3.Row) -> CompactionJobEnvelope:
+        session_key = self._session_key_from_storage(
+            str(row["session_key_hash"]),
+            str(row["canonical_session_key_json"]),
+        )
         try:
-            session_key = SessionKey.model_validate_json(row["canonical_session_key_json"])
             job = CompactionJobEnvelope(
                 job_id=row["job_id"],
                 session_key=session_key,
@@ -1276,10 +1439,10 @@ class SQLiteRepository:
                     else None
                 ),
             )
-        except (TypeError, ValueError) as error:
+        except (TypeError, ValueError):
             raise RepositoryInvariantError(
                 "compaction Job row does not form a canonical envelope"
-            ) from error
+            ) from None
         if row["session_key_hash"] != session_key.session_key_hash:
             raise RepositoryInvariantError(
                 "compaction Job physical session identity does not round-trip"
@@ -1335,10 +1498,12 @@ class SQLiteRepository:
                 "candidate Snapshot ids disagree with ordered membership"
             )
 
-    @staticmethod
     def _snapshot_bundle_by_id(
+        self,
         connection: sqlite3.Connection,
         snapshot_id: str,
+        *,
+        session_key: SessionKey,
     ) -> tuple[SnapshotEnvelope, tuple[SnapshotCapsuleMembership, ...]]:
         row = connection.execute(
             """
@@ -1354,25 +1519,27 @@ class SQLiteRepository:
         ).fetchone()
         if row is None:
             raise RepositoryInvariantError("Job base Snapshot is missing")
-        try:
-            session_key = SessionKey.model_validate_json(row["canonical_session_key_json"])
-        except ValueError as error:
-            raise RepositoryInvariantError("Snapshot SessionKey cannot be reconstructed") from error
-        memberships = SQLiteRepository._memberships_for_snapshot(
+        stored_session_key = self._session_key_from_storage(
+            str(row["session_key_hash"]),
+            str(row["canonical_session_key_json"]),
+        )
+        if stored_session_key != session_key:
+            raise RepositoryInvariantError("Snapshot belongs to a different durable session")
+        memberships = self._memberships_for_snapshot(
             connection,
             snapshot_id=snapshot_id,
             session_key=session_key,
         )
-        snapshot = SQLiteRepository._snapshot_from_row(
+        snapshot = self._snapshot_from_row(
             row,
             session_key=session_key,
             capsule_ids=tuple(item.capsule_id for item in memberships),
         )
-        SQLiteRepository._validate_snapshot_memberships(snapshot, memberships)
+        self._validate_snapshot_memberships(snapshot, memberships)
         return snapshot, memberships
 
-    @staticmethod
     def _active_snapshot_bundle(
+        self,
         connection: sqlite3.Connection,
         session_key: SessionKey,
     ) -> tuple[
@@ -1390,16 +1557,17 @@ class SQLiteRepository:
         ).fetchone()
         if row is None:
             raise RepositoryInvariantError("publish conflict has no durable active winner")
-        snapshot, memberships = SQLiteRepository._snapshot_bundle_by_id(
+        snapshot, memberships = self._snapshot_bundle_by_id(
             connection,
             str(row["snapshot_id"]),
+            session_key=session_key,
         )
         if snapshot.session_key != session_key:
             raise RepositoryInvariantError("publish winner belongs to another durable session")
         return snapshot, int(row["pointer_version"]), memberships
 
-    @staticmethod
     def _events_between(
+        self,
         connection: sqlite3.Connection,
         *,
         session_key: SessionKey,
@@ -1408,12 +1576,8 @@ class SQLiteRepository:
     ) -> tuple[EventEnvelope, ...]:
         rows = connection.execute(
             """
-            SELECT
-                event.*,
-                session.canonical_session_key_json
+            SELECT event.*
             FROM journal_events AS event
-            JOIN sessions AS session
-              ON session.session_key_hash = event.session_key_hash
             WHERE event.session_key_hash = ?
               AND event.sequence > ?
               AND event.sequence <= ?
@@ -1425,10 +1589,10 @@ class SQLiteRepository:
                 end_inclusive,
             ),
         ).fetchall()
-        return tuple(SQLiteRepository._event_from_row(row) for row in rows)
+        return tuple(self._event_from_row(row, session_key=session_key) for row in rows)
 
-    @staticmethod
     def _insert_or_verify_capsule(
+        self,
         connection: sqlite3.Connection,
         capsule: ContextCapsuleEnvelope,
     ) -> None:
@@ -1442,12 +1606,18 @@ class SQLiteRepository:
             (capsule.capsule_id,),
         ).fetchone()
         if row is not None:
+            stored_canonical_json = self._codec.decrypt_object_json(
+                "capsules",
+                "canonical_capsule_json",
+                capsule.capsule_id,
+                str(row["canonical_capsule_json"]),
+            )
             if (
                 row["session_key_hash"] != capsule.session_key.session_key_hash
                 or row["level"] != capsule.level.value
                 or int(row["covered_event_start"]) != capsule.covered_event_start
                 or int(row["covered_event_end"]) != capsule.covered_event_end
-                or row["canonical_capsule_json"] != canonical_json
+                or stored_canonical_json != canonical_json
                 or int(row["token_cost"]) != capsule.token_cost
                 or float(row["source_coverage"]) != capsule.quality.source_coverage
                 or row["created_at"] != _normalize_datetime(capsule.created_at)
@@ -1477,20 +1647,31 @@ class SQLiteRepository:
                 capsule.level.value,
                 capsule.covered_event_start,
                 capsule.covered_event_end,
-                canonical_json,
+                self._codec.encrypt_object_json(
+                    "capsules",
+                    "canonical_capsule_json",
+                    capsule.capsule_id,
+                    canonical_json,
+                ),
                 capsule.token_cost,
                 capsule.quality.source_coverage,
                 _normalize_datetime(capsule.created_at),
             ),
         )
 
-    @staticmethod
     def _insert_committed_snapshot(
+        self,
         connection: sqlite3.Connection,
         snapshot: SnapshotEnvelope,
     ) -> None:
         if snapshot.committed_at is None:
             raise RepositoryInvariantError("committed Snapshot insert requires committed_at")
+        exact_anchor_ids_json = json.dumps(
+            list(snapshot.exact_anchor_ids),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        audit_outcome_json = _canonical_model_json(snapshot.audit_outcome)
         connection.execute(
             """
             INSERT INTO snapshots (
@@ -1514,14 +1695,25 @@ class SQLiteRepository:
                 snapshot.base_snapshot_id,
                 snapshot.covered_event_end,
                 snapshot.source_high_water_mark,
-                json.dumps(
-                    list(snapshot.exact_anchor_ids),
-                    ensure_ascii=False,
-                    separators=(",", ":"),
+                self._codec.encrypt_array_json(
+                    "snapshots",
+                    "exact_anchor_ids_json",
+                    snapshot.snapshot_id,
+                    exact_anchor_ids_json,
                 ),
-                snapshot.rendered_context,
+                self._codec.encrypt_text(
+                    "snapshots",
+                    "rendered_context",
+                    snapshot.snapshot_id,
+                    snapshot.rendered_context,
+                ),
                 snapshot.token_cost,
-                _canonical_model_json(snapshot.audit_outcome),
+                self._codec.encrypt_object_json(
+                    "snapshots",
+                    "audit_outcome",
+                    snapshot.snapshot_id,
+                    audit_outcome_json,
+                ),
                 _normalize_datetime(snapshot.created_at),
                 _normalize_datetime(snapshot.committed_at),
             ),
@@ -1580,8 +1772,8 @@ class SQLiteRepository:
         )
         return cursor.rowcount == 1
 
-    @staticmethod
     def _finish_publish_job(
+        self,
         connection: sqlite3.Connection,
         *,
         job: CompactionJobEnvelope,
@@ -1620,10 +1812,10 @@ class SQLiteRepository:
         )
         if cursor.rowcount != 1:
             raise StaleLeaseError("publication lost its fenced terminal transition")
-        return SQLiteRepository._job_by_id(connection, job.job_id)
+        return self._job_by_id(connection, job.job_id)
 
-    @staticmethod
     def _preserve_follow_up(
+        self,
         connection: sqlite3.Connection,
         *,
         terminal_job: CompactionJobEnvelope,
@@ -1707,47 +1899,65 @@ class SQLiteRepository:
             ),
         )
 
-    @staticmethod
     def _find_idempotent_event(
+        self,
         connection: sqlite3.Connection,
         *,
-        session_key_hash: str,
+        session_key: SessionKey,
         source_hook: SourceHook,
         idempotency_key: str,
     ) -> EventEnvelope | None:
         row = connection.execute(
             """
-            SELECT
-                event.*,
-                session.canonical_session_key_json
+            SELECT event.*
             FROM journal_events AS event
-            JOIN sessions AS session
-              ON session.session_key_hash = event.session_key_hash
             WHERE event.session_key_hash = ?
               AND event.source_hook = ?
               AND event.idempotency_key = ?
             """,
-            (session_key_hash, source_hook.value, idempotency_key),
+            (
+                session_key.session_key_hash,
+                source_hook.value,
+                idempotency_key,
+            ),
         ).fetchone()
-        return SQLiteRepository._event_from_row(row) if row is not None else None
+        return self._event_from_row(row, session_key=session_key) if row is not None else None
 
-    @staticmethod
-    def _event_from_row(row: sqlite3.Row) -> EventEnvelope:
-        return EventEnvelope(
-            event_id=row["event_id"],
-            session_key=SessionKey.model_validate_json(row["canonical_session_key_json"]),
-            sequence=row["sequence"],
-            event_type=EventType(row["event_type"]),
-            role=EventRole(row["role"]),
-            content=row["content"],
-            source_hook=SourceHook(row["source_hook"]),
-            idempotency_key=row["idempotency_key"],
-            token_count=row["token_count"],
-            created_at=_parse_datetime(row["created_at"]),
+    def _event_from_row(
+        self,
+        row: sqlite3.Row,
+        *,
+        session_key: SessionKey,
+    ) -> EventEnvelope:
+        if row["session_key_hash"] != session_key.session_key_hash:
+            raise RepositoryInvariantError("Journal event belongs to a different durable session")
+        event_id = str(row["event_id"])
+        content = self._codec.decrypt_text(
+            "journal_events",
+            "content",
+            event_id,
+            str(row["content"]),
         )
+        try:
+            return EventEnvelope(
+                event_id=event_id,
+                session_key=session_key,
+                sequence=row["sequence"],
+                event_type=EventType(row["event_type"]),
+                role=EventRole(row["role"]),
+                content=content,
+                source_hook=SourceHook(row["source_hook"]),
+                idempotency_key=row["idempotency_key"],
+                token_count=row["token_count"],
+                created_at=_parse_datetime(row["created_at"]),
+            )
+        except (TypeError, ValueError):
+            raise RepositoryInvariantError(
+                "Journal event row does not form a canonical envelope"
+            ) from None
 
-    @staticmethod
     def _memberships_for_snapshot(
+        self,
         connection: sqlite3.Connection,
         *,
         snapshot_id: str,
@@ -1769,10 +1979,20 @@ class SQLiteRepository:
         ).fetchall()
         memberships: list[SnapshotCapsuleMembership] = []
         for expected_ordinal, row in enumerate(rows):
-            capsule = ContextCapsuleEnvelope.model_validate_json(row["canonical_capsule_json"])
+            capsule_id = str(row["capsule_id"])
+            canonical_capsule_json = self._codec.decrypt_object_json(
+                "capsules",
+                "canonical_capsule_json",
+                capsule_id,
+                str(row["canonical_capsule_json"]),
+            )
+            try:
+                capsule = ContextCapsuleEnvelope.model_validate_json(canonical_capsule_json)
+            except (TypeError, ValueError):
+                raise RepositoryInvariantError("durable Capsule cannot be reconstructed") from None
             if (
                 int(row["ordinal"]) != expected_ordinal
-                or row["capsule_id"] != capsule.capsule_id
+                or capsule_id != capsule.capsule_id
                 or row["session_key_hash"] != session_key.session_key_hash
                 or capsule.session_key != session_key
                 or row["level"] != capsule.level.value
@@ -1794,35 +2014,54 @@ class SQLiteRepository:
             )
         return tuple(memberships)
 
-    @staticmethod
     def _snapshot_from_row(
+        self,
         row: sqlite3.Row,
         *,
         session_key: SessionKey,
         capsule_ids: tuple[str, ...],
     ) -> SnapshotEnvelope:
+        snapshot_id = str(row["snapshot_id"])
+        exact_anchor_ids_json = self._codec.decrypt_array_json(
+            "snapshots",
+            "exact_anchor_ids_json",
+            snapshot_id,
+            str(row["exact_anchor_ids_json"]),
+        )
+        rendered_context = self._codec.decrypt_text(
+            "snapshots",
+            "rendered_context",
+            snapshot_id,
+            str(row["rendered_context"]),
+        )
+        audit_outcome_json = self._codec.decrypt_object_json(
+            "snapshots",
+            "audit_outcome",
+            snapshot_id,
+            str(row["audit_outcome"]),
+        )
         try:
-            exact_anchor_ids = tuple(json.loads(row["exact_anchor_ids_json"]))
-            audit_outcome = SnapshotAuditOutcome.model_validate(json.loads(row["audit_outcome"]))
+            exact_anchor_ids = tuple(json.loads(exact_anchor_ids_json))
+            audit_outcome = SnapshotAuditOutcome.model_validate_json(audit_outcome_json)
             snapshot = SnapshotEnvelope(
-                snapshot_id=row["snapshot_id"],
+                snapshot_id=snapshot_id,
                 session_key=session_key,
                 base_snapshot_id=row["base_snapshot_id"],
                 covered_event_end=row["covered_event_end"],
                 source_high_water_mark=row["source_high_water_mark"],
                 capsule_ids=capsule_ids,
                 exact_anchor_ids=exact_anchor_ids,
-                rendered_context=row["rendered_context"],
+                rendered_context=rendered_context,
                 token_cost=row["token_cost"],
                 audit_outcome=audit_outcome,
                 state=SnapshotState(row["lifecycle_state"]),
                 created_at=_parse_datetime(row["created_at"]),
                 committed_at=_parse_datetime(row["committed_at"]),
             )
-        except (TypeError, ValueError, json.JSONDecodeError) as error:
+        except (TypeError, ValueError, json.JSONDecodeError):
             raise RepositoryInvariantError(
                 "committed Snapshot row does not form a canonical envelope"
-            ) from error
+            ) from None
         if row["session_key_hash"] != session_key.session_key_hash:
             raise RepositoryInvariantError("active Snapshot belongs to a different durable session")
         return snapshot

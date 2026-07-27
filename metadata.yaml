@@ -1,9 +1,9 @@
 name: astrbot_plugin_astrcontinuum
 display_name: AstrContinuum
-desc: "Repository-stage technical preview of a non-blocking, durable long-context runtime for AstrBot."
-short_desc: "Durable Journal, reversible context projection, and snapshot-plus-Delta architecture."
-version: v0.1.0
-author: 2718labs
+desc: "Pressure-triggered encrypted context runtime for AstrBot with verified fallback."
+short_desc: "Encrypted Journal, verified request-local context, and reversible Provider View."
+version: v0.2.0
+author: Ayleovelle
 license: AGPL-3.0-or-later
 repo: https://github.com/2718labs/astrbot_plugin_astrcontinuum
 support_platforms: []

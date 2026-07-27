@@ -248,6 +248,10 @@ def test_retrieval_bounds_query_capsules_delta_and_candidate_count() -> None:
     assert all(candidate.capsule_id != "capsule-2" for candidate in candidates)
     raw = [item for item in candidates if item.kind == kind_type.RAW_EVENT]
     assert [item.event_sequence for item in raw] == [4, 5]
+    assert [item.text for item in raw] == [
+        "[USER_MESSAGE/USER event-4]\nraw delta 4",
+        "[USER_MESSAGE/USER event-5]\nraw delta 5",
+    ]
     assert all("SHOULD-NOT-BE-SCANNED" not in item.reason for item in candidates)
 
 
@@ -267,6 +271,57 @@ def test_ties_use_stable_ids_and_output_is_repeatable() -> None:
 
     assert first == second
     assert entity_ids == sorted(entity_ids)
+
+
+def test_required_candidate_at_capacity_plus_one_marks_selection_incomplete() -> None:
+    key = session_key()
+
+    def saturated_capsule(index: int) -> ac.ContextCapsuleEnvelope:
+        item = capsule(key, capsule_id=f"capsule-{index}")
+        source_id = item.source_event_ids[0]
+
+        def claims(prefix: str) -> tuple[ac.CapsuleClaim, ...]:
+            return tuple(
+                ac.CapsuleClaim(
+                    claim_id=f"{prefix}-{index}-{claim_index}",
+                    text=f"{prefix} {index} {claim_index}",
+                    status=ac.SemanticStatus.ACTIVE,
+                    confidence=1.0,
+                    source_event_ids=(source_id,),
+                )
+                for claim_index in range(64)
+            )
+
+        return item.model_copy(
+            update={
+                "goals": claims("goal"),
+                "constraints": claims("constraint"),
+            }
+        )
+
+    view = request_view(tuple(saturated_capsule(index) for index in range(3)), delta_count=0)
+
+    candidates = ac.select_candidates(view, "", ac.RetrievalConfig(max_candidates=256))
+
+    assert len(candidates) == 256
+    assert all(candidate.required for candidate in candidates)
+    assert all(candidate.required_selection_complete is False for candidate in candidates)
+
+
+def test_required_delta_source_bound_marks_selection_incomplete() -> None:
+    view = request_view((capsule(session_key()),), delta_count=2)
+
+    candidates = ac.select_candidates(
+        view,
+        "",
+        ac.RetrievalConfig(max_delta_events=1),
+    )
+
+    raw = tuple(
+        candidate for candidate in candidates if candidate.kind is ac.CandidateKind.RAW_EVENT
+    )
+    assert tuple(candidate.event_sequence for candidate in raw) == (3,)
+    assert all(candidate.required_selection_complete is False for candidate in candidates)
 
 
 def test_public_surface_is_immutable_and_has_no_provider_input() -> None:

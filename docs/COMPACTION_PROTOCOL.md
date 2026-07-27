@@ -2,9 +2,9 @@
 
 English | [简体中文](./COMPACTION_PROTOCOL.zh-CN.md)
 
-This protocol describes the implemented compaction core at `v0.1.0`. The AstrBot `Star`
-lifecycle persists compaction intent but does not yet start the background worker. The protocol
-is therefore durable and testable without being automatically active in an installed plugin.
+This protocol describes the active compaction lane at `v0.1.0`. The AstrBot `Star` persists
+pressure-triggered intent, starts one tracked background worker, and cancels it during
+termination. Automatic execution is therefore part of the installed preview.
 
 ## 1. Safety objective
 
@@ -71,12 +71,14 @@ active pointer.
 
 The worker reads one committed base plus contiguous Delta and:
 
-1. segments bounded evidence;
-2. compiles immutable structured Capsules;
-3. verifies identity, coverage, provenance, dependencies, exact anchors, and closed envelopes;
-4. optionally runs semantic loss audit;
-5. creates a candidate Snapshot covering exactly the frozen target;
-6. enters `READY_TO_COMMIT` only after mandatory checks pass.
+1. segments bounded role-labelled evidence;
+2. asks the selected provider for event ids and exact source spans only;
+3. rejects missing acknowledgements, extra fields, unknown ids, and non-verbatim text;
+4. compiles immutable structured Capsules and renders them deterministically;
+5. verifies identity, coverage, provenance, dependencies, exact anchors, and closed envelopes;
+6. optionally runs semantic loss audit;
+7. creates a candidate Snapshot covering exactly the frozen target;
+8. enters `READY_TO_COMMIT` only after mandatory checks pass.
 
 Disabling optional semantic audit never disables structural, identity, coverage, exact-anchor,
 non-empty, or permanent publication validation.
@@ -122,12 +124,13 @@ request view but cannot mutate Journal, Snapshot, coverage, or job state.
 
 ## 8. Current activation boundary
 
-The repository contains the state machine, scheduler primitives, compiler/validator/auditor
-pipeline, SQLite repository, publication savepoint, and recovery tests. It does not yet contain
-a `Star`-owned task loop that claims jobs and supplies a production compiler/auditor.
+The installed preview includes the `Star`-owned claim loop, frozen compaction reads, lease
+renewal, bounded cancellation, provider selection, redacted retry, atomic publication, and
+basic `/context_status` telemetry.
 
-Startup, bounded cancellation, provider selection, backpressure, and operational telemetry must
-be wired and verified before automatic compaction can be claimed.
+The provider-backed semantic-audit adapter remains unbound; mandatory mechanical and permanent
+publication validation still run. At-rest database encryption and fuller operational controls
+remain future security/production work.
 
 See [Concurrency state machine](./CONCURRENCY_STATE_MACHINE.md),
 [Database schema](./DATABASE_SCHEMA.md), and [Test matrix](./TEST_MATRIX.md).

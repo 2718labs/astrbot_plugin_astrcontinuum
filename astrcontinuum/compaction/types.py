@@ -78,6 +78,16 @@ class CompilerInvariantError(ValueError):
         super().__init__("|".join(message_codes))
 
 
+class CompilerBackendDeferred(RuntimeError):
+    """A safe backend deferral that must not consume the retry budget."""
+
+    def __init__(self, code: str) -> None:
+        if not isinstance(code, str) or not code.strip():
+            raise ValueError("compiler deferral code must be non-empty")
+        self.code = code.strip()
+        super().__init__(self.code)
+
+
 @dataclass(frozen=True, slots=True)
 class CompilationRequest:
     base_snapshot: SnapshotEnvelope | None

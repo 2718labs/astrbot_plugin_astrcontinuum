@@ -3,10 +3,31 @@ from __future__ import annotations
 import importlib
 import json
 import sys
+from collections.abc import AsyncIterator
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
+from typing import Protocol
 
 import pytest
+import pytest_asyncio
+
+import astrcontinuum.adapters.astrbot as astrbot_adapter
+from astrcontinuum.storage import SecureCodec
+
+TEST_MASTER_KEY = "AAECAwQFBgcICQoLDA0ODxAREhMUFRYXGBkaGxwdHh8"
+TEST_CODEC = SecureCodec(bytes(range(32)))
+
+
+class TerminablePlugin(Protocol):
+    async def terminate(self) -> None: ...
+
+
+@pytest_asyncio.fixture
+async def plugin_cleanup() -> AsyncIterator[list[TerminablePlugin]]:
+    plugins: list[TerminablePlugin] = []
+    yield plugins
+    for plugin in reversed(plugins):
+        await plugin.terminate()
 
 
 class FakeLogger:
@@ -71,6 +92,8 @@ class FakeEvent:
         self.message_obj = SimpleNamespace(
             message_id=message_id,
             timestamp=1_727_000_000,
+            type=SimpleNamespace(value="FriendMessage"),
+            session_id="session-1",
         )
         self._extras: dict[str, object] = {}
 
@@ -99,11 +122,15 @@ class FakeEvent:
         return ("plain", text)
 
 
-def _request(prompt: str) -> SimpleNamespace:
+def _request(prompt: str, *, token_usage: int = 0) -> SimpleNamespace:
     return SimpleNamespace(
         prompt=prompt,
         contexts=[FakeMessage(role="assistant", content="immutable request contexts")],
-        conversation=SimpleNamespace(cid="conversation-1", persona_id=None),
+        conversation=SimpleNamespace(
+            cid="conversation-1",
+            persona_id=None,
+            token_usage=token_usage,
+        ),
     )
 
 
@@ -113,6 +140,8 @@ def _load_main(
     *,
     projection_capability: bool = True,
 ) -> tuple[ModuleType, FakeLogger]:
+    monkeypatch.setenv("ASTRCONTINUUM_MASTER_KEY", TEST_MASTER_KEY)
+    monkeypatch.delenv("ASTRCONTINUUM_PREVIOUS_KEY", raising=False)
     logger = FakeLogger()
     astrbot = ModuleType("astrbot")
     astrbot.__path__ = []
@@ -184,10 +213,48 @@ def _dump_messages(messages: list[object]) -> bytes:
 @pytest.mark.asyncio
 async def test_projection_restores_native_history_and_never_persists_projection(
     monkeypatch: pytest.MonkeyPatch,
+    plugin_cleanup: list[TerminablePlugin],
     tmp_path: Path,
 ) -> None:
+    read_count = 0
+    live_assembly_count = 0
+    original_read_request_view = astrbot_adapter.read_request_view
+    original_assemble_live_context = astrbot_adapter.assemble_live_context
+
+    def counted_read_request_view(*args: object, **kwargs: object) -> object:
+        nonlocal read_count
+        read_count += 1
+        return original_read_request_view(*args, **kwargs)  # type: ignore[arg-type]
+
+    def counted_assemble_live_context(
+        *args: object,
+        **kwargs: object,
+    ) -> tuple[object, object]:
+        nonlocal live_assembly_count
+        live_assembly_count += 1
+        return original_assemble_live_context(*args, **kwargs)  # type: ignore[arg-type, return-value]
+
+    monkeypatch.setattr(
+        astrbot_adapter,
+        "read_request_view",
+        counted_read_request_view,
+    )
+    monkeypatch.setattr(
+        astrbot_adapter,
+        "assemble_live_context",
+        counted_assemble_live_context,
+    )
     module, _logger = _load_main(monkeypatch, tmp_path)
-    plugin = module.AstrContinuumPlugin(object(), {"enabled": True})
+    plugin = module.AstrContinuumPlugin(
+        object(),
+        {
+            "enabled": True,
+            "model_context_limit": 100_000,
+            "compaction_start_ratio": 0.75,
+            "provider_view_switch_ratio": 0.80,
+        },
+    )
+    plugin_cleanup.append(plugin)
     await plugin.initialize()
 
     prior_event = FakeEvent("message-prior")
@@ -197,10 +264,11 @@ async def test_projection_restores_native_history_and_never_persists_projection(
     await plugin._bridge.capture_assistant(prior_state.prepared, "old assistant")
 
     event = FakeEvent("message-current")
-    request = _request("fresh user")
+    request = _request("fresh user", token_usage=60_000)
     request_contexts = request.contexts
     request_context_bytes = _dump_messages(request.contexts)
     await plugin.on_llm_request(event, request)
+    reads_before_projection = read_count
 
     system = FakeMessage(role="system", content="system prompt")
     history_user = FakeMessage(role="user", content="old user")
@@ -215,6 +283,8 @@ async def test_projection_restores_native_history_and_never_persists_projection(
     messages.insert(1, opaque)
     await plugin.on_agent_begin_project(event, run_context)
 
+    assert live_assembly_count == 1
+    assert read_count == reads_before_projection
     assert request.contexts is request_contexts
     assert _dump_messages(request.contexts) == request_context_bytes
     assert messages[0] is system
@@ -257,15 +327,32 @@ async def test_projection_restores_native_history_and_never_persists_projection(
     assert bridge is not None
     with bridge.repository.factory.connection(read_only=True) as connection:
         rows = connection.execute(
-            "SELECT sequence, event_type, content FROM journal_events ORDER BY sequence"
+            """
+            SELECT event_id, sequence, event_type, content
+            FROM journal_events
+            ORDER BY sequence
+            """
         ).fetchall()
-        assert [tuple(row) for row in rows] == [
+        decoded_rows = [
+            (
+                row["sequence"],
+                row["event_type"],
+                TEST_CODEC.decrypt_text(
+                    "journal_events",
+                    "content",
+                    row["event_id"],
+                    row["content"],
+                ),
+            )
+            for row in rows
+        ]
+        assert decoded_rows == [
             (1, "USER_MESSAGE", "old user"),
             (2, "ASSISTANT_MESSAGE", "old assistant"),
             (3, "USER_MESSAGE", "fresh user"),
             (4, "ASSISTANT_MESSAGE", "fresh assistant"),
         ]
-        assert all(row["content"] != projected_text for row in rows)
+        assert all(row["content"] not in {projected_text, "old user", "fresh user"} for row in rows)
         before_response = len(rows)
 
     await plugin.on_llm_response(
@@ -282,6 +369,7 @@ async def test_projection_restores_native_history_and_never_persists_projection(
 @pytest.mark.asyncio
 async def test_missing_projection_capability_fails_open_after_user_capture(
     monkeypatch: pytest.MonkeyPatch,
+    plugin_cleanup: list[TerminablePlugin],
     tmp_path: Path,
 ) -> None:
     module, _logger = _load_main(
@@ -289,7 +377,16 @@ async def test_missing_projection_capability_fails_open_after_user_capture(
         tmp_path,
         projection_capability=False,
     )
-    plugin = module.AstrContinuumPlugin(object(), {"enabled": True})
+    plugin = module.AstrContinuumPlugin(
+        object(),
+        {
+            "enabled": True,
+            "model_context_limit": 100_000,
+            "compaction_start_ratio": 0.75,
+            "provider_view_switch_ratio": 0.80,
+        },
+    )
+    plugin_cleanup.append(plugin)
     await plugin.initialize()
 
     prior_event = FakeEvent("message-prior")
@@ -298,7 +395,7 @@ async def test_missing_projection_capability_fails_open_after_user_capture(
     await plugin._bridge.capture_assistant(prior_state.prepared, "old assistant")
 
     event = FakeEvent("message-current")
-    request = _request("fresh user")
+    request = _request("fresh user", token_usage=60_000)
     await plugin.on_llm_request(event, request)
     state = next(iter(event._extras.values()))
     messages = [
@@ -307,13 +404,13 @@ async def test_missing_projection_capability_fails_open_after_user_capture(
         FakeMessage(role="assistant", content="old assistant"),
         FakeMessage(role="user", content="fresh user"),
     ]
-    before = tuple(messages)
     run_context = SimpleNamespace(messages=messages)
 
     await plugin.on_agent_begin_guard(event, run_context)
     await plugin.on_agent_begin_project(event, run_context)
 
-    assert tuple(messages) == before
+    assert messages == [messages[0], messages[-1]]
+    assert state.projected is not None
     assert state.faults[-1].code == "PROJECTION_API_UNAVAILABLE"
     bridge = plugin._bridge
     assert bridge is not None

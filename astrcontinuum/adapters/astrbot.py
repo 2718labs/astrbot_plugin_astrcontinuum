@@ -7,12 +7,19 @@ import hashlib
 import importlib
 import json
 import math
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from enum import Enum
 from typing import NoReturn
 
+from ..context_graph import (
+    ContextEngineMode,
+    EngineOutcome,
+    LiveContextTrace,
+    assemble_live_context,
+)
 from ..domain import (
     CompactionJobEnvelope,
     EventEnvelope,
@@ -27,7 +34,6 @@ from ..runtime import (
     RetrievalConfig,
     TokenCounter,
     Utf8ByteTokenCounter,
-    assemble,
     read_request_view,
     select_candidates,
 )
@@ -40,6 +46,8 @@ _MAX_VALUE_DEPTH = 4
 _MAX_COLLECTION_ITEMS = 16
 _MAX_STRING_CHARACTERS = 512
 _MIN_METADATA_BYTES = 128
+_MAX_CONTEXT_TRACE_SESSIONS = 256
+_MAX_LIVE_CONTEXT_CANDIDATES = 64
 
 
 class AdapterStage(str, Enum):
@@ -150,6 +158,7 @@ class PreparedRequest:
     user_event: EventEnvelope = field(repr=False)
     view: RequestView = field(repr=False)
     candidates: tuple[CandidateBlock, ...] = field(repr=False)
+    trusted_token_usage: int | None
 
 
 def _raise(
@@ -225,20 +234,17 @@ def _host_datetime(value: object) -> datetime | None:
         return None
 
 
-def extract_host_turn_identity(event: object, request: object) -> HostTurnIdentity:
-    """Extract the exact seven-field SessionKey and stable host delivery identity."""
+def extract_host_session_key(event: object, conversation: object) -> SessionKey:
+    """Extract one exact seven-field SessionKey from documented AstrBot objects."""
 
     message_obj = getattr(event, "message_obj", _MISSING)
-    conversation = getattr(request, "conversation", _MISSING)
     raw_group_id = _safe_call(event, "get_group_id")
-    raw_message_type = _safe_call(event, "get_message_type")
     values = {
         "platform_instance_id": _required_text(_safe_call(event, "get_platform_id")),
-        "message_type": _message_type_text(raw_message_type),
-        "session_id": _required_text(_safe_call(event, "get_session_id")),
+        "message_type": _message_type_text(getattr(message_obj, "type", _MISSING)),
+        "session_id": _required_text(getattr(message_obj, "session_id", _MISSING)),
         "user_id": _required_text(_safe_call(event, "get_sender_id")),
         "conversation_id": _required_text(getattr(conversation, "cid", _MISSING)),
-        "host_message_id": _required_text(getattr(message_obj, "message_id", _MISSING)),
     }
     group_id = _optional_text(raw_group_id)
     if group_id is _MISSING:
@@ -257,6 +263,47 @@ def extract_host_turn_identity(event: object, request: object) -> HostTurnIdenti
             missing_field_count=missing_count,
         )
 
+    platform_instance_id = values["platform_instance_id"]
+    message_type = values["message_type"]
+    session_id = values["session_id"]
+    user_id = values["user_id"]
+    conversation_id = values["conversation_id"]
+    if (
+        platform_instance_id is None
+        or message_type is None
+        or session_id is None
+        or user_id is None
+        or conversation_id is None
+    ):
+        _raise(
+            AdapterErrorCode.HOST_IDENTITY_MISSING,
+            AdapterStage.IDENTITY,
+            missing_field_count=1,
+        )
+    return SessionKey(
+        platform_instance_id=platform_instance_id,
+        message_type=message_type,
+        session_id=session_id,
+        group_id=group_id if isinstance(group_id, str) else None,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        persona_id=persona_id if isinstance(persona_id, str) else None,
+    )
+
+
+def extract_host_turn_identity(event: object, request: object) -> HostTurnIdentity:
+    """Extract the exact seven-field SessionKey and stable host delivery identity."""
+
+    message_obj = getattr(event, "message_obj", _MISSING)
+    conversation = getattr(request, "conversation", _MISSING)
+    session_key = extract_host_session_key(event, conversation)
+    host_message_id = _required_text(getattr(message_obj, "message_id", _MISSING))
+    if host_message_id is None:
+        _raise(
+            AdapterErrorCode.HOST_IDENTITY_MISSING,
+            AdapterStage.IDENTITY,
+            missing_field_count=1,
+        )
     created_at = _host_datetime(getattr(message_obj, "timestamp", _MISSING))
     if created_at is None:
         _raise(
@@ -264,36 +311,8 @@ def extract_host_turn_identity(event: object, request: object) -> HostTurnIdenti
             AdapterStage.IDENTITY,
             missing_field_count=1,
         )
-
-    platform_instance_id = values["platform_instance_id"]
-    message_type = values["message_type"]
-    session_id = values["session_id"]
-    user_id = values["user_id"]
-    conversation_id = values["conversation_id"]
-    host_message_id = values["host_message_id"]
-    if (
-        platform_instance_id is None
-        or message_type is None
-        or session_id is None
-        or user_id is None
-        or conversation_id is None
-        or host_message_id is None
-    ):
-        _raise(
-            AdapterErrorCode.HOST_IDENTITY_MISSING,
-            AdapterStage.IDENTITY,
-            missing_field_count=1,
-        )
     return HostTurnIdentity(
-        session_key=SessionKey(
-            platform_instance_id=platform_instance_id,
-            message_type=message_type,
-            session_id=session_id,
-            group_id=group_id if isinstance(group_id, str) else None,
-            user_id=user_id,
-            conversation_id=conversation_id,
-            persona_id=persona_id if isinstance(persona_id, str) else None,
-        ),
+        session_key=session_key,
         host_message_id=host_message_id,
         created_at=created_at,
         request_identity=id(request),
@@ -619,15 +638,48 @@ class AstrBotHookBridge:
         retrieval_config: RetrievalConfig | None = None,
         budget_config: BudgetConfig | None = None,
         counter: TokenCounter | None = None,
+        context_engine_mode: ContextEngineMode = ContextEngineMode.OFF,
     ) -> None:
+        if not isinstance(context_engine_mode, ContextEngineMode):
+            raise TypeError("context_engine_mode must be a ContextEngineMode")
         self._repository = repository
         self._retrieval_config = retrieval_config or RetrievalConfig()
         self._budget_config = budget_config or BudgetConfig()
         self._counter = counter or Utf8ByteTokenCounter()
+        self._context_engine_mode = context_engine_mode
+        self._last_context_trace: LiveContextTrace | None = None
+        self._context_traces: OrderedDict[str, LiveContextTrace] = OrderedDict()
 
     @property
     def repository(self) -> SQLiteRepository:
         return self._repository
+
+    @property
+    def context_engine_mode(self) -> ContextEngineMode:
+        return self._context_engine_mode
+
+    @property
+    def last_context_trace(self) -> LiveContextTrace | None:
+        return self._last_context_trace
+
+    def inspect_context_trace(self, session_key: SessionKey) -> LiveContextTrace | None:
+        """Return bounded, content-free diagnostics without reading the Journal."""
+
+        if not isinstance(session_key, SessionKey):
+            raise TypeError("session_key must be a SessionKey")
+        return self._context_traces.get(session_key.session_key_hash)
+
+    def _remember_context_trace(
+        self,
+        session_key: SessionKey,
+        trace: LiveContextTrace,
+    ) -> None:
+        session_hash = session_key.session_key_hash
+        self._context_traces[session_hash] = trace
+        self._context_traces.move_to_end(session_hash)
+        while len(self._context_traces) > _MAX_CONTEXT_TRACE_SESSIONS:
+            self._context_traces.popitem(last=False)
+        self._last_context_trace = trace
 
     def _content_cost(self, content: str) -> int:
         if not isinstance(content, str):
@@ -659,6 +711,14 @@ class AstrBotHookBridge:
                 AdapterErrorCode.JOURNAL_CONTENT_INVALID,
                 AdapterStage.IDENTITY,
             )
+        # Authenticate the existing current-session view before the first live write.
+        # This prevents already-corrupted durable content from being followed by a new
+        # Journal event before the composition root can lock the storage boundary.
+        await asyncio.to_thread(
+            read_request_view,
+            self._repository,
+            turn.session_key,
+        )
         identity = deterministic_event_identity(turn, SourceHook.ON_LLM_REQUEST)
         user_event = await asyncio.to_thread(
             self._repository.capture_user_event,
@@ -683,15 +743,23 @@ class AstrBotHookBridge:
             )
             if user_event.event_id not in candidate.source_event_ids
         )
+        conversation = getattr(request, "conversation", None)
+        raw_usage = getattr(conversation, "token_usage", None)
+        trusted_token_usage = (
+            raw_usage
+            if isinstance(raw_usage, int) and not isinstance(raw_usage, bool) and raw_usage > 0
+            else None
+        )
         return PreparedRequest(
             turn=turn,
             current_input=current_input,
             user_event=user_event,
             view=view,
             candidates=candidates,
+            trusted_token_usage=trusted_token_usage,
         )
 
-    def assemble_prepared(
+    async def assemble_prepared(
         self,
         prepared: PreparedRequest,
         *,
@@ -700,15 +768,32 @@ class AstrBotHookBridge:
     ) -> AssemblyResult:
         """Apply canonical budget arithmetic after foreign projections have run."""
 
-        return assemble(
+        configured_mode = self._context_engine_mode
+        capacity_exceeded = (
+            configured_mode is not ContextEngineMode.OFF
+            and len(prepared.candidates) > _MAX_LIVE_CONTEXT_CANDIDATES
+        )
+        effective_mode = ContextEngineMode.OFF if capacity_exceeded else configured_mode
+        assembly, trace = await asyncio.to_thread(
+            assemble_live_context,
             prepared.view,
             prepared.candidates,
             current_input=prepared.current_input,
             opaque_token_cost=opaque_token_cost,
             fixed_required_cost=fixed_required_cost,
             counter=self._counter,
-            config=self._budget_config,
+            budget_config=self._budget_config,
+            mode=effective_mode,
         )
+        if capacity_exceeded:
+            trace = replace(
+                trace,
+                mode=configured_mode,
+                outcome=EngineOutcome.DEGRADED_RAW,
+                error_code="GRAPH_LIVE_CAPACITY_EXCEEDED",
+            )
+        self._remember_context_trace(prepared.turn.session_key, trace)
+        return assembly
 
     async def capture_assistant(
         self,

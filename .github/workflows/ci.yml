@@ -37,7 +37,7 @@ jobs:
       - name: Validate public metadata and configuration
         run: |
           uv run python -m json.tool _conf_schema.json > /dev/null
-          uv run python -c "from pathlib import Path; import yaml; data=yaml.safe_load(Path('metadata.yaml').read_text(encoding='utf-8')); assert data['version'] == 'v0.1.0'; assert data['repo'] == 'https://github.com/2718labs/astrbot_plugin_astrcontinuum'"
+          uv run python -c "from pathlib import Path; import yaml; data=yaml.safe_load(Path('metadata.yaml').read_text(encoding='utf-8')); assert data['version'] == 'v0.2.0'; assert data['repo'] == 'https://github.com/2718labs/astrbot_plugin_astrcontinuum'"
 
       - name: Ruff lint
         run: uv run ruff check .

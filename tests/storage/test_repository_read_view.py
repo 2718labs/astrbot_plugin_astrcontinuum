@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 import astrcontinuum as ac
+from tests.storage.security_testkit import secure_repository, storage_test_codec
 
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
 
@@ -32,8 +33,7 @@ def repository(
     fault_injector: Any | None = None,
 ) -> ac.SQLiteRepository:
     factory = ac.SQLiteConnectionFactory(data_dir, busy_timeout_ms=5_000)
-    ac.SQLiteMigrator(factory).migrate()
-    return ac.SQLiteRepository(factory, fault_injector=fault_injector)
+    return secure_repository(factory, fault_injector=fault_injector)
 
 
 def capture(
@@ -135,6 +135,7 @@ def seed_active_snapshot(store: ac.SQLiteRepository, key: ac.SessionKey) -> None
     item = capsule(key)
     snapshot = committed_snapshot(key)
     timestamp = "2026-07-26T12:00:00.000000Z"
+    codec = storage_test_codec()
 
     with store.factory.transaction(immediate=True) as connection:
         connection.execute(
@@ -157,7 +158,12 @@ def seed_active_snapshot(store: ac.SQLiteRepository, key: ac.SessionKey) -> None
                 item.level.value,
                 item.covered_event_start,
                 item.covered_event_end,
-                canonical_json(item),
+                codec.encrypt_object_json(
+                    "capsules",
+                    "canonical_capsule_json",
+                    item.capsule_id,
+                    canonical_json(item),
+                ),
                 item.token_cost,
                 item.quality.source_coverage,
                 timestamp,
@@ -186,10 +192,25 @@ def seed_active_snapshot(store: ac.SQLiteRepository, key: ac.SessionKey) -> None
                 snapshot.base_snapshot_id,
                 snapshot.covered_event_end,
                 snapshot.source_high_water_mark,
-                json.dumps(list(snapshot.exact_anchor_ids), separators=(",", ":")),
-                snapshot.rendered_context,
+                codec.encrypt_array_json(
+                    "snapshots",
+                    "exact_anchor_ids_json",
+                    snapshot.snapshot_id,
+                    json.dumps(list(snapshot.exact_anchor_ids), separators=(",", ":")),
+                ),
+                codec.encrypt_text(
+                    "snapshots",
+                    "rendered_context",
+                    snapshot.snapshot_id,
+                    snapshot.rendered_context,
+                ),
                 snapshot.token_cost,
-                canonical_json(snapshot.audit_outcome),
+                codec.encrypt_object_json(
+                    "snapshots",
+                    "audit_outcome",
+                    snapshot.snapshot_id,
+                    canonical_json(snapshot.audit_outcome),
+                ),
                 timestamp,
                 timestamp,
             ),
@@ -283,7 +304,7 @@ def test_read_transaction_fixes_high_water_before_concurrent_append(
     key = session_key()
     first = capture(setup, 1, key=key)
     second = capture(setup, 2, key=key)
-    reader = ac.SQLiteRepository(
+    reader = secure_repository(
         ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000),
         fault_injector=failpoint,
     )
@@ -292,7 +313,7 @@ def test_read_transaction_fixes_high_water_before_concurrent_append(
         pending = pool.submit(reader.read_request_view, key)
         assert reached_high_water.wait(timeout=5)
         third = capture(
-            ac.SQLiteRepository(ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000)),
+            secure_repository(ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000)),
             3,
             key=key,
         )

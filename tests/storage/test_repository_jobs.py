@@ -8,6 +8,7 @@ from threading import Barrier
 import pytest
 
 import astrcontinuum as ac
+from tests.storage.security_testkit import secure_repository
 
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
 LEASE_END = NOW + timedelta(minutes=5)
@@ -27,8 +28,7 @@ def session_key(session_id: str = "session-1") -> ac.SessionKey:
 
 def repository(data_dir: Path) -> ac.SQLiteRepository:
     factory = ac.SQLiteConnectionFactory(data_dir, busy_timeout_ms=5_000)
-    ac.SQLiteMigrator(factory).migrate()
-    return ac.SQLiteRepository(factory)
+    return secure_repository(factory)
 
 
 def capture_events(
@@ -100,7 +100,7 @@ def test_concurrent_intents_converge_on_one_job_and_maximum_target(
     barrier = Barrier(len(targets))
 
     def trigger(target: int) -> ac.CompactionJobEnvelope | None:
-        store = ac.SQLiteRepository(ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000))
+        store = secure_repository(ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000))
         barrier.wait()
         return raise_intent(
             store,
@@ -132,7 +132,7 @@ def test_claim_freezes_intent_and_only_one_connection_wins(tmp_path: Path) -> No
     barrier = Barrier(count)
 
     def claim(index: int) -> ac.CompactionJobEnvelope | None:
-        store = ac.SQLiteRepository(ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000))
+        store = secure_repository(ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000))
         barrier.wait()
         return store.claim_job(
             worker_id=f"worker-{index}",
@@ -313,7 +313,7 @@ def test_claim_injected_failure_rolls_back_epoch_and_attempt(tmp_path: Path) -> 
         if name == "claim.after_update":
             raise RuntimeError("injected claim crash")
 
-    store = ac.SQLiteRepository(setup.factory, fault_injector=failpoint)
+    store = secure_repository(setup.factory, fault_injector=failpoint)
     with pytest.raises(RuntimeError, match="injected claim crash"):
         store.claim_job(
             worker_id="worker-1",

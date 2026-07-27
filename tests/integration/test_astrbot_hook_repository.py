@@ -12,7 +12,17 @@ from astrcontinuum.adapters import (
     AstrBotAdapterError,
     AstrBotHookBridge,
 )
-from astrcontinuum.storage import SQLiteConnectionFactory, SQLiteMigrator, SQLiteRepository
+from astrcontinuum.storage import (
+    KeyMaterial,
+    KeySource,
+    ResolvedKeyMaterial,
+    SecureCodec,
+    SQLiteConnectionFactory,
+    SQLiteRepository,
+    activate_storage_security,
+)
+
+TEST_KEY = bytes(range(32))
 
 
 class FakeMessageType(str, Enum):
@@ -29,6 +39,8 @@ class FakeEvent:
         self.message_obj = SimpleNamespace(
             message_id=message_id,
             timestamp=1_727_000_000,
+            type=FakeMessageType.FRIEND,
+            session_id="session-9",
         )
         self._sender_id = sender_id
 
@@ -56,17 +68,28 @@ def _request() -> SimpleNamespace:
     )
 
 
-def _bridge(tmp_path: Path) -> AstrBotHookBridge:
+def _bridge(tmp_path: Path) -> tuple[AstrBotHookBridge, SecureCodec]:
     factory = SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000)
-    SQLiteMigrator(factory).migrate()
-    return AstrBotHookBridge(SQLiteRepository(factory))
+    activation = activate_storage_security(
+        factory,
+        ResolvedKeyMaterial(
+            active=KeyMaterial.from_raw(TEST_KEY),
+            previous=None,
+            source=KeySource.ENVIRONMENT,
+            local_degraded=False,
+        ),
+    )
+    return (
+        AstrBotHookBridge(SQLiteRepository(factory, codec=activation.codec)),
+        activation.codec,
+    )
 
 
 @pytest.mark.asyncio
 async def test_authoritative_hooks_are_idempotent_and_allocate_contiguous_rows(
     tmp_path: Path,
 ) -> None:
-    bridge = _bridge(tmp_path)
+    bridge, codec = _bridge(tmp_path)
     event = FakeEvent()
     request = _request()
     contexts = request.contexts
@@ -128,21 +151,30 @@ async def test_authoritative_hooks_are_idempotent_and_allocate_contiguous_rows(
     with bridge.repository.factory.connection(read_only=True) as connection:
         rows = connection.execute(
             """
-            SELECT sequence, event_type, role, source_hook, content
+            SELECT event_id, sequence, event_type, role, source_hook, content
             FROM journal_events
             ORDER BY sequence
             """
         ).fetchall()
-        assert [tuple(row)[:4] for row in rows] == [
+        assert [tuple(row)[1:5] for row in rows] == [
             (1, "USER_MESSAGE", "USER", "ON_LLM_REQUEST"),
             (2, "TOOL_CALL", "TOOL", "ON_USING_LLM_TOOL"),
             (3, "TOOL_RESULT", "TOOL", "ON_LLM_TOOL_RESPOND"),
             (4, "ASSISTANT_MESSAGE", "ASSISTANT", "ON_AGENT_DONE"),
         ]
-        assert rows[0]["content"] == "hello from the user"
-        assert json.loads(rows[1]["content"])["kind"] == "call"
-        assert json.loads(rows[2]["content"])["kind"] == "result"
-        assert rows[3]["content"] == "done"
+        contents = [
+            codec.decrypt_text(
+                "journal_events",
+                "content",
+                row["event_id"],
+                row["content"],
+            )
+            for row in rows
+        ]
+        assert contents[0] == "hello from the user"
+        assert json.loads(contents[1])["kind"] == "call"
+        assert json.loads(contents[2])["kind"] == "result"
+        assert contents[3] == "done"
         assert connection.execute("SELECT next_event_sequence FROM sessions").fetchone()[0] == 5
         job_rows = connection.execute(
             """
@@ -155,7 +187,7 @@ async def test_authoritative_hooks_are_idempotent_and_allocate_contiguous_rows(
 
 @pytest.mark.asyncio
 async def test_missing_stable_identity_skips_every_durable_write(tmp_path: Path) -> None:
-    bridge = _bridge(tmp_path)
+    bridge, _ = _bridge(tmp_path)
     request = _request()
     contexts_before = tuple(request.contexts)
 

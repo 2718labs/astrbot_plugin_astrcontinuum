@@ -10,6 +10,11 @@ from typing import Any
 import pytest
 
 import astrcontinuum as ac
+from tests.storage.security_testkit import (
+    activate_test_storage,
+    secure_repository,
+    storage_test_codec,
+)
 
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
 
@@ -40,8 +45,12 @@ def migrated_repository(
     fault_injector: Any | None = None,
 ) -> Any:
     factory = ac.SQLiteConnectionFactory(data_dir, busy_timeout_ms=5_000)
-    ac.SQLiteMigrator(factory).migrate()
-    return repository_type()(factory, fault_injector=fault_injector)
+    activation = activate_test_storage(factory)
+    return repository_type()(
+        factory,
+        codec=activation.codec,
+        fault_injector=fault_injector,
+    )
 
 
 def capture_user(
@@ -172,7 +181,7 @@ def test_concurrent_connections_allocate_one_contiguous_sequence(tmp_path: Path)
     barrier = Barrier(count)
 
     def capture(index: int) -> ac.EventEnvelope:
-        repository = repository_type()(ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000))
+        repository = secure_repository(ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000))
         barrier.wait()
         return capture_user(
             repository,
@@ -196,6 +205,22 @@ def test_session_hash_collision_or_corruption_is_not_merged(tmp_path: Path) -> N
     repository = migrated_repository(tmp_path)
     expected = session_key()
     other = session_key(session_id="other-session")
+    codec = storage_test_codec()
+    record_key = expected.session_key_hash
+    encrypted_identities = {
+        column: (
+            None if value is None else codec.encrypt_text("sessions", column, record_key, value)
+        )
+        for column, value in (
+            ("platform_instance_id", other.platform_instance_id),
+            ("message_type", other.message_type),
+            ("session_id", other.session_id),
+            ("group_id", other.group_id),
+            ("user_id", other.user_id),
+            ("conversation_id", other.conversation_id),
+            ("persona_id", other.persona_id),
+        )
+    }
 
     with repository.factory.transaction(immediate=True) as connection:
         connection.execute(
@@ -216,30 +241,41 @@ def test_session_hash_collision_or_corruption_is_not_merged(tmp_path: Path) -> N
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 1, ?, ?)
             """,
             (
-                expected.session_key_hash,
-                other.canonical_json(),
-                other.platform_instance_id,
-                other.message_type,
-                other.session_id,
-                other.group_id,
-                other.user_id,
-                other.conversation_id,
-                other.persona_id,
+                record_key,
+                codec.encrypt_object_json(
+                    "sessions",
+                    "canonical_session_key_json",
+                    record_key,
+                    other.canonical_json(),
+                ),
+                encrypted_identities["platform_instance_id"],
+                encrypted_identities["message_type"],
+                encrypted_identities["session_id"],
+                encrypted_identities["group_id"],
+                encrypted_identities["user_id"],
+                encrypted_identities["conversation_id"],
+                encrypted_identities["persona_id"],
                 "2026-07-26T12:00:00.000000Z",
                 "2026-07-26T12:00:00.000000Z",
             ),
         )
 
-    conflict_type = getattr(ac, "SessionIdentityConflict", None)
-    assert conflict_type is not None, "SessionIdentityConflict export is missing"
-    with pytest.raises(conflict_type):
+    invariant_type = getattr(ac, "RepositoryInvariantError", None)
+    assert invariant_type is not None, "RepositoryInvariantError export is missing"
+    with pytest.raises(invariant_type):
         capture_user(repository, key=expected)
 
     with repository.factory.connection(read_only=True) as connection:
         row = connection.execute(
             "SELECT canonical_session_key_json, next_event_sequence FROM sessions"
         ).fetchone()
-        assert json.loads(row[0]) == other.model_dump(mode="json")
+        canonical = codec.decrypt_object_json(
+            "sessions",
+            "canonical_session_key_json",
+            record_key,
+            row[0],
+        )
+        assert json.loads(canonical) == other.model_dump(mode="json")
         assert row[1] == 1
         assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 0
 

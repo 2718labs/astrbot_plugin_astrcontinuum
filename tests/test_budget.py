@@ -108,6 +108,8 @@ def block(
     required: bool = False,
     score: float = 1.0,
     event_sequence: int | None = None,
+    event_type: ac.EventType | None = None,
+    tool_name: str | None = None,
 ) -> runtime.CandidateBlock:
     kind = (
         runtime.CandidateKind.RAW_EVENT
@@ -125,6 +127,8 @@ def block(
         required=required,
         capsule_id=None if kind == runtime.CandidateKind.RAW_EVENT else "capsule-1",
         event_sequence=event_sequence,
+        event_type=event_type,
+        tool_name=tool_name,
     )
 
 
@@ -334,6 +338,74 @@ def test_emergency_follows_frozen_slot_priority_before_exact_anchor() -> None:
         item.block_id == "anchor" and item.reason == "EMERGENCY_REQUIRED_NOT_FIT"
         for item in result.trace.rejections
     )
+
+
+def test_emergency_budget_never_selects_tool_result_without_its_call() -> None:
+    config = runtime.BudgetConfig(
+        target_input_budget=1,
+        hard_input_ceiling=1,
+        model_context_limit=1,
+        reserved_output_and_tools=0,
+        safety_margin=0,
+    )
+    candidates = (
+        block(
+            "tool-call",
+            runtime.RuntimeSlot.RAW_DELTA,
+            "CALL",
+            required=True,
+            event_sequence=1,
+            event_type=ac.EventType.TOOL_CALL,
+            tool_name="weather",
+        ),
+        block(
+            "tool-result",
+            runtime.RuntimeSlot.RAW_DELTA,
+            "R",
+            required=True,
+            event_sequence=2,
+            event_type=ac.EventType.TOOL_RESULT,
+            tool_name="weather",
+        ),
+    )
+
+    result = call_assemble(candidates, config=config)
+
+    assert result.trace.mode is runtime.AssemblyMode.EMERGENCY_ASSEMBLY
+    assert result.selected_blocks == ()
+    assert {item.block_id for item in result.trace.rejections} == {
+        "tool-call",
+        "tool-result",
+    }
+
+
+@pytest.mark.parametrize("event_type", (ac.EventType.TOOL_CALL, ac.EventType.TOOL_RESULT))
+def test_emergency_budget_omits_unmatched_tool_event(event_type: ac.EventType) -> None:
+    config = runtime.BudgetConfig(
+        target_input_budget=1,
+        hard_input_ceiling=1,
+        model_context_limit=1,
+        reserved_output_and_tools=0,
+        safety_margin=0,
+    )
+    kind = "call" if event_type is ac.EventType.TOOL_CALL else "result"
+    candidates = (
+        block("goal", runtime.RuntimeSlot.ACTIVE_GOAL, "GG", required=True),
+        block(
+            f"tool-{kind}",
+            runtime.RuntimeSlot.RAW_DELTA,
+            "T",
+            required=True,
+            event_sequence=1,
+            event_type=event_type,
+            tool_name="weather",
+        ),
+    )
+
+    result = call_assemble(candidates, config=config)
+
+    assert result.trace.mode is runtime.AssemblyMode.EMERGENCY_ASSEMBLY
+    assert result.selected_blocks == ()
 
 
 def test_zero_ac_budget_and_unfittable_required_block_are_explicit() -> None:

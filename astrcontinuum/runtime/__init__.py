@@ -1,6 +1,7 @@
 """Canonical request-side AstrContinuum runtime."""
 
 from .budget import BudgetInvariantError, Utf8ByteTokenCounter, assemble
+from .pressure import PressureConfig, PressureDecision, PressureSource, assess_pressure
 from .projection import (
     ProjectionInvariantError,
     guard_projection,
@@ -43,6 +44,9 @@ __all__ = [
     "BudgetInvariantError",
     "CandidateBlock",
     "CandidateKind",
+    "PressureConfig",
+    "PressureDecision",
+    "PressureSource",
     "ProjectedView",
     "ProjectionErrorCode",
     "ProjectionGuard",
@@ -57,6 +61,7 @@ __all__ = [
     "TokenCounter",
     "Utf8ByteTokenCounter",
     "assemble",
+    "assess_pressure",
     "guard_projection",
     "project",
     "read_request_view",

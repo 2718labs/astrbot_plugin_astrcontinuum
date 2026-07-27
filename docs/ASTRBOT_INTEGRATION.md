@@ -17,7 +17,8 @@ and include a real `PluginManager` compatibility probe.
 - request-scoped state stored on the event object;
 - bounded request assembly and temporary projection;
 - final restoration verification and compaction-intent persistence;
-- resource closure during plugin termination.
+- current-provider affinity and the AstrBot extractive generator adapter;
+- tracked worker startup, wake-up, and closure during plugin termination.
 
 The domain, runtime, compaction, and storage packages do not import AstrBot. Private host objects
 are isolated behind `astrcontinuum.adapters.astrbot`.
@@ -63,11 +64,11 @@ callback delivery converge on one event row without consuming another sequence n
 
 | Handler | Priority | Responsibility | Forbidden work |
 | --- | ---: | --- | --- |
-| `on_llm_request` | `2000` | Capture user event, freeze high-water `H`, read committed Snapshot plus Delta, assemble bounded context | Remote audit/compiler calls, waiting for workers, full-database scans, migrations |
-| `on_agent_begin_guard` | `2000` | Record exact native request/list/message identities before any projection | Replacing or copying host history |
-| `on_agent_begin_project` | `-100` | Append one AstrContinuum-owned temporary provider message after other high-priority setup | Editing native message objects or persistent history |
+| `on_llm_request` | `2000` | Capture user event, freeze high-water `H`, read committed Snapshot plus Delta, remember current provider | Remote audit/compiler calls, waiting for workers, full-database scans, migrations |
+| `on_agent_begin_guard` | `2000` | Record exact native request/message identities before any projection | Replacing or copying host history |
+| `on_agent_begin_project` | `-100` | Assess pressure; when required, replace native history with one bounded temporary Provider View | Editing native message objects or persistent history |
 | `on_agent_done_restore` | `2000` | Remove owned projection and preserve provider-appended Delta | Reconstructing host history by value |
-| `on_agent_done_finalize` | `900` | Verify restoration, capture assistant event, persist latest compaction intent | Publishing a candidate Snapshot inline |
+| `on_agent_done_finalize` | `900` | Verify restoration, capture assistant event, and under pressure persist/wake compaction intent | Publishing a candidate Snapshot inline |
 | `on_using_llm_tool` | `0` | Capture bounded tool-call metadata | Persisting arbitrary object representations |
 | `on_llm_tool_respond` | `0` | Capture bounded tool-result metadata | Persisting unbounded results |
 | `on_llm_response` | `0` | Optional content-free observation | Any Journal write |
@@ -85,6 +86,7 @@ references required only for the active request:
 - prepared immutable read view;
 - projection guard identities;
 - projected/restored views;
+- pressure decision and request-local Conversation copy;
 - captured assistant event;
 - tool ordinals;
 - redacted adapter faults.
@@ -120,18 +122,21 @@ AstrContinuum currently relies on AstrBot provider-message internals:
 - `extra_user_content_parts`;
 - `mark_as_temp` / `_no_save`.
 
-These are probed at runtime. Projection occurs only when the required capability is present.
-The owned `TextPart` and enclosing `Message` are marked temporary, appended without replacing
-the existing context list, and removed before finalization.
+These are probed at runtime. Below the Provider View threshold, the native message list remains
+untouched. At or above the threshold, native history is removed for this provider call and the
+owned `TextPart`/`Message` is marked temporary. If temporary construction is unavailable, an
+empty Provider View still keeps the system objects and current input while removing old native
+history.
 
 Restoration is identity-based:
 
-1. capture the request object, context-list object, and each native message object;
-2. append only the AstrContinuum-owned message;
-3. allow the provider/agent to append its own Delta;
-4. remove the exact owned object;
-5. verify the original request, list, and native messages still have the same identities;
-6. preserve legitimate provider-added objects.
+1. capture the request object and each native message identity;
+2. preserve system/current objects, remove native history, and append only owned temporary
+   objects;
+3. allow AstrBot to replace the list and the provider/agent to append its own Delta;
+4. locate the exact current-user boundary by object identity;
+5. restore the exact native object sequence and preserve legitimate provider-added objects;
+6. verify identities, not list-container identity or serialized equality.
 
 Value equality is insufficient. Rebuilding equivalent dictionaries would still violate host
 ownership and can corrupt downstream persistence.
@@ -142,21 +147,22 @@ Compatibility or invariant failure produces a bounded `AdapterFault` containing 
 counts, never message content or object representations. The live request remains usable:
 
 - identity extraction failure → no capture or projection for that request;
-- missing projection capability → durable capture can continue, projection is skipped;
-- assembly failure → native request continues;
+- missing projection capability below hard pressure → durable capture continues with native
+  context;
+- assembly/projection-object failure at hard pressure → bounded empty Provider View;
 - projection/restoration invariant failure → owned enhancement is removed where safely
   possible and the host continues;
 - finalization failure → no fabricated assistant row or Snapshot coverage.
 
 ## 9. Lifecycle and current limitation
 
-Initialization migrates the database and constructs durable services. Termination closes
-connections/resources. The finalizer raises durable compaction intent after assistant capture.
+Initialization migrates the database, constructs durable services and the exact-span compiler,
+then starts one tracked worker. The finalizer raises and wakes durable compaction intent only
+when pressure requires it. Termination cancels and awaits the worker before clearing services.
 
-At `v0.1.0`, the `Star` lifecycle does **not** start a loop that claims and executes
-`compaction_jobs`. Compiler, validator, auditor, scheduler, lease/fencing, and atomic-publication
-primitives are implemented and tested in the core, but queued intent may remain pending.
-Describing automatic long-running compaction as active would be incorrect.
+The remaining integration limitation is the optional provider-backed semantic-audit adapter.
+Mandatory exact-span validation, mechanical validation, fencing, and atomic publication are
+active.
 
 ## 10. Change checklist
 

@@ -8,17 +8,18 @@ architecture document, changelog, and verification evidence for a concrete commi
 ## v0.1.x — repository stabilization
 
 - Accumulate real AstrBot and adapter compatibility evidence.
-- Wire the background compaction worker into `Star` startup and termination with bounded
-  cancellation.
-- Select production compiler/auditor providers without blocking live hooks.
+- Exercise the wired worker, lease renewal, bounded cancellation, and recovery with real slow
+  providers and process restarts.
+- Evaluate an optional semantic-audit provider without blocking live hooks.
 - Add provider-aware token counters while preserving conservative fail-safe budgeting.
-- Add operator telemetry for queue depth, coverage, retry, lease, and degradation codes.
+- Extend the current status command with coverage, retry, lease, and degradation telemetry.
 - Exercise upgrade, backup/restore, crash, and long-running WAL behavior on real deployments.
 - Keep releases repository-only until the stabilization gate is explicitly accepted.
 
-## v0.2 — controlled compaction preview
+## v0.2 — security-hardening preview
 
-- Enable automatic job claiming behind an explicit configuration gate.
+- Add database encryption at rest, key creation/rotation/recovery, and a plaintext migration
+  path.
 - Provide bounded administration for status, retry, cancellation, and safe rollback.
 - Add adapter-specific evidence and declare only platforms actually verified.
 - Expand multi-version probe automation without publishing provider secrets.

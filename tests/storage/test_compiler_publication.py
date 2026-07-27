@@ -6,6 +6,7 @@ from pathlib import Path
 import pytest
 
 import astrcontinuum as ac
+from tests.storage.security_testkit import secure_repository
 
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
 TOKEN_CEILING = 10_000
@@ -56,8 +57,7 @@ def session_key() -> ac.SessionKey:
 
 def repository(data_dir: Path) -> ac.SQLiteRepository:
     factory = ac.SQLiteConnectionFactory(data_dir, busy_timeout_ms=5_000)
-    ac.SQLiteMigrator(factory).migrate()
-    return ac.SQLiteRepository(factory)
+    return secure_repository(factory)
 
 
 def capture(store: ac.SQLiteRepository, sequence: int) -> ac.EventEnvelope:
