@@ -332,6 +332,35 @@ async def test_worker_lifecycle_is_idempotent_and_wake_is_nonblocking(
 
 
 @pytest.mark.asyncio
+async def test_worker_survives_python_310_asyncio_timeout_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    instance = worker(store, ExactBackend())
+    wait_calls = 0
+
+    class LegacyAsyncioTimeout(Exception):
+        pass
+
+    async def legacy_wait_for(awaitable: object, *, timeout: float) -> None:
+        nonlocal wait_calls
+        wait_calls += 1
+        close = getattr(awaitable, "close", None)
+        if close is not None:
+            close()
+        instance._closed = True
+        raise LegacyAsyncioTimeout
+
+    monkeypatch.setattr(worker_module.asyncio, "TimeoutError", LegacyAsyncioTimeout)
+    monkeypatch.setattr(worker_module.asyncio, "wait_for", legacy_wait_for)
+
+    await instance._run()
+
+    assert wait_calls == 1
+
+
+@pytest.mark.asyncio
 async def test_worker_renews_lease_while_a_slow_model_is_compiling(
     tmp_path: Path,
 ) -> None:

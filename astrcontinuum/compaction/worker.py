@@ -347,5 +347,5 @@ class CompactionWorker:
                     self._wake_event.wait(),
                     timeout=self._config.poll_interval_seconds,
                 )
-            except TimeoutError:
+            except asyncio.TimeoutError:
                 pass
