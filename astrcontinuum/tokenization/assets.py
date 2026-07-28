@@ -42,17 +42,37 @@ ASSET_MANIFEST: Final[Mapping[str, TokenizerAsset]] = MappingProxyType(
         for encoding_name, digest in ASSET_DIGESTS.items()
     }
 )
+_LOWER_HEX_DIGITS: Final = frozenset("0123456789abcdef")
 
 
 def _invalid(code: TokenizerErrorCode) -> NoReturn:
     raise TokenizerError(code)
 
 
-def load_mergeable_ranks(path: Path, expected_digest: str) -> dict[bytes, int]:
+def _is_sha256_digest(value: object) -> bool:
+    return (
+        isinstance(value, str)
+        and len(value) == 64
+        and value.isascii()
+        and all(character in _LOWER_HEX_DIGITS for character in value)
+    )
+
+
+def load_mergeable_ranks(path: Path, asset: TokenizerAsset) -> dict[bytes, int]:
+    if (
+        not isinstance(asset, TokenizerAsset)
+        or isinstance(asset.size, bool)
+        or not isinstance(asset.size, int)
+        or asset.size < 0
+        or not _is_sha256_digest(asset.digest)
+    ):
+        _invalid(TokenizerErrorCode.TOKENIZER_ASSET_INVALID)
+
     data: bytes | None = None
     read_failure: TokenizerErrorCode | None = None
     try:
-        data = path.read_bytes()
+        with path.open("rb") as source:
+            data = source.read(asset.size + 1)
     except FileNotFoundError:
         read_failure = TokenizerErrorCode.TOKENIZER_ASSET_MISSING
     except OSError:
@@ -62,9 +82,11 @@ def load_mergeable_ranks(path: Path, expected_digest: str) -> dict[bytes, int]:
     if data is None:
         _invalid(TokenizerErrorCode.TOKENIZER_ASSET_INVALID)
 
-    if not isinstance(expected_digest, str) or not hmac.compare_digest(
+    if len(data) != asset.size:
+        _invalid(TokenizerErrorCode.TOKENIZER_ASSET_INVALID)
+    if not hmac.compare_digest(
         hashlib.sha256(data).hexdigest(),
-        expected_digest,
+        asset.digest,
     ):
         _invalid(TokenizerErrorCode.TOKENIZER_ASSET_INVALID)
 

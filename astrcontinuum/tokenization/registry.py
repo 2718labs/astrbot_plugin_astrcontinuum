@@ -136,7 +136,7 @@ class TokenizerRegistry:
 
             ranks = load_mergeable_ranks(
                 self._asset_root / spec.asset.filename,
-                spec.asset.digest,
+                spec.asset,
             )
             encoding: object | None = None
             try:

@@ -9,6 +9,7 @@ import tempfile
 import textwrap
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
+from io import BytesIO
 from pathlib import Path
 from typing import NoReturn
 
@@ -26,7 +27,12 @@ from astrcontinuum.tokenization import (
     TokenizerProfile,
     TokenizerRegistry,
 )
-from astrcontinuum.tokenization.assets import ASSET_DIGESTS, ASSET_SIZES, load_mergeable_ranks
+from astrcontinuum.tokenization.assets import (
+    ASSET_DIGESTS,
+    ASSET_SIZES,
+    TokenizerAsset,
+    load_mergeable_ranks,
+)
 
 
 @pytest.fixture
@@ -174,9 +180,14 @@ def test_bundled_assets_have_pinned_sizes_and_digests() -> None:
 
 def test_missing_asset_has_stable_content_free_error(tmp_path: Path) -> None:
     missing = tmp_path / "private" / "o200k_base.tiktoken"
+    asset = TokenizerAsset(
+        filename=missing.name,
+        digest=ASSET_DIGESTS["o200k_base"],
+        size=ASSET_SIZES["o200k_base"],
+    )
 
     with pytest.raises(TokenizerError) as raised:
-        load_mergeable_ranks(missing, ASSET_DIGESTS["o200k_base"])
+        load_mergeable_ranks(missing, asset)
 
     assert raised.value.code is TokenizerErrorCode.TOKENIZER_ASSET_MISSING
     assert raised.value.__context__ is None
@@ -188,14 +199,19 @@ def test_asset_os_error_has_no_dynamic_exception_context(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
     private_path = Path("private-os-error-asset.tiktoken")
+    asset = TokenizerAsset(
+        filename=private_path.name,
+        digest=ASSET_DIGESTS["o200k_base"],
+        size=ASSET_SIZES["o200k_base"],
+    )
 
-    def fail_read_bytes(path: Path) -> bytes:
+    def fail_open(path: Path, mode: str) -> NoReturn:
         raise OSError(f"private-os-detail:{path}")
 
-    monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+    monkeypatch.setattr(Path, "open", fail_open)
 
     with pytest.raises(TokenizerError) as raised:
-        load_mergeable_ranks(private_path, ASSET_DIGESTS["o200k_base"])
+        load_mergeable_ranks(private_path, asset)
 
     assert raised.value.code is TokenizerErrorCode.TOKENIZER_ASSET_INVALID
     assert raised.value.__context__ is None
@@ -206,10 +222,16 @@ def test_asset_os_error_has_no_dynamic_exception_context(
 
 def test_replaced_asset_has_stable_content_free_error(tmp_path: Path) -> None:
     asset = tmp_path / "private-asset.tiktoken"
-    asset.write_bytes(b"YQ== 0\n")
+    data = b"YQ== 0\n"
+    asset.write_bytes(data)
+    contract = TokenizerAsset(
+        filename=asset.name,
+        digest=ASSET_DIGESTS["o200k_base"],
+        size=len(data),
+    )
 
     with pytest.raises(TokenizerError) as raised:
-        load_mergeable_ranks(asset, ASSET_DIGESTS["o200k_base"])
+        load_mergeable_ranks(asset, contract)
 
     assert raised.value.code is TokenizerErrorCode.TOKENIZER_ASSET_INVALID
     assert "private-asset" not in str(raised.value)
@@ -233,9 +255,10 @@ def test_malformed_asset_lines_are_rejected(data: bytes, tmp_path: Path) -> None
     asset = tmp_path / "malformed.tiktoken"
     asset.write_bytes(data)
     digest = hashlib.sha256(data).hexdigest()
+    contract = TokenizerAsset(filename=asset.name, digest=digest, size=len(data))
 
     with pytest.raises(TokenizerError) as raised:
-        load_mergeable_ranks(asset, digest)
+        load_mergeable_ranks(asset, contract)
 
     assert raised.value.code is TokenizerErrorCode.TOKENIZER_ASSET_INVALID
     assert raised.value.__context__ is None
@@ -249,11 +272,129 @@ def test_valid_asset_lines_are_parsed_without_runtime_cache(tmp_path: Path) -> N
     data = b"YQ== 0\nYg== 1\n"
     asset = tmp_path / "valid.tiktoken"
     asset.write_bytes(data)
+    contract = TokenizerAsset(
+        filename=asset.name,
+        digest=hashlib.sha256(data).hexdigest(),
+        size=len(data),
+    )
 
-    assert load_mergeable_ranks(asset, hashlib.sha256(data).hexdigest()) == {
+    assert load_mergeable_ranks(asset, contract) == {
         b"a": 0,
         b"b": 1,
     }
+
+
+def test_truncated_asset_is_rejected_before_digest_acceptance(tmp_path: Path) -> None:
+    data = b"YQ== 0\n"
+    path = tmp_path / "private-truncated.tiktoken"
+    path.write_bytes(data)
+    asset = TokenizerAsset(
+        filename=path.name,
+        digest=hashlib.sha256(data).hexdigest(),
+        size=len(data) + 1,
+    )
+
+    with pytest.raises(TokenizerError) as raised:
+        load_mergeable_ranks(path, asset)
+
+    assert raised.value.code is TokenizerErrorCode.TOKENIZER_ASSET_INVALID
+    assert raised.value.__context__ is None
+    assert "private-truncated" not in str(raised.value)
+    assert str(path) not in repr(raised.value)
+
+
+def test_oversized_asset_is_rejected_even_when_full_digest_matches(tmp_path: Path) -> None:
+    expected_prefix = b"YQ== 0\n"
+    data = expected_prefix + b"Yg== 1\n"
+    path = tmp_path / "private-oversized.tiktoken"
+    path.write_bytes(data)
+    asset = TokenizerAsset(
+        filename=path.name,
+        digest=hashlib.sha256(data).hexdigest(),
+        size=len(expected_prefix),
+    )
+
+    with pytest.raises(TokenizerError) as raised:
+        load_mergeable_ranks(path, asset)
+
+    assert raised.value.code is TokenizerErrorCode.TOKENIZER_ASSET_INVALID
+    assert raised.value.__context__ is None
+    assert "private-oversized" not in str(raised.value)
+    assert str(path) not in repr(raised.value)
+
+
+def test_asset_reader_requests_only_manifest_size_plus_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    data = b"YQ== 0\nYg== 1\n"
+    path = Path("private-bounded-read.tiktoken")
+    asset = TokenizerAsset(
+        filename=path.name,
+        digest=hashlib.sha256(data).hexdigest(),
+        size=len(data),
+    )
+    read_sizes: list[int] = []
+
+    class SpyReader(BytesIO):
+        def read(self, size: int = -1) -> bytes:
+            read_sizes.append(size)
+            return super().read(size)
+
+    reader = SpyReader(data)
+
+    def bounded_open(opened_path: Path, mode: str) -> BytesIO:
+        assert opened_path == path
+        assert mode == "rb"
+        return reader
+
+    def forbid_read_bytes(opened_path: Path) -> NoReturn:
+        raise AssertionError(f"unbounded read attempted: {opened_path}")
+
+    monkeypatch.setattr(Path, "open", bounded_open)
+    monkeypatch.setattr(Path, "read_bytes", forbid_read_bytes)
+
+    assert load_mergeable_ranks(path, asset) == {b"a": 0, b"b": 1}
+    assert read_sizes == [asset.size + 1]
+
+
+@pytest.mark.parametrize(
+    "invalid_digest",
+    [
+        "0" * 63,
+        "0" * 65,
+        "A" * 64,
+        "g" * 64,
+        "é" * 64,
+    ],
+)
+def test_invalid_expected_digest_is_rejected_before_comparison(
+    invalid_digest: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import astrcontinuum.tokenization.assets as assets_module
+
+    data = b"YQ== 0\n"
+    path = tmp_path / "private-invalid-digest.tiktoken"
+    path.write_bytes(data)
+    asset = TokenizerAsset(
+        filename=path.name,
+        digest=invalid_digest,
+        size=len(data),
+    )
+
+    def forbid_compare_digest(*args: object, **kwargs: object) -> NoReturn:
+        raise AssertionError("invalid digest reached compare_digest")
+
+    monkeypatch.setattr(assets_module.hmac, "compare_digest", forbid_compare_digest)
+
+    with pytest.raises(TokenizerError) as raised:
+        load_mergeable_ranks(path, asset)
+
+    assert raised.value.code is TokenizerErrorCode.TOKENIZER_ASSET_INVALID
+    assert raised.value.__context__ is None
+    assert invalid_digest not in str(raised.value)
+    assert "private-invalid-digest" not in repr(raised.value)
 
 
 def test_registry_never_uses_network_loader_or_temp_cache(
@@ -312,8 +453,12 @@ def test_encoding_construction_failure_has_no_dynamic_exception_context(
 def test_registry_reuses_one_encoding_safely_across_threads(
     registry: TokenizerRegistry,
 ) -> None:
-    with ThreadPoolExecutor(max_workers=8) as pool:
-        counters = tuple(pool.map(lambda _: registry.counter_for(CANONICAL_O200K), range(32)))
+    def count_with_shared_encoding(_: int) -> tuple[int, int]:
+        counter = registry.counter_for(CANONICAL_O200K)
+        return counter.count_text("thread-safe"), id(counter._encoding)
 
-    assert {counter.count_text("thread-safe") for counter in counters} == {2}
-    assert len({id(counter._encoding) for counter in counters}) == 1
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        results = tuple(pool.map(count_with_shared_encoding, range(32)))
+
+    assert {count for count, _ in results} == {2}
+    assert len({encoding_id for _, encoding_id in results}) == 1
