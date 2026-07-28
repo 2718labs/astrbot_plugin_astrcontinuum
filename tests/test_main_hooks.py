@@ -84,6 +84,7 @@ class FakeStar:
 
 class FakeTextPart:
     def __init__(self, *, text: str) -> None:
+        self.type = "text"
         self.text = text
         self._no_save = False
 
@@ -887,7 +888,11 @@ async def test_budget_rejection_preserves_message_list_and_every_object_identity
     system = FakeMessage(role="system", content=system_text)
     history = FakeMessage(role="assistant", content="history")
     current = fake_user_message("current input")
+    current_content = current.content
+    assert isinstance(current_content, list)
+    current_part = current_content[0]
     messages = [system, history, current]
+    message_list = messages
     original_objects = tuple(messages)
     run_context = SimpleNamespace(messages=messages)
 
@@ -896,8 +901,13 @@ async def test_budget_rejection_preserves_message_list_and_every_object_identity
 
     state = plugin._state(event)
     assert state is not None
+    assert state.outcome is not None
+    assert state.outcome.mutation_allowed is False
+    assert messages is message_list
     assert tuple(messages) == original_objects
     assert all(actual is expected for actual, expected in zip(messages, original_objects))
+    assert current.content is current_content
+    assert current_content[0] is current_part
     assert request.conversation is original_conversation
     assert state.projected is None
     assert state.faults[-1].code == expected_code

@@ -552,10 +552,14 @@ def projection_factory_from_user_message(
             AdapterErrorCode.PROJECTION_API_UNAVAILABLE,
             AdapterStage.PROJECTION,
         )
-    text_part = next(
-        (part for part in content if isinstance(_safe_attribute(part, "text"), str)),
-        None,
-    )
+    text_part = None
+    for part in content:
+        discriminator = _safe_attribute(part, "type")
+        if type(discriminator) is not str or discriminator != "text":
+            continue
+        if isinstance(_safe_attribute(part, "text"), str):
+            text_part = part
+            break
     if text_part is None:
         _raise(
             AdapterErrorCode.PROJECTION_API_UNAVAILABLE,
@@ -600,11 +604,35 @@ def build_projection_objects(
         marked = marker()
         if marked is not None:
             part = marked
-        if getattr(part, "_no_save", False) is not True:
+        part_type = _safe_attribute(part, "type")
+        part_text = _safe_attribute(part, "text")
+        if (
+            type(part_type) is not str
+            or part_type != "text"
+            or type(part_text) is not str
+            or part_text != text
+            or _safe_attribute(part, "_no_save") is not True
+        ):
             raise TypeError
         message = factory.message_type(role="user", content=[part])
         message.__setattr__("_no_save", True)
-        if getattr(message, "_no_save", False) is not True:
+        message_role = _safe_attribute(message, "role")
+        message_content = _safe_attribute(message, "content")
+        final_part_type = _safe_attribute(part, "type")
+        final_part_text = _safe_attribute(part, "text")
+        if (
+            type(message_role) is not str
+            or message_role != "user"
+            or not isinstance(message_content, (list, tuple))
+            or len(message_content) != 1
+            or message_content[0] is not part
+            or _safe_attribute(message, "_no_save") is not True
+            or type(final_part_type) is not str
+            or final_part_type != "text"
+            or type(final_part_text) is not str
+            or final_part_text != text
+            or _safe_attribute(part, "_no_save") is not True
+        ):
             raise TypeError
     except Exception:  # noqa: BLE001 - construction details and content stay private
         return ProjectionBuild(

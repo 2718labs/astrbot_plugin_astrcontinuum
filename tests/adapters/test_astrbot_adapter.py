@@ -43,6 +43,10 @@ class FakeMessageType(str, Enum):
     FRIEND = "FriendMessage"
 
 
+class FakeContentPartType(str, Enum):
+    TEXT = "text"
+
+
 class FakeEvent:
     def __init__(
         self,
@@ -254,6 +258,7 @@ def test_tool_metadata_is_canonical_result_aware_and_bounded() -> None:
 def test_verified_projection_capability_marks_part_and_message_provider_only() -> None:
     class FakeTextPart:
         def __init__(self, *, text: str) -> None:
+            self.type = "text"
             self.text = text
             self._no_save = False
 
@@ -282,13 +287,63 @@ def test_verified_projection_capability_marks_part_and_message_provider_only() -
     assert message._no_save is True
     assert len(message.content) == 1
     assert isinstance(message.content[0], FakeTextPart)
+    assert message.content[0].type == "text"
     assert message.content[0].text == "projected context"
     assert message.content[0]._no_save is True
+    assert not hasattr(message.content[0], "signature")
+    assert not hasattr(message.content[0], "thinking")
+    assert not hasattr(message.content[0], "think")
+    assert not hasattr(message.content[0], "encrypted_content")
+
+
+def test_projection_build_accepts_a_new_certified_part_from_temp_marker() -> None:
+    class ReplacementTextPart:
+        def __init__(self, *, text: str) -> None:
+            self.type = "text"
+            self.text = text
+            self._no_save = False
+            constructed.append(self)
+
+        def mark_as_temp(self) -> ReplacementTextPart:
+            replacement = ReplacementTextPart(text=self.text)
+            replacement._no_save = True
+            return replacement
+
+    constructed: list[ReplacementTextPart] = []
+
+    class HookMessage:
+        def __init__(self, *, role: str, content: list[object]) -> None:
+            self.role = role
+            self.content = content
+            self._no_save = False
+
+    native = HookMessage(
+        role="user",
+        content=[ReplacementTextPart(text="native current input")],
+    )
+    factory = projection_factory_from_user_message(native)
+    constructed.clear()
+
+    built = build_projection_objects("exact projected text", factory)
+
+    assert built.fault is None
+    assert len(built.objects) == 1
+    assert len(constructed) == 2
+    constructed_part, replacement_part = constructed
+    projected = built.objects[0]
+    assert isinstance(projected, HookMessage)
+    assert projected.content == [replacement_part]
+    assert projected.content[0] is replacement_part
+    assert replacement_part is not constructed_part
+    assert replacement_part.type == "text"
+    assert replacement_part.text == "exact projected text"
+    assert replacement_part._no_save is True
 
 
 def test_projection_factory_is_derived_from_hook_objects_without_core_imports() -> None:
     class HookTextPart:
         def __init__(self, *, text: str) -> None:
+            self.type = "text"
             self.text = text
             self._no_save = False
 
@@ -328,6 +383,191 @@ def test_projection_factory_is_derived_from_hook_objects_without_core_imports() 
     assert not hasattr(projected, "tool_calls")
 
 
+@pytest.mark.parametrize(
+    ("unsafe_type", "set_discriminator"),
+    [
+        ("thinking", True),
+        ("think", True),
+        ("reasoning", True),
+        (FakeContentPartType.TEXT, True),
+        (None, True),
+        (None, False),
+    ],
+    ids=(
+        "thinking",
+        "think",
+        "reasoning",
+        "string-enum-text",
+        "none",
+        "missing",
+    ),
+)
+def test_projection_factory_skips_text_bearing_non_plain_parts(
+    unsafe_type: object,
+    set_discriminator: bool,
+) -> None:
+    class UnsafeTextBearingPart:
+        def __init__(self, *, text: str) -> None:
+            if set_discriminator:
+                self.type = unsafe_type
+            self.text = text
+            self._no_save = False
+
+        def mark_as_temp(self) -> UnsafeTextBearingPart:
+            self._no_save = True
+            return self
+
+    class SafeTextPart:
+        def __init__(self, *, text: str) -> None:
+            self.type = "text"
+            self.text = text
+            self._no_save = False
+
+        def mark_as_temp(self) -> SafeTextPart:
+            self._no_save = True
+            return self
+
+    class HookMessage:
+        def __init__(self, *, role: str, content: list[object]) -> None:
+            self.role = role
+            self.content = content
+            self._no_save = False
+
+    unsafe = UnsafeTextBearingPart(text="private non-text payload")
+    safe = SafeTextPart(text="native current input")
+    native = HookMessage(role="user", content=[unsafe, safe])
+
+    factory = projection_factory_from_user_message(native)
+    built = build_projection_objects("certified projected context", factory)
+
+    assert built.fault is None
+    assert len(built.objects) == 1
+    projected = built.objects[0]
+    assert isinstance(projected, HookMessage)
+    assert len(projected.content) == 1
+    assert isinstance(projected.content[0], SafeTextPart)
+    assert projected.content[0].type == "text"
+    assert projected.content[0].text == "certified projected context"
+    assert native.content == [unsafe, safe]
+    assert native.content[0] is unsafe
+    assert native.content[1] is safe
+
+
+def test_projection_factory_rejects_only_signed_thinking_parts_without_mutation() -> None:
+    signature = object()
+    encrypted_content = object()
+
+    class SignedThinkingPart:
+        def __init__(self, *, text: str) -> None:
+            self.type = "thinking"
+            self.text = text
+            self.signature = signature
+            self.encrypted_content = encrypted_content
+
+    class HookMessage:
+        def __init__(self, *, role: str, content: list[object]) -> None:
+            self.role = role
+            self.content = content
+
+    part = SignedThinkingPart(text="private reasoning")
+    content = [part]
+    native = HookMessage(role="user", content=content)
+
+    with pytest.raises(AstrBotAdapterError) as caught:
+        projection_factory_from_user_message(native)
+
+    assert caught.value.code == AdapterErrorCode.PROJECTION_API_UNAVAILABLE.value
+    assert native.content is content
+    assert content[0] is part
+    assert part.signature is signature
+    assert part.encrypted_content is encrypted_content
+    assert "private reasoning" not in repr(caught.value)
+
+
+@pytest.mark.parametrize(
+    "failure_kind",
+    ("constructor-rewrites-text", "marker-returns-thinking", "marker-rewrites-text"),
+)
+def test_projection_build_authenticates_the_final_plain_text_part(
+    failure_kind: str,
+) -> None:
+    class HookTextPart:
+        def __init__(self, *, text: str) -> None:
+            self.type = "text"
+            self.text = (
+                "private constructor rewrite"
+                if failure_kind == "constructor-rewrites-text"
+                else text
+            )
+            self._no_save = False
+
+        def mark_as_temp(self) -> object:
+            self._no_save = True
+            if failure_kind == "marker-returns-thinking":
+                return SimpleNamespace(
+                    type="thinking",
+                    text=self.text,
+                    signature=None,
+                    _no_save=True,
+                )
+            if failure_kind == "marker-rewrites-text":
+                self.text = "private marker rewrite"
+            return self
+
+    class HookMessage:
+        def __init__(self, *, role: str, content: list[object]) -> None:
+            self.role = role
+            self.content = content
+            self._no_save = False
+
+    native = HookMessage(
+        role="user",
+        content=[HookTextPart(text="native current input")],
+    )
+    factory = projection_factory_from_user_message(native)
+    built = build_projection_objects("exact projected text", factory)
+
+    assert built.objects == ()
+    assert built.fault is not None
+    assert built.fault.code == AdapterErrorCode.PROJECTION_BUILD_FAILED.value
+    assert "private" not in repr(built)
+
+
+@pytest.mark.parametrize("failure_kind", ("role", "content"))
+def test_projection_build_authenticates_the_constructed_message(
+    failure_kind: str,
+) -> None:
+    class HookTextPart:
+        def __init__(self, *, text: str) -> None:
+            self.type = "text"
+            self.text = text
+            self._no_save = False
+
+        def mark_as_temp(self) -> HookTextPart:
+            self._no_save = True
+            return self
+
+    class HookMessage:
+        def __init__(self, *, role: str, content: list[object]) -> None:
+            self.role = "assistant" if failure_kind == "role" else role
+            self.content = (
+                [HookTextPart(text="private replacement")] if failure_kind == "content" else content
+            )
+            self._no_save = False
+
+    native = object.__new__(HookMessage)
+    native.role = "user"
+    native.content = [HookTextPart(text="native current input")]
+    native._no_save = False
+    factory = projection_factory_from_user_message(native)
+    built = build_projection_objects("exact projected text", factory)
+
+    assert built.objects == ()
+    assert built.fault is not None
+    assert built.fault.code == AdapterErrorCode.PROJECTION_BUILD_FAILED.value
+    assert "private replacement" not in repr(built)
+
+
 def test_missing_or_broken_projection_capability_fails_open_without_content() -> None:
     with pytest.raises(AstrBotAdapterError) as missing:
         projection_factory_from_user_message(
@@ -339,6 +579,7 @@ def test_missing_or_broken_projection_capability_fails_open_without_content() ->
 
     class BrokenTextPart:
         def __init__(self, *, text: str) -> None:
+            self.type = "text"
             self.text = text
 
     class BrokenMessage:
