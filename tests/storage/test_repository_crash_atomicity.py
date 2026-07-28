@@ -8,7 +8,7 @@ from typing import Any
 import pytest
 
 import astrcontinuum as ac
-from astrcontinuum.storage import CanonicalMetricObservation
+from astrcontinuum.storage import ArtifactKind, CanonicalMetricObservation, TokenMetric
 from tests.storage.security_testkit import activate_test_storage, secure_repository
 
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
@@ -203,6 +203,23 @@ def publish(
         lease_epoch=job.lease_epoch,
         candidate_snapshot=snapshot,
         memberships=memberships,
+        canonical_metrics=(
+            *(
+                TokenMetric(
+                    ArtifactKind.CAPSULE,
+                    membership.capsule_id,
+                    CANONICAL_PROFILE_ID,
+                    membership.capsule.token_cost + 100,
+                )
+                for membership in memberships
+            ),
+            TokenMetric(
+                ArtifactKind.SNAPSHOT,
+                snapshot.snapshot_id,
+                CANONICAL_PROFILE_ID,
+                snapshot.token_cost + 200,
+            ),
+        ),
         token_ceiling=1_000,
         now=NOW + timedelta(minutes=1),
     )
@@ -240,6 +257,16 @@ def assert_candidate_writes_absent(
         assert connection.execute("SELECT count(*) FROM snapshots").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM snapshot_capsules").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM active_snapshots").fetchone()[0] == 0
+        assert (
+            connection.execute(
+                """
+                SELECT count(*)
+                FROM token_metrics
+                WHERE artifact_kind IN ('CAPSULE', 'SNAPSHOT')
+                """
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def pointer_conflict_setup(
@@ -441,6 +468,7 @@ def test_claim_crash_rolls_back_owner_epoch_and_attempt(tmp_path: Path) -> None:
         "publish.after_capsule",
         "publish.after_snapshot",
         "publish.after_membership",
+        "publish.after_metric",
         "publish.after_pointer",
         "publish.after_terminal",
     ),

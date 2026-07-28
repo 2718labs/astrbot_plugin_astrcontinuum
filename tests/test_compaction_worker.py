@@ -9,12 +9,21 @@ import pytest
 
 import astrcontinuum as ac
 import astrcontinuum.compaction.worker as worker_module
-from astrcontinuum.compaction import CompactionWorker, CompactionWorkerConfig
+from astrcontinuum.compaction import (
+    CompactionWorker,
+    CompactionWorkerConfig,
+    render_capsule,
+)
 from astrcontinuum.context_graph.candidate_verification import (
     CandidateVerificationError,
     CandidateVerificationErrorCode,
 )
-from astrcontinuum.storage import CanonicalMetricObservation
+from astrcontinuum.storage import (
+    ArtifactKind,
+    CanonicalMetricObservation,
+    TokenMetric,
+    TokenMetricStore,
+)
 from astrcontinuum.tokenization import CANONICAL_O200K
 
 NOW = datetime(2026, 7, 27, 4, 0, tzinfo=timezone.utc)
@@ -41,6 +50,16 @@ class FrozenClock:
 class LengthCounter:
     def count_text(self, text: str) -> int:
         return len(text)
+
+
+class RecordingFixedCounter:
+    def __init__(self, result: int) -> None:
+        self.result = result
+        self.texts: list[str] = []
+
+    def count_text(self, text: str) -> int:
+        self.texts.append(text)
+        return self.result
 
 
 class ExactBackend:
@@ -157,11 +176,15 @@ def worker(
     backend: ExactBackend,
     *,
     clock: FrozenClock | None = None,
+    canonical_counter: object | None = None,
+    metric_backfill_limit: int = 32,
 ) -> CompactionWorker:
     return CompactionWorker(
         repository=store,
         backend=backend,
         counter=LengthCounter(),
+        canonical_counter=canonical_counter or LengthCounter(),
+        canonical_profile_id=CANONICAL_O200K.profile_id,
         worker_id="worker-1",
         clock=clock or FrozenClock(NOW + timedelta(minutes=2)),
         config=CompactionWorkerConfig(
@@ -171,6 +194,7 @@ def worker(
             retry_base_seconds=10,
             retry_max_seconds=60,
             max_attempts=3,
+            metric_backfill_limit=metric_backfill_limit,
         ),
     )
 
@@ -188,6 +212,25 @@ def job_row(store: ac.SQLiteRepository, job_id: str) -> tuple[object, ...]:
         ).fetchone()
     assert row is not None
     return tuple(row)
+
+
+def read_metric(
+    store: ac.SQLiteRepository,
+    artifact_kind: ArtifactKind,
+    artifact_id: str,
+) -> TokenMetric | None:
+    metric_store = TokenMetricStore(ac.SecureCodec(TEST_KEY))
+    with store.factory.connection(read_only=True) as connection:
+        connection.execute("BEGIN")
+        try:
+            return metric_store.get_in_transaction(
+                connection,
+                artifact_kind=artifact_kind,
+                artifact_id=artifact_id,
+                tokenizer_profile_id=CANONICAL_O200K.profile_id,
+            )
+        finally:
+            connection.rollback()
 
 
 def test_fenced_compaction_view_uses_frozen_target_not_latest_journal(
@@ -250,6 +293,142 @@ async def test_worker_compiles_and_atomically_publishes_checkpoint(
     assert view.high_water_mark == 1
     assert view.delta == ()
     assert job_row(store, "job-1")[:2] == ("COMMITTED", 1)
+
+
+@pytest.mark.asyncio
+async def test_worker_backfills_event_and_publishes_post_audit_canonical_metrics(
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    session_key = key("canonical")
+    event = capture(store, session_key, 1)
+    raise_intent(store, session_key, 1, job_id="job-canonical")
+    canonical_counter = RecordingFixedCounter(1)
+
+    assert (
+        await worker(
+            store,
+            ExactBackend(),
+            canonical_counter=canonical_counter,
+        ).run_iteration()
+        is True
+    )
+
+    view = store.read_request_view(session_key)
+    assert view.snapshot is not None
+    assert view.snapshot.token_cost == len("Goal: message 1")
+    assert view.capsules[0].token_cost == len("message 1")
+    artifact_ids = (
+        (ArtifactKind.EVENT, event.event_id),
+        (ArtifactKind.CAPSULE, view.capsules[0].capsule_id),
+        (ArtifactKind.SNAPSHOT, view.snapshot.snapshot_id),
+    )
+    assert tuple(
+        read_metric(store, artifact_kind, artifact_id).token_count
+        for artifact_kind, artifact_id in artifact_ids
+    ) == (1, 1, 1)
+    assert canonical_counter.texts == [
+        event.content,
+        render_capsule(view.capsules[0]),
+        view.snapshot.rendered_context,
+    ]
+
+
+@pytest.mark.asyncio
+async def test_worker_defers_incomplete_metric_mapping_without_spending_attempt(
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    session_key = key("bounded-missing")
+    first = capture(store, session_key, 1)
+    second = capture(store, session_key, 2)
+    raise_intent(store, session_key, 2, job_id="job-bounded-missing")
+    clock = FrozenClock(NOW + timedelta(minutes=2))
+    backend = ExactBackend()
+    instance = worker(
+        store,
+        backend,
+        clock=clock,
+        canonical_counter=RecordingFixedCounter(1),
+        metric_backfill_limit=1,
+    )
+
+    assert await instance.run_iteration() is True
+
+    deferred = job_row(store, "job-bounded-missing")
+    assert deferred[0] == "RETRY_WAIT"
+    assert deferred[1] == 0
+    assert deferred[2] == "COMPILING"
+    assert deferred[3] == "TOKEN_METRIC_MISSING"
+    assert backend.requests == []
+    assert read_metric(store, ArtifactKind.EVENT, first.event_id) is not None
+    assert read_metric(store, ArtifactKind.EVENT, second.event_id) is None
+
+    clock.now += timedelta(seconds=11)
+    assert await instance.run_iteration() is True
+    assert job_row(store, "job-bounded-missing")[:2] == ("COMMITTED", 1)
+
+
+@pytest.mark.asyncio
+async def test_worker_defers_unavailable_canonical_counter_without_byte_fallback(
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    session_key = key("canonical-unavailable")
+    capture(store, session_key, 1)
+    raise_intent(store, session_key, 1, job_id="job-canonical-unavailable")
+    backend = ExactBackend()
+    instance = CompactionWorker(
+        repository=store,
+        backend=backend,
+        counter=LengthCounter(),
+        canonical_counter=None,
+        canonical_profile_id=CANONICAL_O200K.profile_id,
+        worker_id="worker-canonical-unavailable",
+        clock=FrozenClock(NOW + timedelta(minutes=2)),
+        config=CompactionWorkerConfig(
+            token_ceiling=10_000,
+            retry_base_seconds=10,
+        ),
+    )
+
+    assert await instance.run_iteration() is True
+
+    deferred = job_row(store, "job-canonical-unavailable")
+    assert deferred[:2] == ("RETRY_WAIT", 0)
+    assert deferred[3] == "TOKEN_METRIC_UNAVAILABLE"
+    assert backend.requests == []
+
+
+def test_attempt_preservation_rejects_non_metric_failures(tmp_path: Path) -> None:
+    store = repository(tmp_path)
+    session_key = key("attempt-guard")
+    capture(store, session_key, 1)
+    raise_intent(store, session_key, 1, job_id="job-attempt-guard")
+    leased = store.claim_job(
+        worker_id="worker-attempt-guard",
+        now=NOW + timedelta(minutes=2),
+        lease_expires_at=NOW + timedelta(minutes=7),
+    )
+    assert leased is not None
+
+    with pytest.raises(
+        ValueError,
+        match="^attempt preservation is limited to retryable canonical metric deferrals$",
+    ):
+        store.fail_job(
+            job_id=leased.job_id,
+            owner="worker-attempt-guard",
+            lease_epoch=leased.lease_epoch,
+            now=NOW + timedelta(minutes=2),
+            error_stage="COMPILING",
+            error_code="COMPILER_BACKEND_FAILURE",
+            error_message="COMPILER_BACKEND_FAILURE",
+            retry_at=NOW + timedelta(minutes=3),
+            preserve_attempt=True,
+        )
+
+    assert job_row(store, leased.job_id)[:2] == ("LEASED", 1)
 
 
 @pytest.mark.asyncio
@@ -365,16 +544,29 @@ async def test_worker_survives_python_310_asyncio_timeout_identity(
 
 @pytest.mark.asyncio
 async def test_worker_renews_lease_while_a_slow_model_is_compiling(
+    monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     store = repository(tmp_path)
     session_key = key("slow")
     capture(store, session_key, 1)
     raise_intent(store, session_key, 1, job_id="job-slow")
+    renewal_count = 0
+    renew_job_lease = store.renew_job_lease
+
+    def record_renewal(**kwargs: object) -> ac.CompactionJobEnvelope:
+        nonlocal renewal_count
+        renewed = renew_job_lease(**kwargs)
+        renewal_count += 1
+        return renewed
+
+    monkeypatch.setattr(store, "renew_job_lease", record_renewal)
     instance = CompactionWorker(
         repository=store,
         backend=SlowExactBackend(),
         counter=LengthCounter(),
+        canonical_counter=LengthCounter(),
+        canonical_profile_id=CANONICAL_O200K.profile_id,
         worker_id="worker-slow",
         clock=lambda: datetime.now(timezone.utc),
         config=CompactionWorkerConfig(
@@ -389,6 +581,7 @@ async def test_worker_renews_lease_while_a_slow_model_is_compiling(
 
     assert await instance.run_iteration() is True
     assert job_row(store, "job-slow")[0] == "COMMITTED"
+    assert renewal_count >= 1
 
 
 @pytest.mark.asyncio
@@ -405,6 +598,8 @@ async def test_missing_session_provider_waits_without_exhausting_attempts(
         repository=store,
         backend=backend,
         counter=LengthCounter(),
+        canonical_counter=LengthCounter(),
+        canonical_profile_id=CANONICAL_O200K.profile_id,
         worker_id="worker-provider-wait",
         clock=clock,
         config=CompactionWorkerConfig(
@@ -455,6 +650,8 @@ async def test_storage_authentication_failure_is_fatal_and_never_retried() -> No
         repository=repository,
         backend=ExactBackend(),
         counter=LengthCounter(),
+        canonical_counter=LengthCounter(),
+        canonical_profile_id=CANONICAL_O200K.profile_id,
         worker_id="worker-auth-failure",
         config=CompactionWorkerConfig(
             token_ceiling=10_000,
@@ -498,6 +695,8 @@ async def test_lease_heartbeat_authentication_failure_escapes_iteration(
         repository=store,
         backend=WaitForHeartbeatBackend(),
         counter=LengthCounter(),
+        canonical_counter=LengthCounter(),
+        canonical_profile_id=CANONICAL_O200K.profile_id,
         worker_id="worker-heartbeat-auth-failure",
         clock=lambda: datetime.now(timezone.utc),
         config=CompactionWorkerConfig(
@@ -537,6 +736,8 @@ async def test_iteration_cancellation_wins_over_heartbeat_authentication_failure
         repository=store,
         backend=BlockingBackend(),
         counter=LengthCounter(),
+        canonical_counter=LengthCounter(),
+        canonical_profile_id=CANONICAL_O200K.profile_id,
         worker_id="worker-heartbeat-cancel-race",
         config=CompactionWorkerConfig(token_ceiling=10_000),
     )
@@ -578,6 +779,8 @@ async def test_primary_storage_error_wins_over_heartbeat_authentication_failure(
         repository=store,
         backend=ExactBackend(),
         counter=LengthCounter(),
+        canonical_counter=LengthCounter(),
+        canonical_profile_id=CANONICAL_O200K.profile_id,
         worker_id="worker-heartbeat-primary-error",
         config=CompactionWorkerConfig(token_ceiling=10_000),
     )
@@ -620,6 +823,8 @@ async def test_unopposed_heartbeat_authentication_failure_reaches_fatal_callback
         repository=store,
         backend=WaitForHeartbeatBackend(),
         counter=LengthCounter(),
+        canonical_counter=LengthCounter(),
+        canonical_profile_id=CANONICAL_O200K.profile_id,
         worker_id="worker-heartbeat-fatal-callback",
         config=CompactionWorkerConfig(token_ceiling=10_000),
         fatal_storage_callback=on_fatal,
@@ -660,6 +865,8 @@ async def test_caller_exception_context_does_not_hide_heartbeat_authentication_f
         repository=store,
         backend=WaitForHeartbeatBackend(),
         counter=LengthCounter(),
+        canonical_counter=LengthCounter(),
+        canonical_profile_id=CANONICAL_O200K.profile_id,
         worker_id="worker-heartbeat-caller-exception",
         config=CompactionWorkerConfig(token_ceiling=10_000),
     )

@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 
 from ..domain.capsules import AnchorStatus, ContextCapsuleEnvelope
@@ -39,6 +39,7 @@ async def compile_candidate(
     base_snapshot: SnapshotEnvelope | None,
     base_capsules: Sequence[ContextCapsuleEnvelope],
     source_events: Sequence[EventEnvelope],
+    event_token_counts: Mapping[str, int],
     target_high_water_mark: int,
     token_ceiling: int,
     backend: CompilerBackend,
@@ -60,6 +61,7 @@ async def compile_candidate(
     )
     segments = segment(
         source_event_tuple,
+        token_counts=event_token_counts,
         config=segmenter_config,
         preferred_end_sequences=preferred_end_sequences,
     )

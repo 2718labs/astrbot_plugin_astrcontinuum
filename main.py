@@ -61,6 +61,7 @@ if TYPE_CHECKING or not __package__:
         resolve_key_material,
     )
     from astrcontinuum.storage.security import resolve_key_source
+    from astrcontinuum.tokenization import CANONICAL_O200K, TokenizerRegistry
 else:
     from .astrcontinuum.adapters import (
         AdapterFault,
@@ -108,6 +109,7 @@ else:
         resolve_key_material,
     )
     from .astrcontinuum.storage.security import resolve_key_source
+    from .astrcontinuum.tokenization import CANONICAL_O200K, TokenizerRegistry
 
 _PLUGIN_NAME = "astrbot_plugin_astrcontinuum"
 _REQUEST_STATE_KEY = "astrcontinuum.v1.request-state"
@@ -549,11 +551,17 @@ class AstrContinuumPlugin(Star):
                     providers=providers,
                     counter=self._counter,
                 )
+                try:
+                    canonical_counter = TokenizerRegistry().counter_for(CANONICAL_O200K)
+                except Exception:  # noqa: BLE001 - worker exposes only stable deferral codes
+                    canonical_counter = None
                 capability = probe_projection_capability()
                 worker = CompactionWorker(
                     repository=repository,
                     backend=backend,
                     counter=self._counter,
+                    canonical_counter=canonical_counter,
+                    canonical_profile_id=CANONICAL_O200K.profile_id,
                     worker_id=f"astrbot-{uuid.uuid4().hex}",
                     config=self._worker_config(),
                     fatal_storage_callback=self._on_worker_storage_failure,

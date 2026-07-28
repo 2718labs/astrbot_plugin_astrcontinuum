@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from itertools import islice
 
 from ..domain.events import EventEnvelope, EventType
@@ -10,11 +10,14 @@ from .types import EventSegment, SegmentBoundaryReason, SegmenterConfig
 def segment(
     events: Sequence[EventEnvelope],
     *,
+    token_counts: Mapping[str, int],
     config: SegmenterConfig,
     preferred_end_sequences: Sequence[int] = (),
 ) -> tuple[EventSegment, ...]:
     source_events = tuple(events)
     _validate_events(source_events)
+    if set(token_counts) != {event.event_id for event in source_events}:
+        raise ValueError("TOKEN_METRIC_MISSING")
     preferred_boundaries = _normalize_preferred_boundaries(
         source_events,
         preferred_end_sequences,
@@ -42,18 +45,19 @@ def segment(
         current_token_cost = 0
 
     for index, event in enumerate(source_events):
+        event_token_count = token_counts[event.event_id]
         if current and len(current) >= config.max_events_per_segment:
             close_current(SegmentBoundaryReason.MAX_EVENTS)
             deferred_preferred_boundary = False
-        elif current and current_token_cost + event.token_count > config.max_tokens_per_segment:
+        elif current and current_token_cost + event_token_count > config.max_tokens_per_segment:
             close_current(SegmentBoundaryReason.MAX_TOKENS)
             deferred_preferred_boundary = False
 
         current.append(event)
-        current_token_cost += event.token_count
+        current_token_cost += event_token_count
         is_last = index == len(source_events) - 1
 
-        if event.token_count > config.max_tokens_per_segment:
+        if event_token_count > config.max_tokens_per_segment:
             close_current(SegmentBoundaryReason.OVERSIZED_EVENT)
             deferred_preferred_boundary = False
         elif is_last:

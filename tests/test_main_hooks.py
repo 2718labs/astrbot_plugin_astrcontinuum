@@ -549,6 +549,48 @@ async def test_pressure_controls_projection_and_durable_intent(
 
 
 @pytest.mark.asyncio
+async def test_initialize_injects_dedicated_canonical_o200k_counter(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+
+    await plugin.initialize()
+
+    worker = plugin._worker
+    assert worker is not None
+    assert worker._canonical_profile_id == module.CANONICAL_O200K.profile_id
+    assert worker._canonical_counter is not plugin._counter
+    assert worker._canonical_counter.profile == module.CANONICAL_O200K
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_canonical_counter_construction_failure_never_uses_byte_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+
+    class FailingRegistry:
+        def counter_for(self, _profile: object) -> None:
+            raise RuntimeError("private tokenizer construction detail")
+
+    monkeypatch.setattr(module, "TokenizerRegistry", FailingRegistry)
+    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+
+    await plugin.initialize()
+
+    worker = plugin._worker
+    assert worker is not None
+    assert worker._canonical_profile_id == module.CANONICAL_O200K.profile_id
+    assert worker._canonical_counter is None
+    assert worker._canonical_counter is not plugin._counter
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
 async def test_soft_pressure_wakes_worker_and_publishes_checkpoint(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,

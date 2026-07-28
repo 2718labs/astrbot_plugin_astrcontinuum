@@ -113,6 +113,7 @@ def request(
         source_events=events,
         segments=ac.segment(
             events,
+            token_counts={item.event_id: item.token_count for item in events},
             config=ac.SegmenterConfig(
                 max_events_per_segment=16,
                 max_tokens_per_segment=10_000,
@@ -165,6 +166,24 @@ async def test_backend_builds_deterministic_exact_source_capsule_without_summary
     assert capsule.capsule_id == second.capsules[0].capsule_id
     assert capsule.goals[0].claim_id == second.capsules[0].goals[0].claim_id
     assert first.rendered_context == second.rendered_context
+
+
+@pytest.mark.asyncio
+async def test_render_capsule_matches_existing_backend_bytes() -> None:
+    from astrcontinuum.compaction.rendering import render_capsule
+
+    source = event(1, "继续实现后台 worker，不要改写原始历史。")
+    output = await backend(
+        RecordingGenerator(extraction(source.event_id, "不要改写原始历史"))
+    ).compile(request((source,)))
+    capsule = output.capsules[0]
+
+    assert (
+        render_capsule(capsule).encode("utf-8")
+        == (
+            f"[CAPSULE {capsule.capsule_id} EVENTS 1-1]\nGOAL: 不要改写原始历史 [source:event-1]"
+        ).encode()
+    )
 
 
 @pytest.mark.asyncio

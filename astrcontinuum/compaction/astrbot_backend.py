@@ -22,6 +22,7 @@ from ..domain import (
     SessionKey,
 )
 from ..runtime.types import TokenCounter
+from .rendering import render_capsule
 from .types import (
     CompilationRequest,
     CompilerBackendDeferred,
@@ -341,51 +342,6 @@ def _anchor(item: _AnchorSelection) -> CapsuleAnchor:
     )
 
 
-def _render_capsule(capsule: ContextCapsuleEnvelope) -> str:
-    lines = [
-        (
-            f"[CAPSULE {capsule.capsule_id} "
-            f"EVENTS {capsule.covered_event_start}-{capsule.covered_event_end}]"
-        )
-    ]
-    claim_groups = (
-        ("GOAL", capsule.goals),
-        ("CONSTRAINT", capsule.constraints),
-        ("PROGRESS", capsule.progress),
-        ("OPEN_LOOP", capsule.open_loops),
-        ("PREFERENCE", capsule.preferences),
-        ("EMOTIONAL_CONTEXT", capsule.emotional_context),
-    )
-    for label, group in claim_groups:
-        lines.extend(
-            f"{label}: {item.text} [source:{','.join(item.source_event_ids)}]"
-            for item in group
-            if item.status is SemanticStatus.ACTIVE
-        )
-    for item in capsule.decisions:
-        if item.status is not SemanticStatus.ACTIVE:
-            continue
-        lines.append(f"DECISION: {item.text} [source:{','.join(item.source_event_ids)}]")
-        if item.rationale:
-            lines.append(f"RATIONALE: {item.rationale}")
-        lines.extend(f"ALTERNATIVE: {value}" for value in item.alternatives)
-        if item.rejected_because:
-            lines.append(f"REJECTED_BECAUSE: {item.rejected_because}")
-    lines.extend(
-        (f"ENTITY: {item.canonical_name} ({item.kind}) [source:{','.join(item.source_event_ids)}]")
-        for item in capsule.entities
-    )
-    lines.extend(
-        (
-            f"EXACT_{item.anchor_type.value.upper()}: {item.exact_text} "
-            f"[source:{','.join(item.source_event_ids)}]"
-        )
-        for item in capsule.exact_anchors
-        if item.status is AnchorStatus.ACTIVE
-    )
-    return "\n".join(lines)
-
-
 def _fallback_anchor(
     segment: EventSegment,
     event_contents: dict[str, str],
@@ -438,7 +394,7 @@ class AstrBotExtractiveCompilerBackend:
             new_capsules.append(capsule)
 
         capsules = (*request.base_capsules, *new_capsules)
-        rendered_context = "\n\n".join(_render_capsule(item) for item in capsules)
+        rendered_context = "\n\n".join(render_capsule(item) for item in capsules)
         if not rendered_context:
             _invalid("EXTRACTIVE_RENDER_EMPTY")
         return CompilerOutput(
@@ -539,7 +495,7 @@ class AstrBotExtractiveCompilerBackend:
             created_at=segment.events[-1].created_at,
         )
         try:
-            token_cost = self._counter.count_text(_render_capsule(capsule))
+            token_cost = self._counter.count_text(render_capsule(capsule))
         except Exception:  # noqa: BLE001 - pluggable counter details stay private
             _invalid("EXTRACTIVE_TOKEN_COUNTER_FAILURE")
         if isinstance(token_cost, bool) or not isinstance(token_cost, int) or token_cost < 0:
