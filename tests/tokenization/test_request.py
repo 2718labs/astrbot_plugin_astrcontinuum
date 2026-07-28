@@ -229,6 +229,58 @@ def test_request_profile_ratios_drive_pressure_thresholds() -> None:
     assert outcome.mutation_allowed is False
 
 
+def test_estimated_pressure_counts_the_current_host_message_exactly_once() -> None:
+    request = workload(host_text="current")
+
+    outcome = tokenization.run_request_budget(
+        request,
+        primary=RecordingCounter(tokenization.OPENAI_O200K),
+        fallback=RecordingCounter(tokenization.BYTE_FALLBACK),
+    )
+
+    assert outcome.pressure.used == len("current")
+
+
+def test_byte_fallback_replays_the_request_local_assembly_runner() -> None:
+    runner_profiles: list[tokenization.TokenizerProfile] = []
+
+    def assembly_runner(
+        view: RequestView,
+        candidates: tuple[runtime.CandidateBlock, ...],
+        **kwargs: object,
+    ) -> runtime.AssemblyResult:
+        counter = kwargs["counter"]
+        assert isinstance(counter, tokenization.RequestScopedTokenCounter)
+        runner_profiles.append(counter.profile)
+        if counter.profile is tokenization.OPENAI_O200K:
+            raise tokenization.TokenizerError(
+                tokenization.TokenizerErrorCode.TOKENIZER_COUNT_FAILED
+            )
+        return runtime.assemble(
+            view,
+            candidates,
+            current_input=kwargs["current_input"],  # type: ignore[arg-type]
+            opaque_token_cost=kwargs["opaque_token_cost"],  # type: ignore[arg-type]
+            fixed_required_cost=kwargs["fixed_required_cost"],  # type: ignore[arg-type]
+            counter=counter,
+            config=kwargs["config"],  # type: ignore[arg-type]
+            block_token_counts=kwargs["block_token_counts"],  # type: ignore[arg-type]
+        )
+
+    outcome = tokenization.run_request_budget(
+        workload(candidate("candidate-1")),
+        primary=RecordingCounter(tokenization.OPENAI_O200K),
+        fallback=RecordingCounter(tokenization.BYTE_FALLBACK),
+        assembly_runner=assembly_runner,
+    )
+
+    assert runner_profiles == [
+        tokenization.OPENAI_O200K,
+        tokenization.BYTE_FALLBACK,
+    ]
+    assert outcome.tokenizer_mode == tokenization.TokenizerMode.BYTE_FALLBACK.value
+
+
 def test_primary_fallback_does_not_change_a_concurrent_request_profile() -> None:
     barrier = threading.Barrier(2)
     o200k = BarrierCounter(
@@ -308,6 +360,34 @@ def test_required_input_overflow_keeps_its_code_and_does_not_fallback() -> None:
     assert outcome.primary_result_discarded is False
     assert outcome.tokenizer_profile_id == tokenization.OPENAI_O200K.profile_id
     assert "candidate" in primary.calls
+    assert fallback.calls == []
+
+
+def test_context_limit_too_small_precedes_all_counts_and_fallback() -> None:
+    request = workload(candidate("candidate-1"))
+    request = replace(
+        request,
+        profile=replace(
+            request.profile,
+            context_limit=1,
+            reserved_output_and_tools=1,
+        ),
+    )
+    primary = RecordingCounter(tokenization.OPENAI_O200K, fail_on_call=1)
+    fallback = RecordingCounter(tokenization.BYTE_FALLBACK, fail_on_call=1)
+
+    outcome = tokenization.run_request_budget(
+        request,
+        primary=primary,
+        fallback=fallback,
+    )
+
+    assert outcome.stable_code == "CONTEXT_LIMIT_TOO_SMALL"
+    assert outcome.mutation_allowed is False
+    assert outcome.assembly is None
+    assert outcome.fallback_code == "NONE"
+    assert outcome.primary_result_discarded is False
+    assert primary.calls == []
     assert fallback.calls == []
 
 

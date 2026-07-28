@@ -179,13 +179,18 @@ def select_live_context(
     fixed_required_cost: int,
     counter: TokenCounter,
     budget_config: BudgetConfig,
+    block_token_counts: Mapping[str, int] | None = None,
     mode: ContextEngineMode,
     engine: ContextEngineSolver,
 ) -> LiveSelectionResult:
     """Compute deterministic fallback first and replace it only after every gate."""
 
     materialized = canonical_candidates(candidates)
-    block_token_counts = count_candidate_blocks(materialized, counter)
+    resolved_block_token_counts = (
+        count_candidate_blocks(materialized, counter)
+        if block_token_counts is None
+        else block_token_counts
+    )
     fallback = assemble(
         view,
         materialized,
@@ -194,7 +199,7 @@ def select_live_context(
         fixed_required_cost=fixed_required_cost,
         counter=counter,
         config=budget_config,
-        block_token_counts=block_token_counts,
+        block_token_counts=resolved_block_token_counts,
     )
     satisfied_event_ids: tuple[str, ...] = ()
     if view.delta:
@@ -333,7 +338,7 @@ def select_live_context(
         scored = _score_for_pack(
             closure.blocks,
             scores=_verified_scores(result, built),
-            block_token_counts=block_token_counts,
+            block_token_counts=resolved_block_token_counts,
         )
         final = assemble(
             view,
@@ -343,7 +348,7 @@ def select_live_context(
             fixed_required_cost=fixed_required_cost,
             counter=counter,
             config=budget_config,
-            block_token_counts=block_token_counts,
+            block_token_counts=resolved_block_token_counts,
         )
         final_ids = {item.block_id for item in final.selected_blocks}
         closure_ids = {item.block_id for item in closure.blocks}
@@ -401,6 +406,7 @@ def assemble_live_context(
     fixed_required_cost: int,
     counter: TokenCounter,
     budget_config: BudgetConfig,
+    block_token_counts: Mapping[str, int] | None = None,
     mode: ContextEngineMode,
 ) -> tuple[AssemblyResult, LiveContextTrace]:
     """Frozen composition API used by the AstrBot request bridge."""
@@ -413,6 +419,7 @@ def assemble_live_context(
         fixed_required_cost=fixed_required_cost,
         counter=counter,
         budget_config=budget_config,
+        block_token_counts=block_token_counts,
         mode=mode,
         engine=SparseContextEngine(),
     )

@@ -6,7 +6,7 @@ import asyncio
 import copy
 import uuid
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
@@ -20,11 +20,9 @@ if TYPE_CHECKING or not __package__:
         AstrBotAdapterError,
         AstrBotHookBridge,
         PreparedRequest,
-        ProjectionCapability,
         build_projection_objects,
-        estimate_opaque_token_cost,
         extract_host_session_key,
-        probe_projection_capability,
+        projection_factory_from_user_message,
         select_projection_boundaries,
     )
     from astrcontinuum.compaction import (
@@ -37,19 +35,19 @@ if TYPE_CHECKING or not __package__:
     from astrcontinuum.domain import EventEnvelope, SessionKey
     from astrcontinuum.runtime import (
         BudgetConfig,
-        PressureConfig,
+        BudgetInvariantError,
         PressureDecision,
         ProjectedView,
         ProjectionGuard,
         ProjectionInvariantError,
         RestoredView,
         Utf8ByteTokenCounter,
-        assess_pressure,
         guard_projection,
         project,
         restore,
         verify_native,
     )
+    from astrcontinuum.runtime.types import BudgetErrorCode
     from astrcontinuum.storage import (
         KeySource,
         SecurityErrorCode,
@@ -61,18 +59,31 @@ if TYPE_CHECKING or not __package__:
         resolve_key_material,
     )
     from astrcontinuum.storage.security import resolve_key_source
-    from astrcontinuum.tokenization import CANONICAL_O200K, TokenizerRegistry
+    from astrcontinuum.tokenization import (
+        CANONICAL_O200K,
+        OPENAI_O200K,
+        REFERENCE_O200K,
+        ContextLimitDecision,
+        ContextLimitResolver,
+        HostBudgetView,
+        RequestBudgetOutcome,
+        RequestBudgetProfile,
+        TokenizerError,
+        TokenizerErrorCode,
+        TokenizerRegistry,
+        TokenizerRoute,
+        TokenizerRouter,
+        resolve_astrbot_request_metadata,
+    )
 else:
     from .astrcontinuum.adapters import (
         AdapterFault,
         AstrBotAdapterError,
         AstrBotHookBridge,
         PreparedRequest,
-        ProjectionCapability,
         build_projection_objects,
-        estimate_opaque_token_cost,
         extract_host_session_key,
-        probe_projection_capability,
+        projection_factory_from_user_message,
         select_projection_boundaries,
     )
     from .astrcontinuum.compaction import (
@@ -85,19 +96,19 @@ else:
     from .astrcontinuum.domain import EventEnvelope, SessionKey
     from .astrcontinuum.runtime import (
         BudgetConfig,
-        PressureConfig,
+        BudgetInvariantError,
         PressureDecision,
         ProjectedView,
         ProjectionGuard,
         ProjectionInvariantError,
         RestoredView,
         Utf8ByteTokenCounter,
-        assess_pressure,
         guard_projection,
         project,
         restore,
         verify_native,
     )
+    from .astrcontinuum.runtime.types import BudgetErrorCode  # noqa: F401
     from .astrcontinuum.storage import (
         KeySource,
         SecurityErrorCode,
@@ -109,7 +120,22 @@ else:
         resolve_key_material,
     )
     from .astrcontinuum.storage.security import resolve_key_source
-    from .astrcontinuum.tokenization import CANONICAL_O200K, TokenizerRegistry
+    from .astrcontinuum.tokenization import (
+        CANONICAL_O200K,
+        OPENAI_O200K,  # noqa: F401
+        REFERENCE_O200K,  # noqa: F401
+        ContextLimitDecision,
+        ContextLimitResolver,
+        HostBudgetView,
+        RequestBudgetOutcome,
+        RequestBudgetProfile,
+        TokenizerError,
+        TokenizerErrorCode,  # noqa: F401
+        TokenizerRegistry,
+        TokenizerRoute,
+        TokenizerRouter,
+        resolve_astrbot_request_metadata,
+    )
 
 _PLUGIN_NAME = "astrbot_plugin_astrcontinuum"
 _REQUEST_STATE_KEY = "astrcontinuum.v1.request-state"
@@ -133,6 +159,7 @@ class _RequestState:
     restored: RestoredView | None = field(default=None, repr=False)
     assistant_event: EventEnvelope | None = field(default=None, repr=False)
     pressure: PressureDecision | None = None
+    outcome: RequestBudgetOutcome | None = field(default=None, repr=False)
     original_conversation: object | None = field(default=None, repr=False)
     intent_raised: bool = False
     next_tool_ordinal: int = 0
@@ -218,6 +245,40 @@ def _contains_identity(objects: tuple[object, ...], target: object) -> bool:
     return any(item is target for item in objects)
 
 
+_HOST_ATTRIBUTE_MISSING = object()
+
+
+def _host_attribute(target: object, name: str) -> object:
+    try:
+        if isinstance(target, Mapping):
+            return target.get(name, _HOST_ATTRIBUTE_MISSING)
+        return getattr(target, name, _HOST_ATTRIBUTE_MISSING)
+    except Exception:  # noqa: BLE001 - hostile Hook properties stay redacted
+        raise TypeError("host property is unavailable") from None
+
+
+def _host_texts(message: object) -> tuple[str, ...]:
+    content = _host_attribute(message, "content")
+    if content is _HOST_ATTRIBUTE_MISSING:
+        raise TypeError("host content is unavailable")
+    if isinstance(content, str):
+        return (content,)
+    if not isinstance(content, (list, tuple)):
+        return ()
+    texts: list[str] = []
+    for part in content:
+        if isinstance(part, str):
+            texts.append(part)
+            continue
+        for name in ("text", "think", "image_url", "audio_url"):
+            value = _host_attribute(part, name)
+            if value is _HOST_ATTRIBUTE_MISSING:
+                continue
+            if isinstance(value, str):
+                texts.append(value)
+    return tuple(texts)
+
+
 @register(
     "astrbot_plugin_astrcontinuum",
     "Ayleovelle",
@@ -238,10 +299,11 @@ class AstrContinuumPlugin(Star):
         self._initialize_lock = asyncio.Lock()
         self._initialized = False
         self._bridge: AstrBotHookBridge | None = None
-        self._capability: ProjectionCapability | None = None
         self._providers: SessionProviderRegistry | None = None
         self._worker: CompactionWorker | None = None
-        self._counter = Utf8ByteTokenCounter()
+        self._tokenizer_registry = TokenizerRegistry()
+        self._tokenizer_router = TokenizerRouter()
+        self._context_limit_resolver = ContextLimitResolver()
         self._context_engine_mode = self._configured_context_engine_mode()
         self._storage_status = self._initial_storage_status()
 
@@ -312,53 +374,79 @@ class AstrContinuumPlugin(Star):
             )
         return "提示：修复密钥配置后重载插件；不要在 WebUI、聊天或日志中粘贴密钥正文。"
 
-    def _budget_config(self) -> BudgetConfig:
+    def _budget_values(self) -> tuple[int, int, int, int]:
         defaults = BudgetConfig()
-        try:
-            return BudgetConfig(
-                target_input_budget=self.config.get(
-                    "target_input_budget",
-                    defaults.target_input_budget,
-                ),
-                hard_input_ceiling=self.config.get(
-                    "hard_input_ceiling",
-                    defaults.hard_input_ceiling,
-                ),
-                model_context_limit=self.config.get(
-                    "model_context_limit",
-                    defaults.model_context_limit,
-                ),
-                reserved_output_and_tools=defaults.reserved_output_and_tools,
-                safety_margin=defaults.safety_margin,
-            )
-        except (TypeError, ValueError):
+        target = self.config.get(
+            "target_input_budget",
+            defaults.target_input_budget,
+        )
+        hard = self.config.get(
+            "hard_input_ceiling",
+            defaults.hard_input_ceiling,
+        )
+        if any(
+            isinstance(value, bool) or not isinstance(value, int) or value < 1
+            for value in (target, hard)
+        ):
             logger.warning(
                 "AstrContinuum configuration fallback code=%s",
                 "BUDGET_CONFIG_INVALID",
             )
-            return defaults
+            target = defaults.target_input_budget
+            hard = defaults.hard_input_ceiling
+        return (
+            target,
+            hard,
+            defaults.reserved_output_and_tools,
+            defaults.safety_margin,
+        )
 
-    def _pressure_config(self) -> PressureConfig:
-        budget = self._budget_config()
+    def _request_profile(
+        self,
+        route: TokenizerRoute,
+        context_limit: ContextLimitDecision,
+        *,
+        model_identity: str | None,
+    ) -> RequestBudgetProfile:
+        target, hard, reserved, safety = self._budget_values()
+        compact_ratio = self.config.get("compaction_start_ratio", 0.75)
+        project_ratio = self.config.get("provider_view_switch_ratio", 0.80)
+        stable_code = (
+            context_limit.stable_code if context_limit.stable_code != "NONE" else route.stable_code
+        )
         try:
-            return PressureConfig(
-                context_limit=budget.model_context_limit,
-                reserved_output_and_tools=budget.reserved_output_and_tools,
-                compact_ratio=self.config.get("compaction_start_ratio", 0.75),
-                project_ratio=self.config.get("provider_view_switch_ratio", 0.80),
+            return RequestBudgetProfile(
+                model_identity=model_identity,
+                context_limit=context_limit.limit,
+                context_limit_source=context_limit.source,
+                tokenizer_profile=route.profile,
+                target_input_budget=target,
+                hard_input_ceiling=hard,
+                reserved_output_and_tools=reserved,
+                safety_margin=safety,
+                compaction_start_ratio=compact_ratio,
+                provider_view_switch_ratio=project_ratio,
+                stable_code=stable_code,
             )
         except (TypeError, ValueError):
             logger.warning(
                 "AstrContinuum configuration fallback code=%s",
                 "PRESSURE_CONFIG_INVALID",
             )
-            return PressureConfig(
-                context_limit=budget.model_context_limit,
-                reserved_output_and_tools=budget.reserved_output_and_tools,
+            return RequestBudgetProfile(
+                model_identity=model_identity,
+                context_limit=context_limit.limit,
+                context_limit_source=context_limit.source,
+                tokenizer_profile=route.profile,
+                target_input_budget=target,
+                hard_input_ceiling=hard,
+                reserved_output_and_tools=reserved,
+                safety_margin=safety,
+                stable_code=stable_code,
             )
 
     def _worker_config(self) -> CompactionWorkerConfig:
-        budget = self._budget_config()
+        target, hard, _reserved, _safety = self._budget_values()
         defaults = {
             "lease_seconds": 300.0,
             "poll_interval_seconds": 1.0,
@@ -369,8 +457,8 @@ class AstrContinuumPlugin(Star):
         try:
             return CompactionWorkerConfig(
                 token_ceiling=min(
-                    budget.target_input_budget,
-                    budget.hard_input_ceiling,
+                    target,
+                    hard,
                 ),
                 lease_seconds=self.config.get(
                     "worker_lease_seconds",
@@ -400,8 +488,8 @@ class AstrContinuumPlugin(Star):
             )
             return CompactionWorkerConfig(
                 token_ceiling=min(
-                    budget.target_input_budget,
-                    budget.hard_input_ceiling,
+                    target,
+                    hard,
                 ),
             )
 
@@ -472,24 +560,6 @@ class AstrContinuumPlugin(Star):
         state.original_conversation = conversation
         state.request.conversation = masked
 
-    def _project_empty(
-        self,
-        state: _RequestState,
-        messages: list[object],
-        guard: ProjectionGuard,
-    ) -> None:
-        try:
-            state.projected = project(messages, guard, ())
-        except ProjectionInvariantError as error:
-            self._restore_request_conversation(state)
-            self._record_fault(state, _projection_fault(error))
-        except Exception:  # noqa: BLE001 - host object details stay private
-            self._restore_request_conversation(state)
-            self._record_fault(
-                state,
-                _generic_fault("EMPTY_PROJECTION_FAILED", "PROJECT"),
-            )
-
     @staticmethod
     async def _close_worker_safely(worker: CompactionWorker | None) -> None:
         if worker is None:
@@ -534,10 +604,10 @@ class AstrContinuumPlugin(Star):
                     raise StorageSecurityError(SecurityErrorCode.STORAGE_MIGRATION_FAILED)
                 key_id = activation.key_id
                 repository = SQLiteRepository(factory, codec=activation.codec)
+                compatibility_counter = Utf8ByteTokenCounter()
                 bridge = AstrBotHookBridge(
                     repository,
-                    budget_config=self._budget_config(),
-                    counter=self._counter,
+                    counter_provider=self._tokenizer_registry.counter_for,
                     context_engine_mode=self._context_engine_mode,
                 )
                 provider_override = self.config.get("compaction_provider_id", "")
@@ -549,17 +619,19 @@ class AstrContinuumPlugin(Star):
                 backend = AstrBotExtractiveCompilerBackend(
                     generator=self._generate_compaction,
                     providers=providers,
-                    counter=self._counter,
+                    counter=compatibility_counter,
                 )
                 try:
-                    canonical_counter = TokenizerRegistry().counter_for(CANONICAL_O200K)
+                    canonical_counter = await asyncio.to_thread(
+                        self._tokenizer_registry.counter_for,
+                        CANONICAL_O200K,
+                    )
                 except Exception:  # noqa: BLE001 - worker exposes only stable deferral codes
                     canonical_counter = None
-                capability = probe_projection_capability()
                 worker = CompactionWorker(
                     repository=repository,
                     backend=backend,
-                    counter=self._counter,
+                    counter=compatibility_counter,
                     canonical_counter=canonical_counter,
                     canonical_profile_id=CANONICAL_O200K.profile_id,
                     worker_id=f"astrbot-{uuid.uuid4().hex}",
@@ -575,7 +647,6 @@ class AstrContinuumPlugin(Star):
                 self._bridge = None
                 self._providers = None
                 self._worker = None
-                self._capability = None
                 self._storage_status = self._locked_storage_status(
                     error.code.value,
                     key_source=key_source,
@@ -592,7 +663,6 @@ class AstrContinuumPlugin(Star):
                 self._bridge = None
                 self._providers = None
                 self._worker = None
-                self._capability = None
                 self._storage_status = self._locked_storage_status(
                     "STORAGE_STARTUP_FAILED",
                     key_source=key_source,
@@ -608,7 +678,6 @@ class AstrContinuumPlugin(Star):
             self._bridge = bridge
             self._providers = providers
             self._worker = worker
-            self._capability = capability
             self._storage_status = _StorageRuntimeStatus(
                 protection=("LOCAL_KEY_DEGRADED" if keys.local_degraded else "ACTIVE"),
                 key_source=key_source,
@@ -631,7 +700,6 @@ class AstrContinuumPlugin(Star):
             self._bridge = None
             self._providers = None
             self._worker = None
-            self._capability = None
             self._storage_status = self._locked_storage_status(error.code.value)
             self._initialized = True
             if worker is not None and worker.task is not current_task:
@@ -650,7 +718,6 @@ class AstrContinuumPlugin(Star):
         async with self._initialize_lock:
             worker = self._worker
             self._bridge = None
-            self._capability = None
             self._providers = None
             self._worker = None
             self._initialized = False
@@ -728,7 +795,24 @@ class AstrContinuumPlugin(Star):
         if bridge is None:
             return
         try:
-            state.prepared = await bridge.prepare_request(event, req)
+            metadata = resolve_astrbot_request_metadata(self.context, event, req)
+            context_limit = self._context_limit_resolver.resolve(
+                self.config.get("model_context_limit", 0),
+                provider_limit=metadata.provider_limit,
+                request_model=metadata.request_model,
+                provider_model=metadata.provider_model,
+            )
+            route = self._tokenizer_router.route(metadata.model_identity)
+            profile = self._request_profile(
+                route,
+                context_limit,
+                model_identity=metadata.model_identity,
+            )
+            state.prepared = await bridge.prepare_request(
+                event,
+                req,
+                budget_profile=profile,
+            )
             await self._remember_current_provider(event, state)
         except StorageSecurityError as error:
             await self._enter_storage_locked(error)
@@ -791,14 +875,12 @@ class AstrContinuumPlugin(Star):
 
         state = self._state(event)
         bridge = self._bridge
-        capability = self._capability
         if (
             state is None
             or state.prepared is None
             or state.guard is None
             or state.projected is not None
             or bridge is None
-            or capability is None
         ):
             return
         messages = cast(list[object], getattr(run_context, "messages", None))
@@ -815,53 +897,68 @@ class AstrContinuumPlugin(Star):
         preserved = (*guard.system_objects, *guard.current_objects)
         opaque_objects = tuple(item for item in retained if not _contains_identity(preserved, item))
         try:
-            estimated_input_usage = estimate_opaque_token_cost(tuple(messages), self._counter)
-            current_input_cost = self._counter.count_text(state.prepared.current_input)
-            state.pressure = assess_pressure(
-                trusted_token_usage=state.prepared.trusted_token_usage,
-                estimated_input_usage=estimated_input_usage,
-                current_input_cost=current_input_cost,
-                config=self._pressure_config(),
+            host_view = HostBudgetView(
+                all_host_texts=tuple(text for message in messages for text in _host_texts(message)),
+                opaque_texts=tuple(
+                    text for message in opaque_objects for text in _host_texts(message)
+                ),
+                fixed_required_texts=tuple(
+                    text for message in guard.system_objects for text in _host_texts(message)
+                ),
             )
+            outcome = await bridge.evaluate_prepared(
+                state.prepared,
+                host_budget_view=host_view,
+            )
+            state.outcome = outcome
+            state.pressure = outcome.pressure
             if not state.pressure.should_project:
                 return
-            self._mask_request_token_usage(state)
-            opaque_cost = estimate_opaque_token_cost(opaque_objects, self._counter)
-            fixed_cost = estimate_opaque_token_cost(guard.system_objects, self._counter)
-            assembly = await bridge.assemble_prepared(
-                state.prepared,
-                opaque_token_cost=opaque_cost,
-                fixed_required_cost=fixed_cost,
-            )
-            projection_objects: tuple[object, ...] = ()
-            if assembly.projected_text:
-                built = build_projection_objects(
-                    assembly.projected_text,
-                    capability,
+            if not outcome.mutation_allowed or outcome.assembly is None:
+                self._record_fault(
+                    state,
+                    _generic_fault(outcome.stable_code, "BUDGET"),
                 )
-                if built.fault is not None:
-                    self._record_fault(state, built.fault)
-                else:
-                    projection_objects = built.objects
+                return
+            current_user_message = guard.current_objects[0]
+            factory = projection_factory_from_user_message(current_user_message)
+            built = build_projection_objects(
+                outcome.assembly.projected_text,
+                factory,
+            )
+            if built.fault is not None:
+                self._record_fault(state, built.fault)
+                return
+            self._mask_request_token_usage(state)
+            projection_objects = built.objects
             state.projected = project(messages, guard, projection_objects)
         except AstrBotAdapterError as error:
+            self._restore_request_conversation(state)
             self._record_fault(state, error.fault)
-            if state.pressure is not None and state.pressure.should_project:
-                self._project_empty(state, messages, guard)
+        except TokenizerError as error:
+            self._restore_request_conversation(state)
+            self._record_fault(
+                state,
+                _generic_fault(error.code.value, "BUDGET"),
+            )
+        except BudgetInvariantError as error:
+            self._restore_request_conversation(state)
+            self._record_fault(
+                state,
+                _generic_fault(error.code, "BUDGET"),
+            )
         except ProjectionInvariantError as error:
             self._record_fault(state, _projection_fault(error))
             self._restore_request_conversation(state)
         except Exception:  # noqa: BLE001 - optional enhancement fails open
+            self._restore_request_conversation(state)
             self._record_fault(
                 state,
                 _generic_fault(
                     "PROJECTION_FAILED",
                     "PROJECT",
-                    capability_available=capability.available,
                 ),
             )
-            if state.pressure is not None and state.pressure.should_project:
-                self._project_empty(state, messages, guard)
 
     @filter.on_agent_done(priority=2000)
     async def on_agent_done_restore(

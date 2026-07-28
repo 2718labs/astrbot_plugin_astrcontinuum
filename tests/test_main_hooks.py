@@ -99,17 +99,26 @@ class FakeMessage:
         self._no_save = False
 
 
+def fake_user_message(text: str) -> FakeMessage:
+    return FakeMessage(role="user", content=[FakeTextPart(text=text)])
+
+
 class FakeEvent:
-    def __init__(self, *, message_id: str = "message-1") -> None:
+    def __init__(
+        self,
+        *,
+        message_id: str = "message-1",
+        session_id: str = "session-1",
+    ) -> None:
         self.message_obj = SimpleNamespace(
             message_id=message_id,
             timestamp=1_727_000_000,
             type=SimpleNamespace(value="FriendMessage"),
-            session_id="session-1",
+            session_id=session_id,
         )
         self._extras: dict[str, object] = {}
         self.plain_results: list[str] = []
-        self.unified_msg_origin = "umo:platform-1:session-1"
+        self.unified_msg_origin = f"umo:platform-1:{session_id}"
 
     def get_platform_id(self) -> str:
         return "platform-1"
@@ -118,7 +127,7 @@ class FakeEvent:
         return SimpleNamespace(value="FriendMessage")
 
     def get_session_id(self) -> str:
-        return "session-1"
+        return self.message_obj.session_id
 
     def get_group_id(self) -> str:
         return ""
@@ -142,13 +151,14 @@ def fake_request(
     *,
     token_usage: int = 0,
     model: object = None,
+    conversation_id: str = "conversation-1",
 ) -> SimpleNamespace:
     return SimpleNamespace(
         prompt=prompt,
         model=model,
         contexts=[FakeMessage(role="assistant", content="native context")],
         conversation=SimpleNamespace(
-            cid="conversation-1",
+            cid=conversation_id,
             persona_id=None,
             token_usage=token_usage,
         ),
@@ -504,7 +514,7 @@ async def test_pressure_controls_projection_and_durable_intent(
 
     system = FakeMessage(role="system", content="system")
     history = FakeMessage(role="assistant", content="native history")
-    current = FakeMessage(role="user", content="current input")
+    current = fake_user_message("current input")
     messages = [system, history, current]
     run_context = SimpleNamespace(messages=messages)
 
@@ -561,7 +571,8 @@ async def test_initialize_injects_dedicated_canonical_o200k_counter(
     worker = plugin._worker
     assert worker is not None
     assert worker._canonical_profile_id == module.CANONICAL_O200K.profile_id
-    assert worker._canonical_counter is not plugin._counter
+    assert not hasattr(plugin, "_counter")
+    assert worker._canonical_counter is not worker._counter
     assert worker._canonical_counter.profile == module.CANONICAL_O200K
     await plugin.terminate()
 
@@ -586,7 +597,363 @@ async def test_canonical_counter_construction_failure_never_uses_byte_fallback(
     assert worker is not None
     assert worker._canonical_profile_id == module.CANONICAL_O200K.profile_id
     assert worker._canonical_counter is None
-    assert worker._canonical_counter is not plugin._counter
+    assert not hasattr(plugin, "_counter")
+    await plugin.terminate()
+
+
+@pytest.mark.parametrize(
+    (
+        "request_model",
+        "provider_model",
+        "provider_limit",
+        "configured_limit",
+        "expected_limit",
+        "expected_source",
+        "expected_profile_id",
+    ),
+    [
+        (
+            "gpt-4o",
+            "gpt-4o",
+            262_144,
+            0,
+            262_144,
+            "AUTO_ASTRBOT",
+            "openai-o200k_base-v1",
+        ),
+        (
+            "gpt-4o",
+            "gpt-3.5-turbo",
+            1_000_000,
+            0,
+            128_000,
+            "AUTO_SAFE_FALLBACK",
+            "openai-o200k_base-v1",
+        ),
+        (
+            None,
+            None,
+            None,
+            0,
+            128_000,
+            "AUTO_SAFE_FALLBACK",
+            "reference-o200k-v1",
+        ),
+        (
+            "MiniMax-Text-01",
+            "provider-default",
+            32_000,
+            90_000,
+            90_000,
+            "MANUAL",
+            "reference-o200k-v1",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_request_metadata_routes_one_immutable_profile_before_capture(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    request_model: str | None,
+    provider_model: str | None,
+    provider_limit: int | None,
+    configured_limit: int,
+    expected_limit: int,
+    expected_source: str,
+    expected_profile_id: str,
+) -> None:
+    provider = (
+        None
+        if provider_model is None and provider_limit is None
+        else SimpleNamespace(
+            get_model=lambda: provider_model,
+            provider_config=(
+                {} if provider_limit is None else {"max_context_tokens": provider_limit}
+            ),
+        )
+    )
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        FakeContext(provider=provider),
+        {
+            "enabled": True,
+            "model_context_limit": configured_limit,
+        },
+    )
+    await plugin.initialize()
+    event = FakeEvent(message_id=f"profile-{expected_source}")
+    request = fake_request(model=request_model)
+
+    await plugin.on_llm_request(event, request)
+
+    state = plugin._state(event)
+    assert state is not None
+    assert state.prepared is not None
+    profile = state.prepared.budget_profile
+    assert profile.model_identity == request_model
+    assert profile.context_limit == expected_limit
+    assert profile.context_limit_source.value == expected_source
+    assert profile.tokenizer_profile.profile_id == expected_profile_id
+    assert state.prepared.user_event.token_count == len(request.prompt.encode("utf-8"))
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sessions_keep_profiles_local_and_model_switch_keeps_canonical_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    providers = {
+        "umo:platform-1:session-openai": SimpleNamespace(
+            get_model=lambda: "gpt-4o",
+            provider_config={"max_context_tokens": 262_144},
+        ),
+        "umo:platform-1:session-minimax": SimpleNamespace(
+            get_model=lambda: "MiniMax-Text-01",
+            provider_config={"max_context_tokens": 1_000_000},
+        ),
+    }
+
+    class PerSessionContext(FakeContext):
+        def get_using_provider(self, *, umo: str) -> object:
+            self.using_provider_requests.append(umo)
+            return providers[umo]
+
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        PerSessionContext(),
+        {"enabled": True, "model_context_limit": 0},
+    )
+    await plugin.initialize()
+    openai_event = FakeEvent(
+        message_id="profile-openai",
+        session_id="session-openai",
+    )
+    minimax_event = FakeEvent(
+        message_id="profile-minimax",
+        session_id="session-minimax",
+    )
+    openai_request = fake_request(
+        "openai request",
+        model="gpt-4o",
+        conversation_id="conversation-openai",
+    )
+    minimax_request = fake_request(
+        "minimax request",
+        model="MiniMax-Text-01",
+        conversation_id="conversation-minimax",
+    )
+
+    await asyncio.gather(
+        plugin.on_llm_request(openai_event, openai_request),
+        plugin.on_llm_request(minimax_event, minimax_request),
+    )
+
+    openai_state = plugin._state(openai_event)
+    minimax_state = plugin._state(minimax_event)
+    assert openai_state is not None and openai_state.prepared is not None
+    assert minimax_state is not None and minimax_state.prepared is not None
+    assert openai_state.prepared.budget_profile.tokenizer_profile is module.OPENAI_O200K
+    assert minimax_state.prepared.budget_profile.tokenizer_profile is module.REFERENCE_O200K
+    assert openai_state.prepared.budget_profile.context_limit == 262_144
+    assert minimax_state.prepared.budget_profile.context_limit == 1_000_000
+
+    bridge = plugin._bridge
+    assert bridge is not None
+    first_id = openai_state.prepared.user_event.event_id
+    before = bridge.repository.read_event_token_counts(
+        openai_state.prepared.turn.session_key,
+        (first_id,),
+        profile_id=module.CANONICAL_O200K.profile_id,
+    )
+    assert first_id in before
+
+    switched_event = FakeEvent(
+        message_id="profile-openai-switched",
+        session_id="session-openai",
+    )
+    switched_request = fake_request(
+        "same session switched model",
+        model="MiniMax-Text-01",
+        conversation_id="conversation-openai",
+    )
+    await plugin.on_llm_request(switched_event, switched_request)
+    switched_state = plugin._state(switched_event)
+    assert switched_state is not None and switched_state.prepared is not None
+    assert switched_state.prepared.budget_profile.tokenizer_profile is module.REFERENCE_O200K
+    after = bridge.repository.read_event_token_counts(
+        openai_state.prepared.turn.session_key,
+        (first_id, switched_state.prepared.user_event.event_id),
+        profile_id=module.CANONICAL_O200K.profile_id,
+    )
+    assert after[first_id] == before[first_id]
+    assert switched_state.prepared.user_event.event_id in after
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_live_budget_uses_one_coarse_thread_call_and_atomic_byte_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        FakeContext(),
+        {
+            "enabled": True,
+            "model_context_limit": 100_000,
+        },
+    )
+    await plugin.initialize()
+    event = FakeEvent(message_id="one-coarse-budget")
+    request = fake_request(token_usage=60_000, model="gpt-4o")
+    await plugin.on_llm_request(event, request)
+    bridge = plugin._bridge
+    assert bridge is not None
+
+    class FailingCounter:
+        def count_text(self, _text: str) -> int:
+            raise RuntimeError("private tokenizer failure")
+
+    bridge._counter_provider = lambda _profile: FailingCounter()
+    original_to_thread = asyncio.to_thread
+    live_budget_calls = 0
+
+    async def counted_to_thread(
+        function: object,
+        /,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        nonlocal live_budget_calls
+        if getattr(function, "__name__", "") == "run_request_budget":
+            live_budget_calls += 1
+        assert callable(function)
+        return await original_to_thread(function, *args, **kwargs)
+
+    monkeypatch.setattr(module.asyncio, "to_thread", counted_to_thread)
+    system = FakeMessage(role="system", content="system")
+    history = FakeMessage(role="assistant", content="history")
+    current = fake_user_message("current input")
+    messages = [system, history, current]
+    run_context = SimpleNamespace(messages=messages)
+
+    await plugin.on_agent_begin_guard(event, run_context)
+    await plugin.on_agent_begin_project(event, run_context)
+
+    state = plugin._state(event)
+    assert state is not None
+    assert live_budget_calls == 1
+    assert state.outcome is not None
+    assert state.outcome.tokenizer_mode == "BYTE_FALLBACK"
+    assert state.outcome.fallback_code == "TOKENIZER_BYTE_FALLBACK"
+    assert state.outcome.primary_result_discarded is True
+    await plugin.terminate()
+
+
+@pytest.mark.parametrize(
+    ("context_limit", "system_text", "expected_code"),
+    [
+        (1, "system", "CONTEXT_LIMIT_TOO_SMALL"),
+        (40_000, " budget" * 20_000, "REQUIRED_INPUT_EXCEEDS_BUDGET"),
+    ],
+    ids=("context-too-small", "required-overflow"),
+)
+@pytest.mark.asyncio
+async def test_budget_rejection_preserves_message_list_and_every_object_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    context_limit: int,
+    system_text: str,
+    expected_code: str,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        FakeContext(),
+        {
+            "enabled": True,
+            "model_context_limit": context_limit,
+        },
+    )
+    await plugin.initialize()
+    event = FakeEvent(message_id=f"reject-{expected_code}")
+    request = fake_request(
+        "current input",
+        token_usage=60_000,
+        model="MiniMax-Text-01",
+    )
+    original_conversation = request.conversation
+    await plugin.on_llm_request(event, request)
+    system = FakeMessage(role="system", content=system_text)
+    history = FakeMessage(role="assistant", content="history")
+    current = fake_user_message("current input")
+    messages = [system, history, current]
+    original_objects = tuple(messages)
+    run_context = SimpleNamespace(messages=messages)
+
+    await plugin.on_agent_begin_guard(event, run_context)
+    await plugin.on_agent_begin_project(event, run_context)
+
+    state = plugin._state(event)
+    assert state is not None
+    assert tuple(messages) == original_objects
+    assert all(actual is expected for actual, expected in zip(messages, original_objects))
+    assert request.conversation is original_conversation
+    assert state.projected is None
+    assert state.faults[-1].code == expected_code
+    await plugin.terminate()
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_code"),
+    [
+        ("tokenizer", "TOKENIZER_COUNT_FAILED"),
+        ("certificate", "INTERNAL_BUDGET_INVARIANT"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_terminal_budget_failures_never_mutate_native_messages(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure_kind: str,
+    expected_code: str,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        FakeContext(),
+        {"enabled": True, "model_context_limit": 100_000},
+    )
+    await plugin.initialize()
+    event = FakeEvent(message_id=f"terminal-{failure_kind}")
+    request = fake_request(token_usage=60_000)
+    original_conversation = request.conversation
+    await plugin.on_llm_request(event, request)
+    bridge = plugin._bridge
+    assert bridge is not None
+
+    async def fail_budget(*_args: object, **_kwargs: object) -> object:
+        if failure_kind == "tokenizer":
+            raise module.TokenizerError(module.TokenizerErrorCode.TOKENIZER_COUNT_FAILED)
+        raise module.BudgetInvariantError(module.BudgetErrorCode.INTERNAL_BUDGET_INVARIANT)
+
+    monkeypatch.setattr(bridge, "evaluate_prepared", fail_budget)
+    system = FakeMessage(role="system", content="system")
+    history = FakeMessage(role="assistant", content="history")
+    current = fake_user_message("current input")
+    messages = [system, history, current]
+    original_objects = tuple(messages)
+    run_context = SimpleNamespace(messages=messages)
+
+    await plugin.on_agent_begin_guard(event, run_context)
+    await plugin.on_agent_begin_project(event, run_context)
+
+    state = plugin._state(event)
+    assert state is not None
+    assert tuple(messages) == original_objects
+    assert all(actual is expected for actual, expected in zip(messages, original_objects))
+    assert request.conversation is original_conversation
+    assert state.projected is None
+    assert state.faults[-1].code == expected_code
     await plugin.terminate()
 
 
@@ -614,7 +981,7 @@ async def test_soft_pressure_wakes_worker_and_publishes_checkpoint(
     await plugin.on_llm_request(event, request)
     system = FakeMessage(role="system", content="system")
     history = FakeMessage(role="assistant", content="native history")
-    current = FakeMessage(role="user", content="保留精确原文")
+    current = fake_user_message("保留精确原文")
     assistant = FakeMessage(role="assistant", content="已完成")
     messages = [system, history, current]
     run_context = SimpleNamespace(messages=messages)
@@ -896,7 +1263,13 @@ async def test_runtime_authentication_failure_locks_plugin_and_stops_worker(
     assert bridge is not None
     assert worker is not None
 
-    async def fail_authentication(_event: object, _request: object) -> None:
+    async def fail_authentication(
+        _event: object,
+        _request: object,
+        *,
+        budget_profile: object,
+    ) -> None:
+        del budget_profile
         raise module.StorageSecurityError(module.SecurityErrorCode.STORAGE_AUTHENTICATION_FAILED)
 
     monkeypatch.setattr(bridge, "prepare_request", fail_authentication)

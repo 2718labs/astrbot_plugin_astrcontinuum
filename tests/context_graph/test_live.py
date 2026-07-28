@@ -149,6 +149,38 @@ def test_off_mode_canonicalizes_duplicate_ids_before_counting_and_fallback() -> 
     assert duplicate.text not in counter.texts
 
 
+def test_validated_block_counts_are_reused_without_counting_candidates_again() -> None:
+    class RecordingCounter:
+        def __init__(self) -> None:
+            self.texts: list[str] = []
+
+        def count_text(self, text: str) -> int:
+            self.texts.append(text)
+            return len(text)
+
+    alpha = candidate("alpha", text="alpha")
+    beta = candidate("beta", text="beta")
+    counter = RecordingCounter()
+
+    selected = select_live_context(
+        request_view(),
+        (alpha, beta),
+        current_input="",
+        opaque_token_cost=0,
+        fixed_required_cost=0,
+        counter=counter,
+        budget_config=budget(),
+        block_token_counts={"alpha": 5, "beta": 4},
+        mode=ContextEngineMode.OFF,
+        engine=FixedEngine(()),
+    )
+
+    assert selected.trace.outcome is EngineOutcome.OFF
+    assert alpha.text not in counter.texts
+    assert beta.text not in counter.texts
+    assert "alpha\n\nbeta" in counter.texts
+
+
 def test_off_shadow_and_fault_return_the_exact_deterministic_fallback(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

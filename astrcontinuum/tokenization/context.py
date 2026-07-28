@@ -75,7 +75,7 @@ def _safe_attribute(instance: object, name: str) -> object | None:
         return None
 
 
-async def resolve_astrbot_request_metadata(
+def resolve_astrbot_request_metadata(
     context: object,
     event: object,
     request: object,

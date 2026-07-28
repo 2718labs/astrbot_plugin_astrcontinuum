@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import inspect
 from dataclasses import FrozenInstanceError
 from types import SimpleNamespace
 
@@ -95,14 +96,17 @@ def test_auto_mode_caps_provider_limit_when_request_overrides_provider_model(
     )
 
 
-def test_auto_mode_keeps_smaller_provider_limit_on_model_mismatch() -> None:
+@pytest.mark.parametrize("provider_limit", [64_000, 32_000])
+def test_auto_mode_keeps_smaller_provider_limit_on_model_mismatch(
+    provider_limit: int,
+) -> None:
     assert ContextLimitResolver().resolve(
         configured_limit=0,
-        provider_limit=64000,
+        provider_limit=provider_limit,
         request_model="request-model",
         provider_model="provider-model",
     ) == ContextLimitDecision(
-        64000,
+        provider_limit,
         ContextLimitSource.AUTO_SAFE_FALLBACK,
         "CONTEXT_LIMIT_UNAVAILABLE",
     )
@@ -290,9 +294,25 @@ def _metadata_context(provider: object) -> SimpleNamespace:
     return SimpleNamespace(get_using_provider=lambda *, umo: provider)
 
 
-@pytest.mark.asyncio
-async def test_metadata_prefers_valid_request_model_over_provider_model() -> None:
-    metadata = await resolve_astrbot_request_metadata(
+def test_metadata_resolver_is_a_synchronous_public_read() -> None:
+    assert inspect.iscoroutinefunction(resolve_astrbot_request_metadata) is False
+
+    metadata = resolve_astrbot_request_metadata(
+        _metadata_context(_metadata_provider(model="provider-model")),
+        _metadata_event(),
+        _metadata_request("request-model"),
+    )
+
+    assert metadata == AstrBotRequestMetadata(
+        model_identity="request-model",
+        request_model="request-model",
+        provider_model="provider-model",
+        provider_limit=128_000,
+    )
+
+
+def test_metadata_prefers_valid_request_model_over_provider_model() -> None:
+    metadata = resolve_astrbot_request_metadata(
         _metadata_context(_metadata_provider(model=" provider-model ")),
         _metadata_event(),
         _metadata_request(" Request-Model "),
@@ -306,9 +326,8 @@ async def test_metadata_prefers_valid_request_model_over_provider_model() -> Non
     )
 
 
-@pytest.mark.asyncio
-async def test_metadata_falls_back_from_invalid_request_model_to_provider() -> None:
-    metadata = await resolve_astrbot_request_metadata(
+def test_metadata_falls_back_from_invalid_request_model_to_provider() -> None:
+    metadata = resolve_astrbot_request_metadata(
         _metadata_context(_metadata_provider()),
         _metadata_event(),
         _metadata_request("invalid request model"),
@@ -330,11 +349,10 @@ async def test_metadata_falls_back_from_invalid_request_model_to_provider() -> N
         SimpleNamespace(get_using_provider=lambda *, umo: None),
     ],
 )
-@pytest.mark.asyncio
-async def test_metadata_tolerates_unavailable_get_using_provider(
+def test_metadata_tolerates_unavailable_get_using_provider(
     context: object,
 ) -> None:
-    metadata = await resolve_astrbot_request_metadata(
+    metadata = resolve_astrbot_request_metadata(
         context,
         _metadata_event(),
         _metadata_request("request-model"),
@@ -348,13 +366,12 @@ async def test_metadata_tolerates_unavailable_get_using_provider(
     )
 
 
-@pytest.mark.asyncio
-async def test_metadata_tolerates_throwing_get_using_provider() -> None:
+def test_metadata_tolerates_throwing_get_using_provider() -> None:
     class ThrowingContext:
         def get_using_provider(self, *, umo: str) -> object:
             raise RuntimeError(f"SECRET-provider:{umo}")
 
-    metadata = await resolve_astrbot_request_metadata(
+    metadata = resolve_astrbot_request_metadata(
         ThrowingContext(),
         _metadata_event(),
         _metadata_request("request-model"),
@@ -376,9 +393,8 @@ async def test_metadata_tolerates_throwing_get_using_provider() -> None:
         SimpleNamespace(get_model=lambda: None, provider_config={}),
     ],
 )
-@pytest.mark.asyncio
-async def test_metadata_tolerates_unavailable_get_model(provider: object) -> None:
-    metadata = await resolve_astrbot_request_metadata(
+def test_metadata_tolerates_unavailable_get_model(provider: object) -> None:
+    metadata = resolve_astrbot_request_metadata(
         _metadata_context(provider),
         _metadata_event(),
         _metadata_request(),
@@ -388,8 +404,7 @@ async def test_metadata_tolerates_unavailable_get_model(provider: object) -> Non
     assert metadata.provider_model is None
 
 
-@pytest.mark.asyncio
-async def test_metadata_tolerates_throwing_get_model() -> None:
+def test_metadata_tolerates_throwing_get_model() -> None:
     def get_model() -> object:
         raise RuntimeError("SECRET-model")
 
@@ -398,7 +413,7 @@ async def test_metadata_tolerates_throwing_get_model() -> None:
         provider_config={"max_context_tokens": 64_000},
     )
 
-    metadata = await resolve_astrbot_request_metadata(
+    metadata = resolve_astrbot_request_metadata(
         _metadata_context(provider),
         _metadata_event(),
         _metadata_request(),
@@ -412,8 +427,7 @@ async def test_metadata_tolerates_throwing_get_model() -> None:
     "provider_config",
     [None, True, "config", 128_000, ("max_context_tokens", 128_000)],
 )
-@pytest.mark.asyncio
-async def test_metadata_requires_provider_config_mapping(
+def test_metadata_requires_provider_config_mapping(
     provider_config: object,
 ) -> None:
     provider = (
@@ -421,7 +435,7 @@ async def test_metadata_requires_provider_config_mapping(
         if provider_config is None
         else _metadata_provider(provider_config=provider_config)
     )
-    metadata = await resolve_astrbot_request_metadata(
+    metadata = resolve_astrbot_request_metadata(
         _metadata_context(provider),
         _metadata_event(),
         _metadata_request(),
@@ -442,11 +456,8 @@ async def test_metadata_requires_provider_config_mapping(
         (200_000, 200_000),
     ],
 )
-@pytest.mark.asyncio
-async def test_metadata_validates_exact_max_context_tokens(
-    limit: object, expected: int | None
-) -> None:
-    metadata = await resolve_astrbot_request_metadata(
+def test_metadata_validates_exact_max_context_tokens(limit: object, expected: int | None) -> None:
+    metadata = resolve_astrbot_request_metadata(
         _metadata_context(_metadata_provider(provider_config={"max_context_tokens": limit})),
         _metadata_event(),
         _metadata_request(),
@@ -455,8 +466,7 @@ async def test_metadata_validates_exact_max_context_tokens(
     assert metadata.provider_limit == expected
 
 
-@pytest.mark.asyncio
-async def test_metadata_tolerates_throwing_properties_and_invalid_origin() -> None:
+def test_metadata_tolerates_throwing_properties_and_invalid_origin() -> None:
     class ThrowingRequest:
         @property
         def model(self) -> object:
@@ -474,7 +484,7 @@ async def test_metadata_tolerates_throwing_properties_and_invalid_origin() -> No
         context_calls += 1
         return _metadata_provider()
 
-    metadata = await resolve_astrbot_request_metadata(
+    metadata = resolve_astrbot_request_metadata(
         SimpleNamespace(get_using_provider=get_using_provider),
         ThrowingEvent(),
         ThrowingRequest(),
@@ -484,8 +494,7 @@ async def test_metadata_tolerates_throwing_properties_and_invalid_origin() -> No
     assert context_calls == 0
 
 
-@pytest.mark.asyncio
-async def test_metadata_tolerates_throwing_provider_config_property() -> None:
+def test_metadata_tolerates_throwing_provider_config_property() -> None:
     class ThrowingProvider:
         def get_model(self) -> str:
             return "provider-model"
@@ -494,7 +503,7 @@ async def test_metadata_tolerates_throwing_provider_config_property() -> None:
         def provider_config(self) -> object:
             raise RuntimeError("SECRET-config")
 
-    metadata = await resolve_astrbot_request_metadata(
+    metadata = resolve_astrbot_request_metadata(
         _metadata_context(ThrowingProvider()),
         _metadata_event(),
         _metadata_request(),
@@ -504,8 +513,7 @@ async def test_metadata_tolerates_throwing_provider_config_property() -> None:
     assert metadata.provider_limit is None
 
 
-@pytest.mark.asyncio
-async def test_metadata_skips_provider_for_empty_or_non_string_origin() -> None:
+def test_metadata_skips_provider_for_empty_or_non_string_origin() -> None:
     calls = 0
 
     def get_using_provider(*, umo: str) -> object:
@@ -515,7 +523,7 @@ async def test_metadata_skips_provider_for_empty_or_non_string_origin() -> None:
 
     context = SimpleNamespace(get_using_provider=get_using_provider)
     for umo in ("", " ", None, 1):
-        metadata = await resolve_astrbot_request_metadata(
+        metadata = resolve_astrbot_request_metadata(
             context,
             _metadata_event(umo),
             _metadata_request("request-model"),

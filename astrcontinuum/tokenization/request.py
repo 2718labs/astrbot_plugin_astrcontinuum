@@ -1,12 +1,23 @@
 from __future__ import annotations
 
 import hashlib
+from collections.abc import Callable
 from dataclasses import replace
 from enum import Enum
 
 from ..runtime.budget import BudgetInvariantError, assemble
-from ..runtime.pressure import PressureConfig, assess_pressure
-from ..runtime.types import BudgetConfig, BudgetErrorCode, TokenCounter
+from ..runtime.pressure import (
+    PressureConfig,
+    PressureDecision,
+    PressureSource,
+    assess_pressure,
+)
+from ..runtime.types import (
+    AssemblyResult,
+    BudgetConfig,
+    BudgetErrorCode,
+    TokenCounter,
+)
 from .types import (
     BYTE_FALLBACK,
     RequestBudgetOutcome,
@@ -17,6 +28,8 @@ from .types import (
 )
 
 _TOKENIZER_BYTE_FALLBACK = "TOKENIZER_BYTE_FALLBACK"
+_CONTEXT_LIMIT_TOO_SMALL = "CONTEXT_LIMIT_TOO_SMALL"
+_AssemblyRunner = Callable[..., AssemblyResult]
 
 
 class RequestBudgetErrorCode(str, Enum):
@@ -164,10 +177,42 @@ def _validate_workload(workload: RequestBudgetWorkload) -> None:
 def _run_once(
     workload: RequestBudgetWorkload,
     counter: RequestScopedTokenCounter,
+    *,
+    assembly_runner: _AssemblyRunner,
 ) -> RequestBudgetOutcome:
     prepared = workload.prepared
     host = workload.host
     profile = workload.profile
+
+    if profile.effective_input_budget < 1:
+        trusted_usage = prepared.trusted_token_usage
+        used = trusted_usage if trusted_usage is not None and trusted_usage > 0 else 0
+        trusted = used > 0
+        return RequestBudgetOutcome(
+            pressure=PressureDecision(
+                used=used,
+                capacity=max(
+                    0,
+                    profile.context_limit - profile.reserved_output_and_tools,
+                ),
+                compact_at=0,
+                project_at=0,
+                should_compact=True,
+                should_project=True,
+                source=(
+                    PressureSource.TRUSTED_PROVIDER_USAGE
+                    if trusted
+                    else PressureSource.CONSERVATIVE_ESTIMATE
+                ),
+            ),
+            assembly=None,
+            tokenizer_profile_id=counter.profile.profile_id,
+            tokenizer_mode=counter.profile.mode.value,
+            fallback_code="NONE",
+            stable_code=_CONTEXT_LIMIT_TOO_SMALL,
+            mutation_allowed=False,
+            primary_result_discarded=False,
+        )
 
     host_cost = _sum_texts(
         counter,
@@ -190,7 +235,7 @@ def _run_once(
     )
     pressure = assess_pressure(
         trusted_token_usage=prepared.trusted_token_usage,
-        estimated_input_usage=host_cost + current_cost,
+        estimated_input_usage=host_cost,
         current_input_cost=current_cost,
         config=PressureConfig(
             context_limit=profile.context_limit,
@@ -210,7 +255,7 @@ def _run_once(
             for candidate in prepared.candidates
         }
         try:
-            assembly = assemble(
+            assembly = assembly_runner(
                 prepared.view,
                 prepared.candidates,
                 current_input=prepared.current_input,
@@ -276,6 +321,7 @@ def run_request_budget(
     *,
     primary: TokenCounter,
     fallback: TokenCounter,
+    assembly_runner: _AssemblyRunner = assemble,
 ) -> RequestBudgetOutcome:
     """Run a request atomically, replaying only tokenizer failures from source."""
 
@@ -287,6 +333,7 @@ def run_request_budget(
                 primary,
                 profile=workload.profile.tokenizer_profile,
             ),
+            assembly_runner=assembly_runner,
         )
     except TokenizerError:
         pass
@@ -299,6 +346,7 @@ def run_request_budget(
     fallback_outcome = _run_once(
         workload,
         RequestScopedTokenCounter(fallback, profile=BYTE_FALLBACK),
+        assembly_runner=assembly_runner,
     )
     return replace(
         fallback_outcome,
