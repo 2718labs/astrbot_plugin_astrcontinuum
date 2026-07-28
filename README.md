@@ -2,7 +2,7 @@
 
 English | [简体中文](./README.zh-CN.md)
 
-[![Version](https://img.shields.io/badge/version-v0.2.0-blue)](./CHANGELOG.md)
+[![Version](https://img.shields.io/badge/version-v0.2.1-blue)](./CHANGELOG.md)
 [![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.24.0%2C%3C5.0.0-orange)](https://github.com/AstrBotDevs/AstrBot)
 [![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-blue)](./LICENSE)
 [![CI](https://github.com/2718labs/astrbot_plugin_astrcontinuum/actions/workflows/ci.yml/badge.svg)](https://github.com/2718labs/astrbot_plugin_astrcontinuum/actions/workflows/ci.yml)
@@ -15,16 +15,15 @@ Delta, and temporarily projects only AstrContinuum-owned context into the provid
 The host's native message objects are restored by identity before AstrBot persists the completed
 turn.
 
-`v0.2.0` is an architectural refactor of the context runtime, not a bolt-on ranking feature.
-It preserves the authoritative Journal and reversible AstrBot hook boundary while rebuilding
-the context decision plane around request-local sparse graphs, explicit constraints, verification
-certificates, deterministic recovery, and background candidate verification.
+`v0.2.1` adds immutable request-local token profiles, offline ordinary-text BPE, automatic
+AstrBot context-window discovery, and encrypted canonical-token metrics to the verified context
+runtime introduced in `v0.2.0`. Existing byte-count compatibility values and object identities
+remain unchanged; they are not reinterpreted as live-model token counts.
 
 > [!IMPORTANT]
-> `v0.2.0` is prepared as a local playable package and is deliberately **not listed in the
-> AstrBot plugin market** yet. It combines encrypted persistence, pressure-triggered exact-source
-> compilation, a verified request-local context engine, deterministic fallback, reversible
-> projection, and content-free administrator diagnostics. Review
+> `v0.2.1` combines encrypted persistence, pressure-triggered exact-source
+> compilation, a verified request-local context engine, offline tokenizer assets, deterministic
+> fallback, reversible projection, and content-free administrator diagnostics. Review
 > [Configuration](#configuration) and [Operations and privacy](#operations-and-privacy) before
 > installing.
 
@@ -50,7 +49,7 @@ AstrContinuum separates the durable core from the AstrBot composition root. That
 possible to test persistence, concurrency, budgeting, and recovery independently, but it also
 means “implemented in the core” and “active in the installed plugin” are not the same claim.
 
-| Capability | `v0.2.0` status | Notes |
+| Capability | `v0.2.1` status | Notes |
 | --- | --- | --- |
 | Official AstrBot `PluginManager` loading | Implemented and verified | Tested against `4.24.0`, `4.24.2`, and `4.26.7` |
 | Idempotent user/assistant/tool Journal capture | Implemented and wired | Four authoritative hook/event mappings only |
@@ -63,7 +62,11 @@ means “implemented in the core” and “active in the installed plugin” are
 | Background compaction worker lifecycle | Implemented and wired | Automatic claim, renewal, retry, cancellation, and atomic publication |
 | Request-local sparse context engine | Implemented | Active, Shadow, and Off modes; unverified output cannot replace fallback |
 | Encrypted durable persistence | Implemented and wired | AES-256-GCM envelopes, locked startup, migration, rotation, and scrub |
+| Offline tokenizer profiles | Implemented and wired | Pinned `cl100k_base`/`o200k_base`; no tokenizer network or mutable runtime cache |
+| Canonical token sidecar and backfill | Implemented and wired | New artifacts commit metrics atomically; older artifacts are filled in bounded restartable batches |
+| Automatic model context window | Implemented and wired | `0` follows AstrBot metadata; unavailable metadata uses a content-free safe fallback |
 | Administrator effectiveness evidence | Implemented and wired | `/context_status` and current-session `/context_inspect`, without content |
+| Deterministic release archive | Implemented and verified | Strict allowlist, one top-level plugin directory, pinned assets, and a `<16 MiB` gate |
 | Time-travel/rollback user interface | **Not exposed yet** | Storage primitives exist; no AstrBot command or WebUI is published |
 
 The sparse engine is a derived request-time computation, not a second conversation store.
@@ -112,17 +115,21 @@ flowchart LR
     S --> V
 ```
 
-The design has three logical lanes:
+Token accounting has three independent coordinate lanes:
 
-- **Live lane:** capture → read one committed view → build fallback → activate and verify the
-  request-local graph → assemble budget → project → run provider → restore. It stays bounded,
-  non-blocking, and falls back deterministically.
-- **Compaction lane:** claim durable intent → compile immutable Capsules → validate/audit →
-  verify the candidate graph → publish with fencing and compare-and-swap. A candidate that
-  fails verification never reaches `READY_TO_COMMIT`. One worker is started and stopped by the
-  plugin lifecycle.
-- **Archive lane:** preserve immutable user, assistant, tool-call, and tool-result facts with
-  provenance.
+- **Canonical persistence lane:** `canonical-o200k-v1` records encrypted derived metrics for
+  deterministic segmentation and artifact validation. It never changes with the conversation
+  model.
+- **Live request lane:** one immutable request profile is resolved from the current AstrBot
+  Provider and request. It counts the complete provider projection, runs the Provider, and is
+  discarded after the request.
+- **Compaction lane:** the background worker resolves its own immutable profile for the selected
+  compaction Provider, recounts the final serialized input, and publishes output back into the
+  canonical lane.
+
+The append-only Journal remains the authority behind all three lanes. A tool call and its result
+are one atomic selection unit, and a request-level BYTE fallback restarts the whole count with one
+unit system instead of mixing partial results.
 
 The complete component and transaction design is documented in
 [Architecture](./docs/ARCHITECTURE.md), [Data flow](./docs/DATA_FLOW.md),
@@ -134,15 +141,15 @@ The complete component and transaction design is documented in
 The live engine turns one immutable request view into a bounded numerical problem. It does not
 ask another model to retell the conversation, and it never persists its derived graph. The
 important part is not the presence of a matrix symbol. It is the complete numerical loop:
-**discretize state → build local operators → assemble globally → restrict the admissible affine
+**encode candidates → build pairwise operators → aggregate a sparse global matrix → restrict the admissible affine
 set → eliminate unretained coordinates → solve → certify the full state**; an eligible
 reduced-solve failure may trigger one bounded full-state retry.
 
 The method is defined by four invariants: relations contribute independently, global behavior
-emerges only through sparse assembly, constraints restrict the state before solving, and every
+emerges only through sparse aggregation, constraints restrict the state before solving, and every
 reduced solution is checked against the unreduced system.
 
-### 1. State discretization and local-to-global assembly
+### 1. Candidate-vector encoding and sparse aggregation
 
 For $n$ candidate blocks, the request-local state is $x\in\mathbb R^n$. Coordinate $x_i$ is a
 continuous activation value, not a Boolean decision or a probability; thresholding happens only
@@ -151,65 +158,65 @@ after the numerical solve.
 For one bounded pair relation $r=(i,j)$, define the local extractor, signed difference vector,
 and local operator
 
-$$
+```math
 A_r=
 \begin{bmatrix}
-e_i^{\mathsf T}\\
+e_i^{\mathsf T}\\[0pt]
 e_j^{\mathsf T}
 \end{bmatrix}
 \in\mathbb R^{2\times n},
 \qquad
 g=
 \begin{bmatrix}
-1\\
+1\\[0pt]
 -1
 \end{bmatrix},
 \qquad
 k_r=w_rgg^{\mathsf T}
 =w_r
 \begin{bmatrix}
-1 & -1\\
+1 & -1\\[0pt]
 -1 & 1
 \end{bmatrix}.
-$$
+```
 
 Its local state is $x_r=A_rx$, and its local quadratic contribution is
 
-$$
+```math
 \Pi_r(x)=\frac12x_r^{\mathsf T}k_rx_r
 =\frac12w_r(x_i-x_j)^2.
-$$
+```
 
-The current deterministic builder derives $w_r$ from exact structural evidence:
+The current deterministic builder derives $w_r$ from exact lineage and placement signals:
 
-$$
+```math
 \begin{aligned}
 w_r
 ={}&1.0\,\mathbf 1_{\text{shared provenance}}
-+0.75\,\mathbf 1_{\text{same capsule}} \\
++0.75\,\mathbf 1_{\text{same capsule}} \\[0pt]
 &+0.50\,\mathbf 1_{\text{adjacent raw events}}
 +0.25\,\mathbf 1_{\text{same candidate kind}}
 +0.125\,\mathbf 1_{\text{same slot}}.
 \end{aligned}
-$$
+```
 
 Every local operator is scattered into one bounded global CSR operator:
 
-$$
+```math
 K=D+\varepsilon I+\sum_{r\in\mathcal R}A_r^{\mathsf T}k_rA_r.
-$$
+```
 
 Here $e_i\in\mathbb R^n$ is the $i$-th coordinate basis vector,
-$D=\operatorname{diag}(\delta_1,\ldots,\delta_n)$, $\delta_i\ge0$, and $\varepsilon>0$.
-The current builder uses $\delta_i=1$ and $\varepsilon=10^{-9}$. Assembly is not merely an
+$D=\mathrm{diag}(\delta_1,\ldots,\delta_n)$, $\delta_i\ge0$, and $\varepsilon>0$.
+The current builder uses $\delta_i=1$ and $\varepsilon=10^{-9}$. Sparse aggregation is not merely an
 implementation detail: for every nonzero $y$,
 
-$$
+```math
 y^{\mathsf T}Ky
 =\sum_{i=1}^{n}(\delta_i+\varepsilon)y_i^2
 +\sum_{r=(i,j)\in\mathcal R}w_r(y_i-y_j)^2
 \ge\varepsilon\lVert y\rVert_2^2>0.
-$$
+```
 
 Therefore $K$ is symmetric positive definite, and every principal block used by state
 elimination is invertible. The equivalent expanded contribution is
@@ -219,14 +226,14 @@ directly and never materializes the extractor matrices.
 For the current v0.2 builder, the request vector $q\in[0,1]^n$ is a deterministic character-set
 Jaccard activation. With $U(\cdot)$ denoting the case-folded alphanumeric unit set,
 
-$$
+```math
 q_i=
 \begin{cases}
 \dfrac{\lvert U(u)\cap U(b_i)\rvert}{\lvert U(u)\cup U(b_i)\rvert},
 & U(u)\ne\varnothing,\\[6pt]
 0, & U(u)=\varnothing.
 \end{cases}
-$$
+```
 
 Here $u$ is the current input and $b_i$ is the candidate text. This activation can evolve
 independently later; the matrix and verification contracts do not depend on a model-generated
@@ -237,56 +244,52 @@ score.
 Required blocks compile to $x_i=1$. The numerical core also supports fixed-zero and exact
 equality rows such as $x_i-x_j=0$. Let
 
-$$
+```math
 C\in\mathbb R^{m\times n},
 \quad d,\lambda\in\mathbb R^m,
 \quad
 C_{\mathrm{cert}}\in\mathbb R^{m_c\times n},
 \quad d_{\mathrm{cert}}\in\mathbb R^{m_c},
 \quad m\le m_c.
-$$
+```
 
 The compiler reduces all supported source rows to an independent solve basis while preserving
 the same admissible affine set:
 
-$$
+```math
 \mathcal F_d
 =\{x\in\mathbb R^n\mid Cx=d\}
 =\{x\in\mathbb R^n\mid
 C_{\mathrm{cert}}x=d_{\mathrm{cert}}\},
 \qquad
-\operatorname{rank}(C)=m.
-$$
+\mathrm{rank}(C)=m.
+```
 
-$C$ defines the admissible affine set before solving; it is not a post-processing checklist. With
+$C$ defines the admissible affine set before solving; it is not a post-processing checklist. The
+objective is $\Pi(x)=\frac12x^{\mathsf T}Kx-q^{\mathsf T}x$, and the activation is the
+constrained minimizer
 
-$$
-\Pi(x)=\frac12x^{\mathsf T}Kx-q^{\mathsf T}x,
-$$
-
-the activation is the constrained minimizer
-
-$$
-x^\star=\underset{x\in\mathcal F_d}{\operatorname{arg\,min}}\;\Pi(x),
-$$
+```math
+x^\star=\mathop{\mathrm{arg\,min}}_{x\in\mathcal F_d}\;\Pi(x),
+```
 
 whose first-order system is
 
-$$
+```math
 \begin{bmatrix}
-K & C^{\mathsf T} \\
+K & C^{\mathsf T} \\[0pt]
 C & 0
 \end{bmatrix}
 \begin{bmatrix}
-x \\
+x \\[0pt]
 \lambda
 \end{bmatrix}
 =
 \begin{bmatrix}
-q \\
+q \\[0pt]
 d
 \end{bmatrix}.
-$$
+```
 
 The compiler rejects contradictory rows. For a consistent compiled system, $K\succ0$ and the
 full-row-rank $C$ give a unique primal solution. The solve uses the compact basis $C$, while
@@ -298,88 +301,84 @@ certificate below.
 Let $\mathcal I=\{1,\ldots,n\}$. Map `activation.retained_coordinate_ids` to coordinate indices
 and call that set $R_{\mathrm{in}}$. For any matrix $M$, define its column support as
 
-$$
-\operatorname{csupp}(M)
+```math
+\mathrm{csupp}(M)
 =\{i\in\mathcal I\mid \exists\,\ell,\ M_{\ell i}\ne0\}.
-$$
+```
 
 The engine's initial retained set is exactly
 
-$$
+```math
 R_0=
 \begin{cases}
 R_{\mathrm{in}}\cup R_{\mathrm{required}}
-\cup\operatorname{csupp}(C_{\mathrm{cert}}),
-& R_{\mathrm{in}}\ne\varnothing,\\
+\cup\mathrm{csupp}(C_{\mathrm{cert}}),
+& R_{\mathrm{in}}\ne\varnothing,\\[0pt]
 \mathcal I, & R_{\mathrm{in}}=\varnothing,
 \end{cases}
 \qquad
 E=\mathcal I\setminus R_0.
-$$
+```
 
 In the current production builder,
-
-$$
-R_{\mathrm{in}}
-=R_{\mathrm{required}}\cup\{i\in\mathcal I\mid q_i>0\}.
-$$
+$R_{\mathrm{in}}=R_{\mathrm{required}}\cup\{i\in\mathcal I\mid q_i>0\}$.
 
 Constraint support is never allowed to enter $E$, so after reordering the coordinates
 $C=[\,C_R\;\;0\,]$. With $r=\lvert R_0\rvert$, $e=\lvert E\rvert$, $r+e=n$,
 $C_R\in\mathbb R^{m\times r}$, and $T\in\mathbb R^{e\times r}$, the full constrained system is
 therefore partitioned as
 
-$$
+```math
 \begin{bmatrix}
-K_{RR} & K_{RE} & C_R^{\mathsf T}\\
-K_{ER} & K_{EE} & 0\\
+K_{RR} & K_{RE} & C_R^{\mathsf T}\\[0pt]
+K_{ER} & K_{EE} & 0\\[0pt]
 C_R & 0 & 0
 \end{bmatrix}
 \begin{bmatrix}
-x_R\\
-x_E\\
+x_R\\[0pt]
+x_E\\[0pt]
 \lambda
 \end{bmatrix}
 =
 \begin{bmatrix}
-q_R\\
-q_E\\
+q_R\\[0pt]
+q_E\\[0pt]
 d
 \end{bmatrix}.
-$$
+```
 
 When $e>0$, $K_{EE}\succ0$, so exact block elimination is well-defined:
 
-$$
+```math
 \begin{aligned}
 K_{EE}z &= q_E, &
-K_{EE}T &= K_{ER},\\
+K_{EE}T &= K_{ER},\\[0pt]
 \widehat K &= K_{RR}-K_{RE}T, &
 \widehat q &= q_R-K_{RE}z.
 \end{aligned}
-$$
+```
 
 The Schur complement also satisfies $\widehat K\succ0$.
 
 The reduced constrained system still contains $C_R$:
 
-$$
+```math
 \begin{bmatrix}
-\widehat K & C_R^{\mathsf T}\\
+\widehat K & C_R^{\mathsf T}\\[0pt]
 C_R & 0
 \end{bmatrix}
 \begin{bmatrix}
-x_R\\
+x_R\\[0pt]
 \lambda
 \end{bmatrix}
 =
 \begin{bmatrix}
-\widehat q\\
+\widehat q\\[0pt]
 d
 \end{bmatrix},
 \qquad
 x_E=z-Tx_R.
-$$
+```
 
 The inverse notation is deliberately absent: implementation solves the $K_{EE}$ systems for
 $z$ and the columns of $T$, forms the Schur complement, solves the smaller constrained system,
@@ -398,37 +397,37 @@ residual certificates, not an estimate of the unknown forward error
 $\lVert x-x^\star\rVert$. For $M\in\mathbb R^{p\times n}$, the implementation uses the maximum
 absolute row-sum norm with an explicit empty-row convention:
 
-$$
+```math
 \lVert M\rVert_\infty=
 \begin{cases}
 \displaystyle\max_{1\le i\le p}\sum_j\lvert M_{ij}\rvert, & p>0,\\[4pt]
 0, & p=0.
 \end{cases}
-$$
+```
 
 Define the zero-safe normalization
 
-$$
+```math
 \mathcal N(r,s)=
 \begin{cases}
-0, & \lVert r\rVert_\infty=0\ \text{and}\ s=0,\\
+0, & \lVert r\rVert_\infty=0\ \text{and}\ s=0,\\[0pt]
 \dfrac{\lVert r\rVert_\infty}{s}, & s>0,\\[4pt]
 +\infty, & \text{otherwise}.
 \end{cases}
-$$
+```
 
 Then the full-order stationarity, original-constraint, and reconstruction certificates are
 
-$$
+```math
 \eta_{\mathrm{stat}}=
 \mathcal N\!\left(
 Kx-q+C^{\mathsf T}\lambda,\,
 \lVert K\rVert_\infty\lVert x\rVert_\infty+
 \lVert q\rVert_\infty+\lVert C^{\mathsf T}\lambda\rVert_\infty
 \right),
-$$
+```
 
-$$
+```math
 \eta_{\mathrm{con}}=
 \mathcal N\!\left(
 C_{\mathrm{cert}}x-d_{\mathrm{cert}},\,
@@ -441,15 +440,15 @@ C_{\mathrm{cert}}x-d_{\mathrm{cert}},\,
 K_{E,:}x-q_E,\,
 \lVert K_{E,:}\rVert_\infty\lVert x\rVert_\infty+\lVert q_E\rVert_\infty
 \right).
-$$
+```
 
 When $E=\varnothing$, $\eta_{\mathrm{rec}}=0$. With
 $S_\theta=\{i\in\mathcal I\mid x_i\ge\theta\}$ and $\theta=0.5$, the candidate may proceed only
 when
 
-$$
+```math
 \max(\eta_{\mathrm{stat}},\eta_{\mathrm{con}},\eta_{\mathrm{rec}})\le\tau
-$$
+```
 
 and required-block coverage, exact-provenance coverage, dependency closure, and final budget
 packing all pass against the same immutable request view. The default direct certificate limit is
@@ -457,9 +456,9 @@ $\tau=10^{-10}$.
 
 The live enrichment rule is intentionally bounded and exact:
 
-$$
+```math
 R_{\mathrm{retry}}=\mathcal I.
-$$
+```
 
 This retry occurs only when the first reduced attempt reports `REDUCTION_*` or `SOLVE_*` and
 $R_0\ne\mathcal I$. There is at most one retry. It enlarges the retained state but never relaxes
@@ -526,6 +525,8 @@ full identity object.
 | `snapshot_capsules` | Ordered Snapshot-to-Capsule membership |
 | `active_snapshots` | One compare-and-swap protected active pointer per session |
 | `compaction_jobs` | Durable intent, leases, fencing epochs, retries, and terminal outcomes |
+| `token_metrics` | Encrypted canonical token metrics keyed by artifact and immutable profile |
+| `token_metric_backfill_intents` | Bounded, restartable work for older artifacts missing canonical metrics |
 
 SQLite foreign keys, uniqueness constraints, transactions, savepoints, lease epochs, and active
 pointer CAS form the correctness boundary. In-process locks and queues are never required for
@@ -542,24 +543,40 @@ request view = active committed Snapshot + Journal events (coverage + 1 .. H)
 Before the first Snapshot, the reader uses a logical `EMPTY_BASE` with coverage `0`; it does not
 fabricate a database Snapshot row.
 
-The assembler computes:
+The assembler first fixes the request input ceiling and the remaining AstrContinuum budget:
 
-```text
-B_input = min(
-    target_input_budget,
-    hard_input_ceiling,
-    model_context_limit - reserved_output_and_tools
-)
+```math
+B_{\mathrm{input}} =
+\min\left(
+B_{\mathrm{target}},
+B_{\mathrm{hard}},
+C_{\mathrm{model}} - R_{\mathrm{output/tools}}
+\right);
 
-B_ac = max(
-    0,
-    B_input
-    - opaque_host_history_cost
-    - current_input_cost
-    - fixed_required_cost
-    - safety_margin
-)
+B_{\mathrm{AC}} =
+\max\left(
+0,
+B_{\mathrm{input}}
+- B_{\mathrm{host}}
+- B_{\mathrm{current}}
+- B_{\mathrm{required}}
+- B_{\mathrm{safety}}
+\right).
 ```
+
+Every profile applies its safety multiplier with integer basis points:
+
+```math
+T_p(x) =
+\left\lceil
+\frac{m_p T_{\mathrm{raw},p}(x)}{10000}
+\right\rceil;
+```
+
+Known OpenAI text encodings use `m_p = 10000`; the reference `o200k_base` profile uses
+`m_p = 11000`; BYTE fallback uses UTF-8 byte length with `m_p = 10000`. Compatibility byte fields
+remain immutable for wire compatibility, deterministic IDs, and old validators. The canonical,
+live, and compaction lanes never read those fields as current token metrics.
 
 Candidates are connected through deterministic, bounded relations derived from exact provenance,
 Capsule membership, raw-event adjacency, candidate kind, and slot. Explicit dependencies and
@@ -582,10 +599,9 @@ Checkpoint in the background while the current request still uses native AstrBot
 the default `80%`, the provider input switches to a bounded “published Checkpoint + recent raw
 events + exact evidence” view.
 
-> [!NOTE]
-> `v0.2.0` uses a conservative `Utf8ByteTokenCounter`: one UTF-8 byte equals one budget unit.
-> Configuration values are therefore safety budgets, not exact provider-token counts. A
-> provider-aware tokenizer adapter is future work.
+Before any mutation, AstrContinuum serializes the final full provider projection and recounts it
+with the request's single immutable profile. A tokenizer or asset failure discards all partial
+counts and reruns that request with `utf8-byte-v1`; it never combines BPE and byte units.
 
 Injected parts and messages are marked `_no_save`, and AstrContinuum restores the exact native
 objects by identity before finalization. If hard pressure has already been reached but assembly
@@ -595,8 +611,8 @@ the Journal and AstrBot's persisted history remain unchanged.
 
 ## Installation
 
-The plugin is not in the AstrBot market yet. Install only from this repository in a controlled
-environment.
+Install from this repository or from a verified release ZIP. AstrBot-market distribution is a
+separate maintainer process and is not performed by this repository's CI.
 
 ### Manual clone
 
@@ -630,17 +646,17 @@ AstrContinuum：运行中
 
 ## Configuration
 
-The WebUI schema intentionally exposes only settings that are connected to the `v0.2.0` Star
+The WebUI schema intentionally exposes only settings that are connected to the `v0.2.1` Star
 lifecycle.
 
 | Key | Type | Default | Effect |
 | --- | --- | ---: | --- |
 | `enabled` | `bool` | `true` | Enables durable capture and temporary projection |
 | `context_engine_mode` | `string` | `active` | `active`: use only verified graph output; `shadow`: measure but send fallback; `off`: deterministic path only |
-| `encryption_key_source` | `string` | `environment` | Read the installation key from an injected environment variable, an external file, or explicit local convenience mode |
-| `encryption_key_file` | `file` | empty | Active external key file; used only in `file` mode |
-| `encryption_previous_key_file` | `file` | empty | Previous external key file supplied only for one rotation or recovery |
-| `model_context_limit` | `int` | `200000` | Total conservative context budget |
+| `encryption_key_source` | `string` | `local` | Automatically manage a local key (recommended), or select an external file or environment secret |
+| `encryption_key_file` | `string` | empty | Absolute path to the active external key file; shown only in `file` mode |
+| `encryption_previous_key_file` | `string` | empty | Absolute path to the prior external key file; shown only in `file` mode during rotation or recovery |
+| `model_context_limit` | `int` | `0` | `0`: follow AstrBot Provider metadata; positive value: manual total context window |
 | `target_input_budget` | `int` | `130000` | Preferred input budget |
 | `hard_input_ceiling` | `int` | `150000` | Hard input ceiling |
 | `compaction_start_ratio` | `float` | `0.75` | Queue a background Checkpoint at this usable-window ratio |
@@ -653,8 +669,12 @@ limits, relation weights, and recovery bounds are deliberately not exposed as We
 Invalid budget values fall back to the built-in defaults and emit the content-free warning code
 `BUDGET_CONFIG_INVALID`.
 
+When `model_context_limit = 0`, AstrContinuum reads only bounded public AstrBot metadata. A valid
+Provider window reports `AUTO_ASTRBOT`; if it is unavailable, the request uses the safe `128000`
+window and reports `AUTO_SAFE_FALLBACK`. A positive configured value reports `MANUAL`.
+
 Reserved output/tool capacity (`32000`) and the assembly safety margin (`2000`) are fixed in
-`v0.2.0`.
+`v0.2.1`.
 
 The compaction model does not write a free-form narrative summary. It may return only event ids
 and verbatim source spans; extra fields, missing event acknowledgements, or paraphrases that
@@ -669,13 +689,14 @@ policy first.
 | `/context_status` | Administrator | Reports storage health, configured engine mode, latest content-free outcome, worker state, and aggregate counts |
 | `/context_inspect` | Administrator | Reports current-session content-free candidate, selection, reduction, residual-band, recovery, and coverage evidence |
 
-`/context_status` shows whether the engine is `ACTIVE`, `SHADOW`, or `OFF` and whether its latest
-run was verified, refined, unverified, or degraded to raw fallback. `/context_inspect` rechecks
-the complete current `SessionKey` after querying and never prints conversation text, source spans,
-entity names, provider identifiers, key material, ciphertext, or exception details.
+`/context_status` shows whether the engine is `ACTIVE`, `SHADOW`, or `OFF`, the context-window
+source, tokenizer mode/profile, BYTE fallback count, canonical metric progress, and whether the
+latest run was verified, refined, unverified, or degraded. `/context_inspect` rechecks the complete
+current `SessionKey` after querying and never prints conversation text, source spans, entity names,
+model names, provider identifiers, asset paths, key material, ciphertext, or exception details.
 
 No compaction, rollback, key-management, or destructive database-administration command is
-exposed in `v0.2.0`.
+exposed in `v0.2.1`.
 
 ## Compatibility
 
@@ -717,9 +738,11 @@ Tool values are depth- and item-bounded. Oversized metadata falls back to a cont
 truncation record.
 
 Conversation-derived durable values are authenticated and encrypted with AES-256-GCM envelopes.
-The default `environment` mode requires an installation-wide
-`ASTRCONTINUUM_MASTER_KEY` injected by the host or secret manager before AstrBot starts. For a
-manual installation, external file mode can create a key without printing it:
+The default `local` mode automatically creates and reuses a key in AstrBot's persistent plugin
+data volume, so a database file disclosed by itself cannot be directly decrypted. It does not
+protect against disclosure of the complete data volume. Use the advanced `environment` mode with
+an external secret manager, or the advanced `file` mode with an external key file, when the key
+must be isolated from that volume. External file mode can create a key without printing it:
 
 ```bash
 python -m astrcontinuum.keyctl generate --output <external-key-file>
@@ -727,9 +750,7 @@ python -m astrcontinuum.keyctl fingerprint --key-file <external-key-file>
 ```
 
 The external file must stay outside the plugin data directory. Never paste a key into WebUI,
-chat, logs, source control, service arguments, or shell command arguments. Explicit `local` mode
-still encrypts the database, but stores the key inside the same plugin data boundary and is
-reported as `LOCAL_KEY_DEGRADED`.
+chat, logs, source control, service arguments, or shell command arguments.
 
 To rotate an external key, stop AstrBot or disable the plugin, generate the new key, configure it
 as active and the key that currently unlocks the database as previous, then start or reload.
@@ -747,6 +768,12 @@ On startup, migrations are idempotent. The worker recovers and requeues expired 
 mutating committed Snapshots or Journal events. Long model calls renew their lease, and plugin
 termination cancels and awaits the tracked worker task.
 
+During a `v0.2.1` upgrade, existing encrypted byte-count fields keep their decrypted values and
+identities. The schema adds encrypted canonical metric sidecars and backfill intents; older
+artifacts are filled in bounded, restartable batches. If a batch is interrupted, restart AstrBot
+and observe `/context_status`. Do not delete the database or edit compatibility counts. Missing
+canonical metrics pause only background compaction while live AstrBot requests continue.
+
 ### Failure behavior
 
 AstrContinuum is designed to fail open on the request path:
@@ -761,9 +788,17 @@ AstrContinuum is designed to fail open on the request path:
   sending known-oversized history;
 - projection or restoration invariant failure → record a redacted code and continue;
 - invalid budget configuration → use safe defaults;
+- automatic context-window metadata unavailable → use `128000` and report
+  `AUTO_SAFE_FALLBACK`;
+- tokenizer import, asset, mapping, or count failure → restart the complete request under
+  `utf8-byte-v1` and report `TOKENIZER_BYTE_FALLBACK`;
+- canonical metric missing → queue bounded backfill and delay only background compaction;
 - failed candidate publication → keep the previous active Snapshot.
 
-Message contents, host object representations, and secrets are not written into fault logs.
+Bundled tokenizer assets are read locally and verified by size and SHA-256. Runtime tokenization
+does not access the network, create a tokenizer cache, or send additional data to a Provider.
+Message contents, model identities, asset paths, host object representations, and secrets are not
+written into fault logs.
 
 ## Development and verification
 
@@ -824,6 +859,6 @@ itself based on the official AstrBot plugin template. AstrContinuum is built for
 
 ## License
 
-Copyright © 2026 Ayleovelle and 2718labs contributors.
+Copyright © 2026 Ayleovelle.
 
 Licensed under the [GNU Affero General Public License v3.0 or later](./LICENSE).

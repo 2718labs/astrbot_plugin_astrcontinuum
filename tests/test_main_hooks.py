@@ -403,7 +403,7 @@ def test_main_declares_one_star_and_exact_hook_priorities(
         "astrbot_plugin_astrcontinuum",
         "Ayleovelle",
         "Non-blocking infinite context runtime for AstrBot",
-        "0.2.0",
+        "0.2.1",
     )
     assert plugin_type.on_llm_request.__astrbot_priority__ == 2000
     assert plugin_type.on_agent_begin_guard.__astrbot_priority__ == 2000

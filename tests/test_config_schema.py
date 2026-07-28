@@ -235,4 +235,4 @@ def test_release_version_is_consistent_across_plugin_surfaces() -> None:
         project_match.group(1),
         metadata_match.group(1),
         registered_version.value,
-    } == {"0.2.0"}
+    } == {"0.2.1"}

@@ -6,6 +6,42 @@ All notable changes to AstrContinuum are documented in this file. The format fol
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and version numbers follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.2.1 — 2026-07-28
+
+Request budgeting now uses immutable, request-local tokenizer profiles while preserving every
+existing byte-count compatibility value and identity. The deterministic plugin archive is a
+verified release artifact; AstrBot-market distribution is a separate maintainer process.
+
+### Added
+
+- Bundled, digest-pinned `cl100k_base` and `o200k_base` assets for offline ordinary-text BPE,
+  together with third-party notices and a request-level UTF-8 byte fallback.
+- Three independent token lanes: canonical persisted metrics, the live request profile, and the
+  background compaction profile. Concurrent requests never share mutable tokenizer state.
+- Encrypted canonical-token sidecars, atomic writes for new artifacts, and bounded, restartable
+  backfill for older encrypted artifacts.
+- Automatic AstrBot context-window resolution, content-free status fields, real-version probes,
+  and deterministic archive build and verification scripts.
+
+### Changed
+
+- Final provider projections are recounted as a complete request with one immutable profile.
+  Required blocks, dependency closure, and tool-call/tool-result pairs remain atomic.
+- `tiktoken>=0.12,<0.14` is now a release contract shared by package metadata and the AstrBot
+  requirements file. Runtime tokenization does not use network or mutable tokenizer caches.
+- CI covers Python 3.10 through 3.13, includes Windows Python 3.12, and runs a dedicated isolated
+  release-contract job.
+- Encryption-key management now defaults to automatic local key creation and reuse. It protects
+  a separately disclosed database file; use an external environment secret or file when the key
+  must be isolated from the complete AstrBot data volume.
+
+### Fixed
+
+- A tokenizer, asset, model-map, or count failure restarts that request with one BYTE fallback
+  profile instead of mixing units.
+- Missing canonical metrics delay only background compaction; they do not block native AstrBot
+  request handling or fall back to immutable compatibility byte fields.
+
 ## v0.2.0 — 2026-07-27
 
 Architectural refactor of the encrypted, pressure-triggered context runtime. The authoritative
@@ -112,6 +148,37 @@ AstrBot plugin market, tagged as a stable release, or published as a GitHub Rele
 本文件记录 AstrContinuum 的重要变更，格式参考
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循
 [语义化版本](https://semver.org/lang/zh-CN/)。
+
+### v0.2.1 — 2026-07-28
+
+请求预算改为使用不可变、请求局部的 tokenizer profile，同时保持既有字节计数兼容值与
+对象标识不变。确定性插件归档是已验证的发布产物；AstrBot 市场分发是独立维护者流程。
+
+#### 新增
+
+- 内置并固定摘要的 `cl100k_base`、`o200k_base` 资产，用于离线普通文本 BPE；同时加入
+  第三方声明与请求级 UTF-8 字节回退。
+- 三条彼此独立的 token 轨道：持久化规范指标、实时请求 profile、后台归约 profile。
+  并发请求之间不共享可变 tokenizer 状态。
+- 加密规范 token sidecar、新 artifact 的原子写入，以及对旧加密 artifact 有界、可恢复
+  的渐进补齐。
+- AstrBot 窗口自动解析、无内容状态字段、真实版本探针，以及确定性归档构建与验证脚本。
+
+#### 变更
+
+- Provider 投影在注入前按一个不可变 profile 对完整请求重新计数；必选块、依赖闭包以及
+  工具调用/结果对保持原子。
+- `tiktoken>=0.12,<0.14` 成为包元数据与 AstrBot requirements 共享的发布契约；运行时
+  tokenizer 不访问网络，也不使用可变 tokenizer 缓存。
+- CI 覆盖 Python 3.10 至 3.13，明确包含 Windows Python 3.12，并增加隔离发布契约任务。
+- 加密密钥管理默认自动创建并复用本地密钥，可保护单独泄漏的数据库文件；若密钥必须与
+  整个 AstrBot data 卷隔离，可改用外部环境密钥或外部文件。
+
+#### 修复
+
+- tokenizer、资产、模型映射或计数失败时，整个请求改用同一个 BYTE 回退 profile 重跑，
+  不混合不同单位。
+- 规范指标缺失只会延迟后台归约，不阻塞原生 AstrBot 请求，也不会回读不可变兼容字节字段。
 
 ### v0.2.0 — 2026-07-27
 

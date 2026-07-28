@@ -337,7 +337,7 @@ def _host_texts(message: object) -> tuple[str, ...]:
     "astrbot_plugin_astrcontinuum",
     "Ayleovelle",
     "Non-blocking infinite context runtime for AstrBot",
-    "0.2.0",
+    "0.2.1",
 )
 class AstrContinuumPlugin(Star):
     """One standards-compliant Star with reversible provider projection."""

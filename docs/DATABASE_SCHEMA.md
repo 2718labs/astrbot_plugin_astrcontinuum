@@ -1,10 +1,16 @@
-# Phase 0 Database Schema
+# v0.2.1 Database Schema
 
 ## Conventions
 
 The persistence target is SQLite. Opaque ids are non-empty text, timestamps are UTC RFC 3339 text, booleans are integer `0` or `1`, and JSON columns contain canonical JSON validated before insert. Journal sequences and Snapshot coverage indexes start at `1`. Bootstrap `EMPTY_BASE` has logical coverage `0` but is not a Snapshot Schema envelope, database row, or active pointer.
 
 Foreign keys MUST be enabled. Write transactions and constraints are the correctness boundary; process-local locks are optional optimizations only. Enum values are uppercase stable wire values. Wire envelopes are closed objects. SQLite normalization MUST round-trip every required wire field exactly and MUST NOT expose physical lookup or JSON-storage columns as extra wire properties.
+
+The active secure format stores conversation-derived text, structured envelopes, compatibility
+counts, and canonical token metrics in authenticated `acenc:v1:` AES-256-GCM envelopes. The
+logical wire values and compatibility byte counts do not change when encrypted. Physical
+`*_envelope` columns and encrypted JSON wrappers are storage details and MUST NOT appear as
+extra wire properties.
 
 Standard JSON Schema does not compare arbitrary fields across records. Permanent mechanical validators MUST enforce `covered_event_end = source_high_water_mark = compaction_jobs.target_high_water_mark` before publish; same-row arithmetic relations SHOULD also use SQLite `CHECK` constraints.
 
@@ -38,7 +44,7 @@ The canonical tuple order MUST be `platform_instance_id`, `message_type`, `sessi
 | `content` | TEXT NOT NULL |
 | `source_hook` | TEXT NOT NULL: `ON_LLM_REQUEST`, `ON_AGENT_DONE`, `ON_USING_LLM_TOOL`, or `ON_LLM_TOOL_RESPOND` |
 | `idempotency_key` | TEXT NOT NULL, non-empty |
-| `token_count` | INTEGER NOT NULL CHECK `>= 0` |
+| `token_count_envelope` | TEXT NOT NULL `acenc:v1:` envelope for the non-negative logical compatibility byte count |
 | `created_at` | TEXT NOT NULL, UTC RFC 3339 |
 
 The database or repository validation MUST enforce exactly these triples:
@@ -62,7 +68,7 @@ CREATE TABLE capsules (
     covered_event_start INTEGER NOT NULL CHECK (covered_event_start >= 1),
     covered_event_end INTEGER NOT NULL CHECK (covered_event_end >= covered_event_start),
     canonical_capsule_json TEXT NOT NULL,
-    token_cost INTEGER NOT NULL CHECK (token_cost >= 0),
+    token_cost_envelope TEXT NOT NULL,
     source_coverage REAL NOT NULL CHECK (source_coverage BETWEEN 0 AND 1),
     created_at TEXT NOT NULL,
     FOREIGN KEY (session_key_hash) REFERENCES sessions(session_key_hash)
@@ -74,6 +80,8 @@ insertion and MUST round-trip the complete embedded SessionKey and every structu
 semantic record. `source_coverage` is a physical index projection of
 `quality.source_coverage`; it is not an extra wire field.
 
+`canonical_capsule_json` is an encrypted JSON wrapper in the secure format, and
+`token_cost_envelope` holds the authenticated non-negative logical compatibility count.
 Capsule rows are immutable. A permanent validator MUST reject a Capsule when any
 top-level or nested source event id is missing, belongs to another session, or lies
 outside the Capsule coverage. Sylanne memory content is not an admissible source event.
@@ -129,9 +137,9 @@ Snapshot wire-to-SQLite mapping is normative:
 | `covered_event_end` | INTEGER NOT NULL CHECK `>= 1` |
 | `source_high_water_mark` | INTEGER NOT NULL CHECK `>= covered_event_end` |
 | `exact_anchor_ids_json` | TEXT NOT NULL, canonical JSON array |
-| `rendered_context` | TEXT NOT NULL, non-empty |
-| `token_cost` | INTEGER NOT NULL CHECK `>= 0` |
-| `audit_outcome` | TEXT NOT NULL; canonical object with `mechanical_passed`, `semantic_status`, and unique `failure_codes` |
+| `rendered_context` | TEXT NOT NULL `acenc:v1:` envelope |
+| `token_cost_envelope` | TEXT NOT NULL `acenc:v1:` envelope for the non-negative logical compatibility count |
+| `audit_outcome` | TEXT NOT NULL encrypted JSON wrapper for the logical canonical audit object |
 | `lifecycle_state` | TEXT NOT NULL CHECK value is `COMMITTED` |
 | `created_at`, `committed_at` | TEXT NOT NULL, UTC RFC 3339 |
 
@@ -181,6 +189,39 @@ The Job wire envelope requires every declared field. A nullable field MUST be pr
 
 The database MUST enforce at most one nonterminal intent chain per session, for example with a partial unique index over nonterminal states. `TX_RAISE_COMPACTION_INTENT` MUST coalesce duplicates by taking the maximum intent target.
 
+## `token_metrics`
+
+Canonical counts are derived sidecars, never replacements for compatibility wire fields:
+
+| Column | Rule |
+| --- | --- |
+| `artifact_kind` | TEXT NOT NULL: `EVENT`, `CAPSULE`, or `SNAPSHOT` |
+| `artifact_id` | TEXT NOT NULL, non-empty |
+| `tokenizer_profile_id` | TEXT NOT NULL, non-empty immutable profile identity |
+| `metric_envelope` | TEXT NOT NULL `acenc:v1:` envelope containing only schema version and non-negative token count |
+| `created_at` | TEXT NOT NULL, UTC RFC 3339 |
+
+The primary key is
+`(artifact_kind, artifact_id, tokenizer_profile_id)`. A repeated write with the same logical
+count is idempotent; a different count for that identity is `TOKEN_METRIC_CONFLICT`. The
+authenticated record key binds all three key fields, so swapping encrypted metric envelopes
+between artifacts or profiles fails authentication.
+
+## `token_metric_backfill_intents`
+
+| Column | Rule |
+| --- | --- |
+| `session_key_hash` | TEXT NOT NULL REFERENCES `sessions` |
+| `artifact_kind` | TEXT NOT NULL: `EVENT`, `CAPSULE`, or `SNAPSHOT` |
+| `artifact_id` | TEXT NOT NULL, non-empty |
+| `tokenizer_profile_id` | TEXT NOT NULL, non-empty |
+| `created_at` | TEXT NOT NULL, UTC RFC 3339 |
+
+The primary key matches `token_metrics`. Rows identify content-free missing work; they contain no
+message text or count. Backfill reads authenticated artifact text in stable bounded order,
+rechecks session ownership, writes the metric, and deletes its intent in one transaction.
+Crashes leave either the old intent or the completed metric, never an untracked partial state.
+
 ## Atomic Transactions
 
 | Name | Required atomic effects |
@@ -194,6 +235,12 @@ The database MUST enforce at most one nonterminal intent chain per session, for 
 | `TX_FAIL_JOB` | Fence by owner/epoch, persist redacted error, enter `RETRY_WAIT` or `FAILED`, clear lease |
 | `TX_PUBLISH_SNAPSHOT` | Fence and mechanically validate strict coverage advance; open one savepoint; insert new candidate Capsules, committed Snapshot, and ordered membership; bootstrap CAS-create or existing-pointer CAS-update; on same-prefix uniqueness or pointer conflict roll back every new candidate row and persist `SUPERSEDED`; in either branch preserve higher intent as follow-up against winning base |
 | `TX_RECOVER_EXPIRED_LEASES` | Requeue expired working jobs and clear owner/expiry; for expired `READY_TO_COMMIT` also clear candidate id so the next claim recompiles |
+| `TX_BACKFILL_TOKEN_METRICS` | Recheck artifact/session ownership, CAS-write a bounded canonical metric batch, and delete matching intents atomically |
+
+Each capture transaction also commits either the canonical Event metric or a matching backfill
+intent with the new event. `TX_PUBLISH_SNAPSHOT` requires and atomically commits exactly one
+canonical metric for every new Capsule and the new Snapshot. Metrics never advance the active
+pointer independently of the artifact they describe.
 
 `TX_PUBLISH_SNAPSHOT` MUST insert all newly compiled `capsules`, the committed Snapshot,
 and its ordered `snapshot_capsules` rows inside the same savepoint before active-pointer

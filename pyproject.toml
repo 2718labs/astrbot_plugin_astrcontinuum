@@ -4,7 +4,7 @@ build-backend = "uv_build"
 
 [project]
 name = "astrbot-plugin-astrcontinuum"
-version = "0.2.0"
+version = "0.2.1"
 description = "Non-blocking infinite context runtime for AstrBot"
 readme = "README.md"
 requires-python = ">=3.10"
@@ -42,7 +42,7 @@ pythonpath = ["."]
 testpaths = ["tests"]
 
 [tool.ruff]
-extend-exclude = ["*.md"]
+extend-exclude = ["*.md", "scripts/vendor"]
 line-length = 100
 target-version = "py310"
 
