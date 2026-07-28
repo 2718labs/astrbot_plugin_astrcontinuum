@@ -1,5 +1,11 @@
 from .context import ContextLimitResolver, resolve_astrbot_request_metadata
 from .registry import TokenizerRegistry
+from .request import (
+    RequestBudgetErrorCode,
+    RequestBudgetInvariantError,
+    RequestScopedTokenCounter,
+    run_request_budget,
+)
 from .router import TokenizerRouter, normalize_model_identity
 from .types import (
     BYTE_FALLBACK,
@@ -11,8 +17,12 @@ from .types import (
     AstrBotRequestMetadata,
     ContextLimitDecision,
     ContextLimitSource,
+    HostBudgetView,
+    PreparedBudgetInput,
     ProfileCounter,
+    RequestBudgetOutcome,
     RequestBudgetProfile,
+    RequestBudgetWorkload,
     TokenizerError,
     TokenizerErrorCode,
     TokenizerMode,
@@ -32,8 +42,15 @@ __all__ = [
     "ContextLimitDecision",
     "ContextLimitResolver",
     "ContextLimitSource",
+    "HostBudgetView",
+    "PreparedBudgetInput",
     "ProfileCounter",
+    "RequestBudgetErrorCode",
+    "RequestBudgetInvariantError",
+    "RequestBudgetOutcome",
     "RequestBudgetProfile",
+    "RequestBudgetWorkload",
+    "RequestScopedTokenCounter",
     "TokenizerError",
     "TokenizerErrorCode",
     "TokenizerMode",
@@ -44,4 +61,5 @@ __all__ = [
     "apply_multiplier",
     "normalize_model_identity",
     "resolve_astrbot_request_metadata",
+    "run_request_budget",
 ]
