@@ -298,6 +298,28 @@ def _local_keys(data_root: Path) -> tuple[KeyMaterial, bool]:
     return _read_key_path(path, external_root=None), _harden_local_file(path)
 
 
+def resolve_key_source(
+    config: Mapping[str, object],
+    *,
+    environ: Mapping[str, str] | None = None,
+) -> KeySource:
+    """Select an explicit source or bridge a legacy missing-source config."""
+
+    if not isinstance(config, Mapping):
+        _raise(SecurityErrorCode.STORAGE_KEY_INVALID)
+    environment = os.environ if environ is None else environ
+    if "encryption_key_source" in config:
+        source_value = config["encryption_key_source"]
+    elif ACTIVE_KEY_ENV in environment or PREVIOUS_KEY_ENV in environment:
+        source_value = KeySource.ENVIRONMENT.value
+    else:
+        source_value = KeySource.LOCAL.value
+    try:
+        return KeySource(source_value)
+    except (TypeError, ValueError):
+        _raise(SecurityErrorCode.STORAGE_KEY_INVALID)
+
+
 def resolve_key_material(
     config: Mapping[str, object],
     data_dir: str | Path,
@@ -306,17 +328,12 @@ def resolve_key_material(
 ) -> ResolvedKeyMaterial:
     """Resolve exactly the configured source without fallback."""
 
-    if not isinstance(config, Mapping):
-        _raise(SecurityErrorCode.STORAGE_KEY_INVALID)
-    source_value = config.get("encryption_key_source", KeySource.ENVIRONMENT.value)
-    try:
-        source = KeySource(source_value)
-    except (TypeError, ValueError):
-        _raise(SecurityErrorCode.STORAGE_KEY_INVALID)
+    environment = os.environ if environ is None else environ
+    source = resolve_key_source(config, environ=environment)
     root = _data_root(Path(data_dir))
 
     if source is KeySource.ENVIRONMENT:
-        active, previous = _environment_keys(os.environ if environ is None else environ)
+        active, previous = _environment_keys(environment)
         return ResolvedKeyMaterial(
             active=active,
             previous=previous,

@@ -60,6 +60,7 @@ if TYPE_CHECKING or not __package__:
         activate_storage_security,
         resolve_key_material,
     )
+    from astrcontinuum.storage.security import resolve_key_source
 else:
     from .astrcontinuum.adapters import (
         AdapterFault,
@@ -106,6 +107,7 @@ else:
         activate_storage_security,
         resolve_key_material,
     )
+    from .astrcontinuum.storage.security import resolve_key_source
 
 _PLUGIN_NAME = "astrbot_plugin_astrcontinuum"
 _REQUEST_STATE_KEY = "astrcontinuum.v1.request-state"
@@ -253,16 +255,15 @@ class AstrContinuumPlugin(Star):
     @staticmethod
     def _key_source_label(source: KeySource) -> str:
         if source is KeySource.FILE:
-            return "external file"
+            return "服务器密钥文件"
         if source is KeySource.LOCAL:
-            return "local convenience"
-        return "environment"
+            return "自动管理"
+        return "环境变量"
 
     def _configured_key_source_label(self) -> str:
-        value = self.config.get("encryption_key_source", KeySource.ENVIRONMENT.value)
         try:
-            return self._key_source_label(KeySource(value))
-        except (TypeError, ValueError):
+            return self._key_source_label(resolve_key_source(self.config))
+        except StorageSecurityError:
             return "unknown"
 
     def _initial_storage_status(self) -> _StorageRuntimeStatus:
@@ -297,6 +298,17 @@ class AstrContinuumPlugin(Star):
             maintenance="UNKNOWN",
             security_code=code,
         )
+
+    @staticmethod
+    def _storage_lock_hint(status: _StorageRuntimeStatus) -> str:
+        if status.security_code == SecurityErrorCode.STORAGE_KEY_MISSING.value:
+            return (
+                "下一步：将密钥来源设为“环境变量”并在服务器进程中注入 "
+                "ASTRCONTINUUM_MASTER_KEY，或改为“自动管理”/“服务器密钥文件”"
+                "后重载插件；"
+                "不要在 WebUI、聊天或日志中粘贴密钥正文。"
+            )
+        return "提示：修复密钥配置后重载插件；不要在 WebUI、聊天或日志中粘贴密钥正文。"
 
     def _budget_config(self) -> BudgetConfig:
         defaults = BudgetConfig()
@@ -1362,8 +1374,7 @@ class AstrContinuumPlugin(Star):
                 + "\n"
                 + "\n".join(engine_lines)
                 + "\n"
-                "后台归约：未启动\n"
-                "提示：修复密钥配置后重载插件；不要在 WebUI 或聊天中粘贴密钥。"
+                "后台归约：未启动\n" + self._storage_lock_hint(status)
             )
             return
 
@@ -1419,7 +1430,7 @@ class AstrContinuumPlugin(Star):
                     + "\n"
                     + "\n".join(current_engine_lines)
                     + "\n后台归约：未启动\n"
-                    "提示：修复密钥配置后重载插件；不要在 WebUI 或聊天中粘贴密钥。"
+                    + self._storage_lock_hint(current_status)
                 )
             else:
                 current_worker_task = current_worker.task if current_worker is not None else None
@@ -1482,7 +1493,7 @@ class AstrContinuumPlugin(Star):
                 "AstrContinuum 当前会话检查\n"
                 "检查状态：不可用\n"
                 f"检查代码：{status.security_code}\n"
-                f"数据保护：{status.protection}"
+                f"数据保护：{status.protection}\n" + self._storage_lock_hint(status)
             )
             return
 

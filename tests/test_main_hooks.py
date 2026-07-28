@@ -403,6 +403,17 @@ def test_main_declares_one_star_and_exact_hook_priorities(
     assert star_types == [plugin_type]
 
 
+def test_key_source_status_labels_use_simple_chinese(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path, master_key=None)
+
+    assert module.AstrContinuumPlugin._key_source_label(module.KeySource.LOCAL) == "自动管理"
+    assert module.AstrContinuumPlugin._key_source_label(module.KeySource.FILE) == "服务器密钥文件"
+    assert module.AstrContinuumPlugin._key_source_label(module.KeySource.ENVIRONMENT) == "环境变量"
+
+
 @pytest.mark.asyncio
 async def test_lifecycle_command_and_llm_response_are_idempotent_and_observational(
     monkeypatch: pytest.MonkeyPatch,
@@ -432,7 +443,7 @@ async def test_lifecycle_command_and_llm_response_are_idempotent_and_observation
         "AstrContinuum：运行中\n"
         "数据保护：ACTIVE\n"
         "加密格式：AES-256-GCM / envelope-v1\n"
-        "密钥来源：environment\n"
+        "密钥来源：环境变量\n"
         f"活动密钥标识：{TEST_MASTER_KEY_ID}\n"
         "存储维护：ACTIVE\n"
         "安全代码：NONE\n"
@@ -613,7 +624,13 @@ async def test_missing_key_latches_locked_without_touching_sqlite(
     tmp_path: Path,
 ) -> None:
     module, logger = load_main(monkeypatch, tmp_path, master_key=None)
-    plugin = module.AstrContinuumPlugin(object(), {"enabled": True})
+    plugin = module.AstrContinuumPlugin(
+        object(),
+        {
+            "enabled": True,
+            "encryption_key_source": "environment",
+        },
+    )
 
     await plugin.initialize()
 
@@ -636,6 +653,26 @@ async def test_missing_key_latches_locked_without_touching_sqlite(
     assert "已记录事件" not in status_text
     assert "已发布 Checkpoint" not in status_text
     assert "待处理任务" not in status_text
+    assert "密钥来源设为“环境变量”" in status_text
+    assert "ASTRCONTINUUM_MASTER_KEY" in status_text
+    assert "自动管理" in status_text
+    assert "服务器密钥文件" in status_text
+    assert "重载" in status_text
+    assert TEST_MASTER_KEY not in status_text
+    assert str(tmp_path) not in status_text
+    assert "astrcontinuum.key" not in status_text
+
+    inspection = [item async for item in plugin.context_inspect(event)]
+    inspection_text = inspection[0][1]
+    assert "检查代码：STORAGE_KEY_MISSING" in inspection_text
+    assert "密钥来源设为“环境变量”" in inspection_text
+    assert "ASTRCONTINUUM_MASTER_KEY" in inspection_text
+    assert "自动管理" in inspection_text
+    assert "服务器密钥文件" in inspection_text
+    assert "重载" in inspection_text
+    assert TEST_MASTER_KEY not in inspection_text
+    assert str(tmp_path) not in inspection_text
+    assert "astrcontinuum.key" not in inspection_text
     assert not (tmp_path / "astrcontinuum.sqlite3").exists()
     assert all(TEST_MASTER_KEY not in str(record) for record in logger.records)
 
@@ -649,6 +686,36 @@ async def test_missing_key_latches_locked_without_touching_sqlite(
     assert plugin._bridge is not None
     assert plugin._worker is not None
     await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_missing_source_uses_server_managed_default_and_reuses_key(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path, master_key=None)
+    first = module.AstrContinuumPlugin(object(), {"enabled": True})
+
+    assert first._storage_status.key_source == "自动管理"
+    await first.initialize()
+
+    local_path = tmp_path / "astrcontinuum.key"
+    first_text = local_path.read_text(encoding="ascii")
+    status = [item async for item in first.context_status(FakeEvent())]
+    assert "数据保护：LOCAL_KEY_DEGRADED" in status[0][1]
+    assert "密钥来源：自动管理" in status[0][1]
+    assert "安全代码：NONE" in status[0][1]
+    await first.terminate()
+
+    second = module.AstrContinuumPlugin(object(), {"enabled": True})
+    await second.initialize()
+
+    assert local_path.read_text(encoding="ascii") == first_text
+    assert second._bridge is not None
+    second_status = [item async for item in second.context_status(FakeEvent())]
+    assert "数据保护：LOCAL_KEY_DEGRADED" in second_status[0][1]
+    assert "密钥来源：自动管理" in second_status[0][1]
+    await second.terminate()
 
 
 @pytest.mark.asyncio
@@ -671,7 +738,7 @@ async def test_explicit_local_key_mode_is_visibly_degraded(
     assert (tmp_path / "astrcontinuum.key").is_file()
     status = [item async for item in plugin.context_status(FakeEvent())]
     assert "数据保护：LOCAL_KEY_DEGRADED" in status[0][1]
-    assert "密钥来源：local convenience" in status[0][1]
+    assert "密钥来源：自动管理" in status[0][1]
     assert "安全代码：NONE" in status[0][1]
     await plugin.terminate()
 
@@ -831,6 +898,54 @@ async def test_failed_rotation_does_not_report_configured_key_as_active(
     assert f"活动密钥标识：{replacement_key_id}" not in text
     assert "活动密钥标识：NONE" in text
     await replacement_plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_missing_source_never_silently_rekeys_an_existing_environment_database(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    original = module.AstrContinuumPlugin(
+        FakeContext(),
+        {
+            "enabled": True,
+            "encryption_key_source": "environment",
+        },
+    )
+    await original.initialize()
+    assert original._bridge is not None
+    await original.terminate()
+
+    monkeypatch.delenv("ASTRCONTINUUM_MASTER_KEY", raising=False)
+    replacement = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    await replacement.initialize()
+
+    assert replacement._bridge is None
+    assert (tmp_path / "astrcontinuum.key").is_file()
+    replacement_status = [item async for item in replacement.context_status(FakeEvent())]
+    replacement_text = replacement_status[0][1]
+    assert "数据保护：LOCKED" in replacement_text
+    assert "密钥来源：自动管理" in replacement_text
+    assert "安全代码：STORAGE_PREVIOUS_KEY_REQUIRED" in replacement_text
+    assert "活动密钥标识：NONE" in replacement_text
+    await replacement.terminate()
+
+    monkeypatch.setenv("ASTRCONTINUUM_MASTER_KEY", TEST_MASTER_KEY)
+    recovered = module.AstrContinuumPlugin(
+        FakeContext(),
+        {
+            "enabled": True,
+            "encryption_key_source": "environment",
+        },
+    )
+    await recovered.initialize()
+
+    assert recovered._bridge is not None
+    recovered_status = [item async for item in recovered.context_status(FakeEvent())]
+    assert "数据保护：ACTIVE" in recovered_status[0][1]
+    assert f"活动密钥标识：{TEST_MASTER_KEY_ID}" in recovered_status[0][1]
+    await recovered.terminate()
 
 
 @pytest.mark.asyncio

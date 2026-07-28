@@ -251,6 +251,75 @@ def test_explicit_local_source_creates_once_and_reuses_the_same_key(tmp_path: Pa
         assert stat.S_IMODE(local_path.stat().st_mode) & 0o077 == 0
 
 
+def test_missing_source_creates_once_and_reuses_the_server_managed_key(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "plugin-data"
+
+    first = resolve_key_material({}, data_dir, environ={})
+    local_path = data_dir / LOCAL_KEY_FILENAME
+    first_text = local_path.read_text(encoding="ascii")
+    second = resolve_key_material({}, data_dir, environ={})
+
+    assert first.source is KeySource.LOCAL
+    assert first.local_degraded is True
+    assert first.active.raw_key == second.active.raw_key
+    assert first_text == encode_key_text(first.active.raw_key) + "\n"
+    assert local_path.read_text(encoding="ascii") == first_text
+
+
+def test_missing_source_preserves_an_existing_environment_deployment(
+    tmp_path: Path,
+) -> None:
+    data_dir = tmp_path / "plugin-data"
+
+    resolved = resolve_key_material(
+        {},
+        data_dir,
+        environ={"ASTRCONTINUUM_MASTER_KEY": ACTIVE_TEXT},
+    )
+
+    assert resolved.source is KeySource.ENVIRONMENT
+    assert resolved.active.raw_key == ACTIVE_KEY
+    assert resolved.local_degraded is False
+    assert not (data_dir / LOCAL_KEY_FILENAME).exists()
+
+
+@pytest.mark.parametrize(
+    ("environ", "code"),
+    [
+        (
+            {"ASTRCONTINUUM_PREVIOUS_KEY": PREVIOUS_TEXT},
+            SecurityErrorCode.STORAGE_KEY_MISSING,
+        ),
+        (
+            {"ASTRCONTINUUM_PREVIOUS_KEY": ""},
+            SecurityErrorCode.STORAGE_KEY_MISSING,
+        ),
+        (
+            {"ASTRCONTINUUM_MASTER_KEY": ""},
+            SecurityErrorCode.STORAGE_KEY_MISSING,
+        ),
+        (
+            {"ASTRCONTINUUM_MASTER_KEY": "invalid"},
+            SecurityErrorCode.STORAGE_KEY_INVALID,
+        ),
+    ],
+)
+def test_missing_source_with_any_environment_key_present_never_falls_back_to_local(
+    tmp_path: Path,
+    environ: dict[str, str],
+    code: SecurityErrorCode,
+) -> None:
+    data_dir = tmp_path / "plugin-data"
+
+    with pytest.raises(StorageSecurityError) as raised:
+        resolve_key_material({}, data_dir, environ=environ)
+
+    _assert_code(raised, code)
+    assert not (data_dir / LOCAL_KEY_FILENAME).exists()
+
+
 def test_local_source_never_overwrites_an_existing_invalid_file(tmp_path: Path) -> None:
     data_dir = tmp_path / "plugin-data"
     data_dir.mkdir()

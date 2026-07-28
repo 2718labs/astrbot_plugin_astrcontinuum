@@ -24,34 +24,40 @@
     "default": "active"
   },
   "encryption_key_source": {
-    "description": "数据库加密密钥的保存位置",
-    "hint": "选择插件启动时从哪里读取数据库加密密钥。默认“环境变量”要求在启动 AstrBot 前设置 ASTRCONTINUUM_MASTER_KEY；未设置时 AstrContinuum 会保持锁定，不读写数据库，AstrBot 原生聊天仍可继续。不要把密钥粘贴到 WebUI、聊天、日志或命令行参数。只有个人试玩且能接受密钥与数据库处于同一目录边界时，才选择“本机便捷模式”。",
+    "description": "数据库加密密钥管理方式",
+    "hint": "新安装默认由服务器在 AstrBot 持久 data 卷的插件数据目录中自动生成并复用密钥，不需要在 WebUI 中配置密钥正文。这样能防止单独泄漏数据库文件后被直接解密，但整个 data 卷泄漏不受此模式保护。需要让密钥与 data 卷高隔离时，可通过外部密钥管理系统注入 ASTRCONTINUUM_MASTER_KEY 环境变量，也可填写外部密钥文件绝对路径。不要把密钥粘贴到 WebUI、聊天、日志或命令行参数。",
     "obvious_hint": true,
     "type": "string",
     "options": [
-      "environment",
+      "local",
       "file",
-      "local"
+      "environment"
     ],
     "labels": [
-      "环境变量（推荐）",
-      "外部密钥文件",
-      "本机便捷模式（较弱）"
+      "自动管理（推荐）",
+      "服务器密钥文件（高级）",
+      "环境变量（高级）"
     ],
-    "default": "environment"
+    "default": "local"
   },
   "encryption_key_file": {
-    "description": "当前加密密钥文件（仅外部文件模式）",
-    "hint": "这里只选择服务器上已经准备好的密钥文件，不要粘贴密钥内容。请先停止 AstrBot，再运行 python -m astrcontinuum.keyctl generate --output <外部密钥文件>；文件必须位于插件数据目录之外。使用环境变量或本机便捷模式时保持为空。",
+    "description": "当前加密密钥文件的绝对路径（仅外部文件模式）",
+    "hint": "填写服务器内可读的当前密钥文件绝对路径，不要粘贴密钥内容。请先停止 AstrBot，再运行 python -m astrcontinuum.keyctl generate --output <外部密钥文件绝对路径>；文件必须位于插件数据目录之外。使用环境变量或自动管理模式时保持为空。",
     "obvious_hint": true,
-    "type": "file",
+    "type": "string",
+    "condition": {
+      "encryption_key_source": "file"
+    },
     "default": ""
   },
   "encryption_previous_key_file": {
-    "description": "旧加密密钥文件（仅换钥时）",
-    "hint": "换钥时先停止 AstrBot：把新密钥设为当前密钥，把仍能解锁数据库的旧密钥文件选在这里，然后启动或重载。确认 /context_status 显示数据保护为 ACTIVE、新密钥标识已生效且维护完成后，清空旧密钥文件并再次重载。环境变量模式对应 ASTRCONTINUUM_PREVIOUS_KEY。不要在 WebUI、聊天、日志或命令参数中粘贴任何密钥。",
+    "description": "旧加密密钥文件的绝对路径（仅换钥时）",
+    "hint": "换钥时先停止 AstrBot：把新密钥设为当前密钥，并在这里填写服务器内可读、仍能解锁数据库的旧密钥文件绝对路径，然后启动或重载。确认 /context_status 显示数据保护为 ACTIVE、新密钥标识已生效且维护完成后，清空旧密钥文件路径并再次重载。环境变量模式对应 ASTRCONTINUUM_PREVIOUS_KEY。不要在 WebUI、聊天、日志或命令参数中粘贴任何密钥。",
     "obvious_hint": true,
-    "type": "file",
+    "type": "string",
+    "condition": {
+      "encryption_key_source": "file"
+    },
     "default": ""
   },
   "model_context_limit": {

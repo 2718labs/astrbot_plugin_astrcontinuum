@@ -11,6 +11,35 @@ def _load_schema() -> dict[str, object]:
     return json.loads((project_root / "_conf_schema.json").read_text(encoding="utf-8"))
 
 
+def _astrbot_dashboard_type_errors(
+    schema: dict[str, object], config: dict[str, object]
+) -> list[str]:
+    """Mirror the relevant AstrBot 4.11/4.24/4.26 dashboard type contracts."""
+    errors: list[str] = []
+    for key, value in config.items():
+        metadata = schema.get(key)
+        if not isinstance(metadata, dict):
+            continue
+        field_type = metadata.get("type")
+        if field_type == "file" and not isinstance(value, list):
+            errors.append(f"{key}: expected list")
+        elif field_type == "string" and not isinstance(value, str):
+            errors.append(f"{key}: expected string")
+    return errors
+
+
+def test_default_config_with_selected_provider_is_saveable_by_astrbot_dashboard() -> None:
+    schema = _load_schema()
+    config = {
+        key: value["default"]
+        for key, value in schema.items()
+        if isinstance(value, dict) and "default" in value
+    }
+    config["compaction_provider_id"] = "minimax-token-plan/MiniMax-M3"
+
+    assert _astrbot_dashboard_type_errors(schema, config) == []
+
+
 def test_context_engine_mode_is_the_only_exposed_engine_control() -> None:
     schema = _load_schema()
 
@@ -37,30 +66,45 @@ def test_storage_key_configuration_is_explicit_and_never_accepts_key_text() -> N
 
     source = schema["encryption_key_source"]
     assert source["type"] == "string"
-    assert source["default"] == "environment"
-    assert source["options"] == ["environment", "file", "local"]
+    assert source["default"] == "local"
+    assert source["options"] == ["local", "file", "environment"]
     assert source["labels"] == [
-        "环境变量（推荐）",
-        "外部密钥文件",
-        "本机便捷模式（较弱）",
+        "自动管理（推荐）",
+        "服务器密钥文件（高级）",
+        "环境变量（高级）",
     ]
     assert source["obvious_hint"] is True
     assert "ASTRCONTINUUM_MASTER_KEY" in source["hint"]
+    assert "自动生成" in source["hint"]
+    assert "持久 data 卷" in source["hint"]
+    assert "单独泄漏数据库文件" in source["hint"]
+    assert "整个 data 卷泄漏" in source["hint"]
+    assert "不受此模式保护" in source["hint"]
     assert "不要把密钥粘贴" in source["hint"]
 
     active_file = schema["encryption_key_file"]
-    assert active_file["type"] == "file"
+    assert active_file["type"] == "string"
     assert active_file["default"] == ""
+    # AstrBot 4.11+ evaluates flat field metadata conditions with strict equality.
+    assert active_file["condition"] == {"encryption_key_source": "file"}
     assert active_file["obvious_hint"] is True
+    assert "填写服务器内可读的当前密钥文件绝对路径" in active_file["hint"]
     assert "密钥内容" in active_file["hint"]
 
     previous_file = schema["encryption_previous_key_file"]
-    assert previous_file["type"] == "file"
+    assert previous_file["type"] == "string"
     assert previous_file["default"] == ""
+    assert previous_file["condition"] == {"encryption_key_source": "file"}
     assert previous_file["obvious_hint"] is True
+    assert "填写服务器内可读" in previous_file["hint"]
+    assert "旧密钥文件绝对路径" in previous_file["hint"]
     assert "ASTRCONTINUUM_PREVIOUS_KEY" in previous_file["hint"]
     assert "数据保护为 ACTIVE" in previous_file["hint"]
     assert "不要在 WebUI、聊天、日志或命令参数中粘贴任何密钥" in previous_file["hint"]
+
+    compaction_provider = schema["compaction_provider_id"]
+    assert compaction_provider["type"] == "string"
+    assert compaction_provider["_special"] == "select_provider"
 
     forbidden_fields = {
         "master_key",
