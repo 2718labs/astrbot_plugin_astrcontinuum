@@ -7,6 +7,7 @@ import importlib
 import json
 import shutil
 import sys
+from dataclasses import fields
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any
@@ -465,6 +466,9 @@ async def test_lifecycle_command_and_llm_response_are_idempotent_and_observation
         "安全代码：NONE\n"
         "上下文引擎：ACTIVE\n"
         "最近引擎状态：NONE\n"
+        "预算诊断：尚无已完成请求\n"
+        "归约模型：FOLLOW_CURRENT\n"
+        "Canonical 计数：完成 0·待补 0\n"
         "后台归约：运行中\n"
         "已记录事件：0\n"
         "已发布 Checkpoint：0\n"
@@ -1296,11 +1300,9 @@ async def test_missing_key_latches_locked_without_touching_sqlite(
     assert "已记录事件" not in status_text
     assert "已发布 Checkpoint" not in status_text
     assert "待处理任务" not in status_text
-    assert "密钥来源设为“环境变量”" in status_text
-    assert "ASTRCONTINUUM_MASTER_KEY" in status_text
-    assert "自动管理" in status_text
-    assert "服务器密钥文件" in status_text
-    assert "重载" in status_text
+    assert "在高级设置选自动管理并重载（仅新库/确认无需旧库时）" in status_text
+    assert "设置服务器活动密钥与旧密钥并重载" in status_text
+    assert "ASTRCONTINUUM_MASTER_KEY" not in status_text
     assert TEST_MASTER_KEY not in status_text
     assert str(tmp_path) not in status_text
     assert "astrcontinuum.key" not in status_text
@@ -1308,11 +1310,9 @@ async def test_missing_key_latches_locked_without_touching_sqlite(
     inspection = [item async for item in plugin.context_inspect(event)]
     inspection_text = inspection[0][1]
     assert "检查代码：STORAGE_KEY_MISSING" in inspection_text
-    assert "密钥来源设为“环境变量”" in inspection_text
-    assert "ASTRCONTINUUM_MASTER_KEY" in inspection_text
-    assert "自动管理" in inspection_text
-    assert "服务器密钥文件" in inspection_text
-    assert "重载" in inspection_text
+    assert "在高级设置选自动管理并重载（仅新库/确认无需旧库时）" in inspection_text
+    assert "设置服务器活动密钥与旧密钥并重载" in inspection_text
+    assert "ASTRCONTINUUM_MASTER_KEY" not in inspection_text
     assert TEST_MASTER_KEY not in inspection_text
     assert str(tmp_path) not in inspection_text
     assert "astrcontinuum.key" not in inspection_text
@@ -2006,4 +2006,205 @@ async def test_context_inspect_bounds_and_sanitizes_hostile_trace_values(
     assert "/path" not in lowered
     assert "nan" not in lowered
     assert "inf" not in lowered
+    await plugin.terminate()
+
+
+def test_completed_budget_diagnostics_has_content_free_allowlist_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+
+    assert tuple(item.name for item in fields(module._CompletedBudgetDiagnostics)) == (
+        "context_limit",
+        "context_limit_source",
+        "online_profile_id",
+        "online_mode",
+        "durable_profile_id",
+        "fallback_code",
+        "stable_code",
+        "effective_input_budget",
+        "selected_input_tokens",
+        "byte_fallback_count",
+    )
+    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": False})
+    assert plugin._latest_completed_budget is None
+    assert len(plugin._completed_budget_sessions) == 0
+
+
+def test_completed_budget_diagnostics_follow_completion_order_and_bound_session_lru(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": False})
+    profile = SimpleNamespace(
+        context_limit=262_144,
+        context_limit_source=SimpleNamespace(value="AUTO_ASTRBOT"),
+        tokenizer_profile=module.OPENAI_O200K,
+        effective_input_budget=130_000,
+    )
+
+    def outcome(stable_code: str, *, byte_fallback: bool = False) -> SimpleNamespace:
+        return SimpleNamespace(
+            tokenizer_profile_id=(
+                "utf8-byte-v1" if byte_fallback else module.OPENAI_O200K.profile_id
+            ),
+            tokenizer_mode="BYTE_FALLBACK" if byte_fallback else "EXACT_TEXT",
+            fallback_code="TOKENIZER_BYTE_FALLBACK" if byte_fallback else "NONE",
+            stable_code=stable_code,
+            assembly=SimpleNamespace(trace=SimpleNamespace(total_input_cost=777)),
+        )
+
+    sessions = [
+        module.SessionKey(
+            platform_instance_id="platform",
+            message_type="friend_message",
+            session_id=f"session-{index}",
+            group_id=None,
+            user_id="user",
+            conversation_id=f"conversation-{index}",
+            persona_id=None,
+        )
+        for index in range(257)
+    ]
+    for index, session_key in enumerate(sessions):
+        plugin._remember_completed_budget(
+            session_key,
+            profile,
+            outcome(
+                "CONTEXT_LIMIT_UNAVAILABLE"
+                if index % 2 == 0
+                else "CONTEXT_LIMIT_CONFIG_INVALID"
+            ),
+        )
+
+    assert len(plugin._completed_budget_sessions) == 256
+    assert sessions[0].session_key_hash not in plugin._completed_budget_sessions
+    assert tuple(plugin._completed_budget_sessions)[-1] == sessions[-1].session_key_hash
+    assert plugin._latest_completed_budget.stable_code == "CONTEXT_LIMIT_UNAVAILABLE"
+
+    # A request that started earlier but completes later becomes the global latest.
+    plugin._remember_completed_budget(
+        sessions[1],
+        profile,
+        outcome("CONTEXT_LIMIT_CONFIG_INVALID"),
+    )
+    assert tuple(plugin._completed_budget_sessions)[-1] == sessions[1].session_key_hash
+    assert plugin._latest_completed_budget.stable_code == "CONTEXT_LIMIT_CONFIG_INVALID"
+    plugin._remember_completed_budget(
+        sessions[1],
+        profile,
+        outcome("REQUIRED_INPUT_EXCEEDS_BUDGET", byte_fallback=True),
+    )
+    assert plugin._latest_completed_budget.byte_fallback_count == 1
+
+
+@pytest.mark.asyncio
+async def test_status_and_inspect_report_content_free_budget_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = SimpleNamespace(
+        get_model=lambda: "gpt-4o",
+        provider_config={"max_context_tokens": 262_144},
+    )
+    context = FakeContext(provider=provider)
+    module, logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        context,
+        {
+            "enabled": True,
+            "model_context_limit": 0,
+            "compaction_provider_id": "",
+        },
+    )
+    await plugin.initialize()
+    secret = "PRIVATE-PROMPT-HTTP-BODY-MUST-NOT-LEAK"
+    event = FakeEvent(message_id="budget-diagnostics")
+    request = fake_request(secret, token_usage=220_000, model="gpt-4o")
+    await plugin.on_llm_request(event, request)
+    messages = [
+        FakeMessage(role="system", content="private system prompt"),
+        FakeMessage(role="assistant", content="private native history"),
+        fake_user_message(secret),
+    ]
+    run_context = SimpleNamespace(messages=messages)
+    await plugin.on_agent_begin_guard(event, run_context)
+    await plugin.on_agent_begin_project(event, run_context)
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None and state.outcome is not None
+
+    status_text = (await anext(plugin.context_status(FakeEvent(message_id="status"))))[1]
+    assert "模型窗口：262144·AUTO_ASTRBOT" in status_text
+    assert "在线计数：openai-o200k_base-v1·EXACT_TEXT" in status_text
+    assert "持久计数：canonical-o200k-v1·CANONICAL" in status_text
+    assert "Tokenizer 降级：NONE" in status_text
+    assert "预算稳定代码：NONE" in status_text
+    assert "归约模型：FOLLOW_CURRENT" in status_text
+    assert "后台归约：运行中" in status_text
+
+    inspect_text = (await anext(plugin.context_inspect(FakeEvent(message_id="inspect"))))[1]
+    assert "有效输入预算：130000" in inspect_text
+    assert "已选择输入量：" in inspect_text
+    assert "BYTE_FALLBACK 计数：0" in inspect_text
+    assert "Canonical 计数：完成 1·待补 0" in inspect_text
+    assert "预算稳定代码：NONE" in inspect_text
+
+    forbidden = (
+        secret,
+        "private system prompt",
+        "private native history",
+        "gpt-4o",
+        "conversation-provider",
+        state.prepared.turn.session_key.session_key_hash,
+        event.unified_msg_origin,
+        TEST_MASTER_KEY,
+        str(tmp_path),
+        "max_context_tokens",
+    )
+    combined = status_text + inspect_text + repr(plugin._latest_completed_budget)
+    assert all(value not in combined for value in forbidden)
+    assert all(
+        all(value not in str(record) for value in forbidden)
+        for record in logger.records
+    )
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_canonical_metric_status_reports_durable_backfill_pending(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    actual_registry = module.TokenizerRegistry
+
+    class CanonicalFailingRegistry:
+        def __init__(self) -> None:
+            self._delegate = actual_registry()
+
+        def counter_for(self, profile: object) -> object:
+            if profile == module.CANONICAL_O200K:
+                raise RuntimeError("private canonical asset failure")
+            return self._delegate.counter_for(profile)
+
+    monkeypatch.setattr(module, "TokenizerRegistry", CanonicalFailingRegistry)
+    provider = SimpleNamespace(
+        get_model=lambda: "gpt-4o",
+        provider_config={"max_context_tokens": 262_144},
+    )
+    plugin = module.AstrContinuumPlugin(FakeContext(provider=provider), {"enabled": True})
+    await plugin.initialize()
+
+    event = FakeEvent(message_id="canonical-pending")
+    await plugin.on_llm_request(event, fake_request(model="gpt-4o"))
+    run_context = SimpleNamespace(messages=[fake_user_message("private input")])
+    await plugin.on_agent_begin_guard(event, run_context)
+    await plugin.on_agent_begin_project(event, run_context)
+
+    status_text = (await anext(plugin.context_status(FakeEvent(message_id="status"))))[1]
+    inspect_text = (await anext(plugin.context_inspect(FakeEvent(message_id="inspect"))))[1]
+    assert "Canonical 计数：完成 0·待补 1" in status_text
+    assert "Canonical 计数：完成 0·待补 1" in inspect_text
     await plugin.terminate()

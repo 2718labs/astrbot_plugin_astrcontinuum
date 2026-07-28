@@ -29,7 +29,20 @@ def _astrbot_dashboard_type_errors(
 
 
 def test_default_config_with_selected_provider_is_saveable_by_astrbot_dashboard() -> None:
+    """Guard the v0.2.0 dashboard 400: file defaults must not be typed as file."""
+
     schema = _load_schema()
+    for key in ("encryption_key_file", "encryption_previous_key_file"):
+        metadata = schema[key]
+        assert isinstance(metadata, dict)
+        assert metadata["type"] == "string"
+        assert metadata["default"] == ""
+        assert metadata["condition"] == {"encryption_key_source": "file"}
+
+    selector = schema["compaction_provider_id"]
+    assert isinstance(selector, dict)
+    assert selector["type"] == "string"
+    assert selector["default"] == ""
     config = {
         key: value["default"]
         for key, value in schema.items()
@@ -38,6 +51,74 @@ def test_default_config_with_selected_provider_is_saveable_by_astrbot_dashboard(
     config["compaction_provider_id"] = "minimax-token-plan/MiniMax-M3"
 
     assert _astrbot_dashboard_type_errors(schema, config) == []
+
+
+def test_context_limit_defaults_to_public_astrbot_auto_detection() -> None:
+    schema = _load_schema()
+
+    context_limit = schema["model_context_limit"]
+    assert isinstance(context_limit, dict)
+    assert context_limit["type"] == "int"
+    assert context_limit["default"] == 0
+    assert context_limit["obvious_hint"] is True
+    assert "0" in context_limit["hint"]
+    assert "自动" in context_limit["hint"]
+    assert "AstrBot" in context_limit["hint"]
+    assert "128000" in context_limit["hint"]
+    assert "上限" in context_limit["hint"]
+    assert "/context_status" in context_limit["hint"]
+
+
+def test_budget_defaults_remain_conservative_and_advanced_copy_is_short() -> None:
+    schema = _load_schema()
+
+    assert schema["target_input_budget"]["default"] == 130_000
+    assert schema["hard_input_ceiling"]["default"] == 150_000
+    assert schema["compaction_start_ratio"]["default"] == 0.75
+    assert schema["provider_view_switch_ratio"]["default"] == 0.8
+    for key in (
+        "target_input_budget",
+        "hard_input_ceiling",
+        "compaction_start_ratio",
+        "provider_view_switch_ratio",
+    ):
+        metadata = schema[key]
+        assert isinstance(metadata, dict)
+        assert "通常无需修改" in metadata["hint"]
+
+
+def test_schema_does_not_expose_tokenizer_implementation_controls() -> None:
+    schema = _load_schema()
+
+    assert schema["encryption_key_source"]["default"] == "local"
+    forbidden_fragments = (
+        "tokenizer",
+        "profile",
+        "encoding",
+        "asset",
+        "multiplier",
+        "path",
+    )
+    assert all(
+        all(fragment not in key.lower() for fragment in forbidden_fragments)
+        for key in schema
+    )
+    assert "advanced_settings" not in schema
+
+
+def test_compaction_provider_selector_contract_keeps_blank_follow_current() -> None:
+    schema = _load_schema()
+
+    selector = schema["compaction_provider_id"]
+    assert selector["type"] == "string"
+    assert selector["_special"] == "select_provider"
+    assert selector["default"] == ""
+    assert selector.get("invisible") is not True
+    assert "留空" in selector["hint"]
+    assert "跟随当前对话模型" in selector["hint"]
+    assert "节省成本" in selector["hint"]
+    assert "MiniMax" in selector["hint"]
+    assert "数据与隐私策略" in selector["hint"]
 
 
 def test_context_engine_mode_is_the_only_exposed_engine_control() -> None:

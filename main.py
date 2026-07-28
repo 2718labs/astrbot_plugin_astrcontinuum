@@ -5,7 +5,7 @@ from __future__ import annotations
 import asyncio
 import copy
 import uuid
-from collections import Counter
+from collections import Counter, OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, TypeVar, cast
@@ -61,6 +61,7 @@ if TYPE_CHECKING or not __package__:
     )
     from astrcontinuum.storage.security import resolve_key_source
     from astrcontinuum.tokenization import (
+        BYTE_FALLBACK,
         CANONICAL_O200K,
         OPENAI_O200K,
         REFERENCE_O200K,
@@ -111,7 +112,7 @@ else:
         restore,
         verify_native,
     )
-    from .astrcontinuum.runtime.types import BudgetErrorCode  # noqa: F401
+    from .astrcontinuum.runtime.types import BudgetErrorCode
     from .astrcontinuum.storage import (
         KeySource,
         SecurityErrorCode,
@@ -124,16 +125,17 @@ else:
     )
     from .astrcontinuum.storage.security import resolve_key_source
     from .astrcontinuum.tokenization import (
+        BYTE_FALLBACK,
         CANONICAL_O200K,
-        OPENAI_O200K,  # noqa: F401
-        REFERENCE_O200K,  # noqa: F401
+        OPENAI_O200K,
+        REFERENCE_O200K,
         ContextLimitDecision,
         ContextLimitResolver,
         HostBudgetView,
         RequestBudgetOutcome,
         RequestBudgetProfile,
         TokenizerError,
-        TokenizerErrorCode,  # noqa: F401
+        TokenizerErrorCode,
         TokenizerRegistry,
         TokenizerRoute,
         TokenizerRouter,
@@ -145,6 +147,7 @@ _PLUGIN_NAME = "astrbot_plugin_astrcontinuum"
 _REQUEST_STATE_KEY = "astrcontinuum.v1.request-state"
 _ENCRYPTION_FORMAT = "AES-256-GCM / envelope-v1"
 _TRACE_INTEGER_LIMIT = 1_000_000
+_MAX_COMPLETED_BUDGET_SESSIONS = 256
 _EVENT_TYPES = (
     "USER_MESSAGE",
     "ASSISTANT_MESSAGE",
@@ -152,6 +155,28 @@ _EVENT_TYPES = (
     "TOOL_RESULT",
 )
 _T = TypeVar("_T")
+_ONLINE_PROFILE_MODES = {
+    profile.profile_id: profile.mode.value
+    for profile in (OPENAI_O200K, REFERENCE_O200K, BYTE_FALLBACK)
+}
+_CONTEXT_LIMIT_SOURCES = frozenset(
+    {
+        "MANUAL",
+        "AUTO_ASTRBOT",
+        "AUTO_SAFE_FALLBACK",
+    }
+)
+_TOKENIZER_FALLBACK_CODES = frozenset({"NONE", "TOKENIZER_BYTE_FALLBACK"})
+_BUDGET_STABLE_CODES = frozenset(
+    {
+        "NONE",
+        "CONTEXT_LIMIT_CONFIG_INVALID",
+        "CONTEXT_LIMIT_UNAVAILABLE",
+        "CONTEXT_LIMIT_TOO_SMALL",
+        *(code.value for code in BudgetErrorCode),
+        *(code.value for code in TokenizerErrorCode),
+    }
+)
 
 
 @dataclass(slots=True, repr=False)
@@ -181,6 +206,30 @@ class _StorageRuntimeStatus:
 
 
 @dataclass(frozen=True, slots=True)
+class _CompletedBudgetDiagnostics:
+    """Strictly content-free fields from one completed request-budget evaluation."""
+
+    context_limit: int
+    context_limit_source: str
+    online_profile_id: str
+    online_mode: str
+    durable_profile_id: str
+    fallback_code: str
+    stable_code: str
+    effective_input_budget: int
+    selected_input_tokens: int
+    byte_fallback_count: int
+
+
+@dataclass(frozen=True, slots=True)
+class _CanonicalMetricCounts:
+    """Durable, content-free canonical metric completion state."""
+
+    completed: str
+    pending: str
+
+
+@dataclass(frozen=True, slots=True)
 class _SessionInspection:
     snapshot_suffix: str
     pointer_version: int
@@ -191,6 +240,7 @@ class _SessionInspection:
     capsule_slots: tuple[tuple[str, int], ...]
     pending_job_state: str
     retry_code: str
+    canonical_metrics: _CanonicalMetricCounts
 
 
 @dataclass(frozen=True, slots=True)
@@ -310,6 +360,16 @@ class AstrContinuumPlugin(Star):
         self._context_limit_resolver = ContextLimitResolver()
         self._context_engine_mode = self._configured_context_engine_mode()
         self._storage_status = self._initial_storage_status()
+        configured_provider = self.config.get("compaction_provider_id", "")
+        self._compaction_provider_status = (
+            "FOLLOW_CURRENT"
+            if isinstance(configured_provider, str) and not configured_provider.strip()
+            else "UNAVAILABLE"
+        )
+        self._latest_completed_budget: _CompletedBudgetDiagnostics | None = None
+        self._completed_budget_sessions: OrderedDict[
+            str, _CompletedBudgetDiagnostics
+        ] = OrderedDict()
 
     def _configured_context_engine_mode(self) -> ContextEngineMode:
         value = self.config.get("context_engine_mode", ContextEngineMode.ACTIVE.value)
@@ -371,12 +431,119 @@ class AstrContinuumPlugin(Star):
     def _storage_lock_hint(status: _StorageRuntimeStatus) -> str:
         if status.security_code == SecurityErrorCode.STORAGE_KEY_MISSING.value:
             return (
-                "下一步：将密钥来源设为“环境变量”并在服务器进程中注入 "
-                "ASTRCONTINUUM_MASTER_KEY，或改为“自动管理”/“服务器密钥文件”"
-                "后重载插件；"
+                "下一步：在高级设置选自动管理并重载（仅新库/确认无需旧库时），"
+                "或设置服务器活动密钥与旧密钥并重载；"
                 "不要在 WebUI、聊天或日志中粘贴密钥正文。"
             )
         return "提示：修复密钥配置后重载插件；不要在 WebUI、聊天或日志中粘贴密钥正文。"
+
+    @staticmethod
+    def _known_budget_label(value: object, allowed: frozenset[str]) -> str:
+        return value if isinstance(value, str) and value in allowed else "INVALID"
+
+    @staticmethod
+    def _diagnostic_count(value: object) -> int:
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            return 0
+        return value
+
+    @staticmethod
+    def _canonical_metric_counts(
+        completed: object,
+        pending: object,
+    ) -> _CanonicalMetricCounts:
+        def label(value: object) -> str:
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                return "UNAVAILABLE"
+            return str(min(value, _TRACE_INTEGER_LIMIT))
+
+        return _CanonicalMetricCounts(label(completed), label(pending))
+
+    @staticmethod
+    def _canonical_metric_unavailable() -> _CanonicalMetricCounts:
+        return _CanonicalMetricCounts("UNAVAILABLE", "UNAVAILABLE")
+
+    def _remember_completed_budget(
+        self,
+        session_key: SessionKey,
+        profile: RequestBudgetProfile,
+        outcome: RequestBudgetOutcome,
+    ) -> None:
+        """Remember only fixed-profile, content-free fields after evaluation completes."""
+
+        session_hash = session_key.session_key_hash
+        profile_id = getattr(outcome, "tokenizer_profile_id", None)
+        online_mode = getattr(outcome, "tokenizer_mode", None)
+        if (
+            not isinstance(profile_id, str)
+            or _ONLINE_PROFILE_MODES.get(profile_id) != online_mode
+        ):
+            profile_id = "INVALID"
+            online_mode = "INVALID"
+        source = getattr(getattr(profile, "context_limit_source", None), "value", None)
+        context_limit_source = self._known_budget_label(source, _CONTEXT_LIMIT_SOURCES)
+        fallback_code = self._known_budget_label(
+            getattr(outcome, "fallback_code", None),
+            _TOKENIZER_FALLBACK_CODES,
+        )
+        stable_code = self._known_budget_label(
+            getattr(outcome, "stable_code", None),
+            _BUDGET_STABLE_CODES,
+        )
+        assembly = getattr(outcome, "assembly", None)
+        trace = getattr(assembly, "trace", None)
+        selected_input_tokens = self._diagnostic_count(
+            getattr(trace, "total_input_cost", 0)
+        )
+        previous = self._completed_budget_sessions.get(session_hash)
+        byte_fallback_count = (
+            previous.byte_fallback_count if previous is not None else 0
+        ) + (1 if online_mode == BYTE_FALLBACK.mode.value else 0)
+        completed = _CompletedBudgetDiagnostics(
+            context_limit=self._diagnostic_count(getattr(profile, "context_limit", 0)),
+            context_limit_source=context_limit_source,
+            online_profile_id=cast(str, profile_id),
+            online_mode=cast(str, online_mode),
+            durable_profile_id=CANONICAL_O200K.profile_id,
+            fallback_code=fallback_code,
+            stable_code=stable_code,
+            effective_input_budget=self._diagnostic_count(
+                getattr(profile, "effective_input_budget", 0)
+            ),
+            selected_input_tokens=selected_input_tokens,
+            byte_fallback_count=byte_fallback_count,
+        )
+        self._completed_budget_sessions[session_hash] = completed
+        self._completed_budget_sessions.move_to_end(session_hash)
+        while len(self._completed_budget_sessions) > _MAX_COMPLETED_BUDGET_SESSIONS:
+            self._completed_budget_sessions.popitem(last=False)
+        self._latest_completed_budget = completed
+
+    def _completed_budget_lines(
+        self,
+        completed: _CompletedBudgetDiagnostics | None,
+        canonical_metrics: _CanonicalMetricCounts,
+    ) -> tuple[str, ...]:
+        """Render only the fixed, content-free completed-budget diagnostics."""
+
+        if completed is None:
+            return (
+                "预算诊断：尚无已完成请求",
+                f"归约模型：{self._compaction_provider_status}",
+                f"Canonical 计数：完成 {canonical_metrics.completed}·待补 {canonical_metrics.pending}",
+            )
+        return (
+            f"模型窗口：{completed.context_limit}·{completed.context_limit_source}",
+            f"在线计数：{completed.online_profile_id}·{completed.online_mode}",
+            f"持久计数：{completed.durable_profile_id}·CANONICAL",
+            f"Tokenizer 降级：{completed.fallback_code}",
+            f"预算稳定代码：{completed.stable_code}",
+            f"有效输入预算：{completed.effective_input_budget}",
+            f"已选择输入量：{completed.selected_input_tokens}",
+            f"归约模型：{self._compaction_provider_status}",
+            f"BYTE_FALLBACK 计数：{completed.byte_fallback_count}",
+            f"Canonical 计数：完成 {canonical_metrics.completed}·待补 {canonical_metrics.pending}",
+        )
 
     def _budget_values(self) -> tuple[int, int, int, int]:
         defaults = BudgetConfig()
@@ -699,8 +866,18 @@ class AstrContinuumPlugin(Star):
                 provider_override_configured = (
                     isinstance(configured_provider, str) and bool(configured_provider.strip())
                 )
+                provider_override = self._resolve_explicit_compaction_binding()
+                self._compaction_provider_status = (
+                    "EXPLICIT"
+                    if provider_override_configured and provider_override is not None
+                    else (
+                        "UNAVAILABLE"
+                        if provider_override_configured
+                        else "FOLLOW_CURRENT"
+                    )
+                )
                 providers = SessionProviderRegistry(
-                    provider_override=self._resolve_explicit_compaction_binding(),
+                    provider_override=provider_override,
                     provider_override_configured=provider_override_configured,
                 )
                 backend = AstrBotExtractiveCompilerBackend(
@@ -1000,6 +1177,11 @@ class AstrContinuumPlugin(Star):
             outcome = await bridge.evaluate_prepared(
                 state.prepared,
                 host_budget_view=host_view,
+            )
+            self._remember_completed_budget(
+                state.prepared.turn.session_key,
+                state.prepared.budget_profile,
+                outcome,
             )
             state.outcome = outcome
             state.pressure = outcome.pressure
@@ -1463,6 +1645,65 @@ class AstrContinuumPlugin(Star):
                 """,
                 (session_key.session_key_hash,),
             ).fetchone()
+            try:
+                canonical_rows = connection.execute(
+                    """
+                    SELECT
+                        (
+                            SELECT count(*)
+                            FROM token_metrics AS metric
+                            WHERE metric.tokenizer_profile_id = ?
+                              AND (
+                                  (
+                                      metric.artifact_kind = 'EVENT'
+                                      AND EXISTS (
+                                          SELECT 1
+                                          FROM journal_events AS event
+                                          WHERE event.event_id = metric.artifact_id
+                                            AND event.session_key_hash = ?
+                                      )
+                                  )
+                                  OR (
+                                      metric.artifact_kind = 'CAPSULE'
+                                      AND EXISTS (
+                                          SELECT 1
+                                          FROM capsules AS capsule
+                                          WHERE capsule.capsule_id = metric.artifact_id
+                                            AND capsule.session_key_hash = ?
+                                      )
+                                  )
+                                  OR (
+                                      metric.artifact_kind = 'SNAPSHOT'
+                                      AND EXISTS (
+                                          SELECT 1
+                                          FROM snapshots AS snapshot
+                                          WHERE snapshot.snapshot_id = metric.artifact_id
+                                            AND snapshot.session_key_hash = ?
+                                      )
+                                  )
+                              )
+                        ),
+                        (
+                            SELECT count(*)
+                            FROM token_metric_backfill_intents
+                            WHERE session_key_hash = ?
+                              AND tokenizer_profile_id = ?
+                        )
+                    """,
+                    (
+                        CANONICAL_O200K.profile_id,
+                        session_key.session_key_hash,
+                        session_key.session_key_hash,
+                        session_key.session_key_hash,
+                        session_key.session_key_hash,
+                        CANONICAL_O200K.profile_id,
+                    ),
+                ).fetchone()
+                canonical_metrics = cls._canonical_metric_counts(
+                    canonical_rows[0], canonical_rows[1]
+                )
+            except Exception:  # noqa: BLE001 - diagnostics stay fail-open
+                canonical_metrics = cls._canonical_metric_unavailable()
 
         event_count_map = {cls._safe_operational_label(row[0]): int(row[1]) for row in event_rows}
         event_counts = tuple(
@@ -1496,6 +1737,7 @@ class AstrContinuumPlugin(Star):
             capsule_slots=capsule_slots,
             pending_job_state=pending_job_state,
             retry_code=retry_code,
+            canonical_metrics=canonical_metrics,
         )
 
     def _read_session_observability(
@@ -1574,7 +1816,7 @@ class AstrContinuumPlugin(Star):
             )
             return
 
-        def read_counts() -> tuple[int, int, int]:
+        def read_counts() -> tuple[int, int, int, _CanonicalMetricCounts]:
             with bridge.repository.factory.connection(read_only=True) as connection:
                 event_count = int(
                     connection.execute("SELECT count(*) FROM journal_events").fetchone()[0]
@@ -1598,11 +1840,35 @@ class AstrContinuumPlugin(Star):
                         """
                     ).fetchone()[0]
                 )
-                return event_count, checkpoint_count, pending_count
+                try:
+                    canonical_row = connection.execute(
+                        """
+                        SELECT
+                            (
+                                SELECT count(*)
+                                FROM token_metrics
+                                WHERE tokenizer_profile_id = ?
+                            ),
+                            (
+                                SELECT count(*)
+                                FROM token_metric_backfill_intents
+                                WHERE tokenizer_profile_id = ?
+                            )
+                        """,
+                        (CANONICAL_O200K.profile_id, CANONICAL_O200K.profile_id),
+                    ).fetchone()
+                    canonical_metrics = self._canonical_metric_counts(
+                        canonical_row[0], canonical_row[1]
+                    )
+                except Exception:  # noqa: BLE001 - diagnostics stay fail-open
+                    canonical_metrics = self._canonical_metric_unavailable()
+                return event_count, checkpoint_count, pending_count, canonical_metrics
 
         query_failed = False
         try:
-            event_count, checkpoint_count, pending_count = await asyncio.to_thread(read_counts)
+            event_count, checkpoint_count, pending_count, canonical_metrics = await asyncio.to_thread(
+                read_counts
+            )
         except Exception:  # noqa: BLE001 - never expose storage details to chat
             logger.error(
                 "AstrContinuum status query failed code=%s",
@@ -1648,12 +1914,18 @@ class AstrContinuumPlugin(Star):
         worker_status = "运行中" if worker_task is not None and not worker_task.done() else "已停止"
         security_lines = self._security_status_lines(current_status)
         engine_lines = self._engine_status_lines(self._latest_context_trace(current_bridge))
+        budget_lines = self._completed_budget_lines(
+            self._latest_completed_budget,
+            canonical_metrics if not query_failed else self._canonical_metric_unavailable(),
+        )
         if query_failed:
             yield event.plain_result(
                 "AstrContinuum：运行中\n"
                 + "\n".join((*security_lines,))
                 + "\n"
                 + "\n".join(engine_lines)
+                + "\n"
+                + "\n".join(budget_lines)
                 + f"\n后台归约：{worker_status}\n统计信息：暂时无法读取"
             )
             return
@@ -1663,6 +1935,8 @@ class AstrContinuumPlugin(Star):
             + "\n".join((*security_lines,))
             + "\n"
             + "\n".join(engine_lines)
+            + "\n"
+            + "\n".join(budget_lines)
             + "\n"
             f"后台归约：{worker_status}\n"
             f"已记录事件：{event_count}\n"
@@ -1769,6 +2043,10 @@ class AstrContinuumPlugin(Star):
             if inspection.capsule_slots
             else "NONE"
         )
+        budget_lines = self._completed_budget_lines(
+            self._completed_budget_sessions.get(session_key.session_key_hash),
+            inspection.canonical_metrics,
+        )
         yield event.plain_result(
             "AstrContinuum 当前会话检查\n"
             "检查状态：可用\n"
@@ -1797,5 +2075,7 @@ class AstrContinuumPlugin(Star):
             f"恢复次数：{engine_inspection.recovery_count}\n"
             f"必选覆盖：{engine_inspection.required_coverage}\n"
             f"来源覆盖：{engine_inspection.provenance_coverage}\n"
+            + "\n".join(budget_lines)
+            + "\n"
             f"稳定代码：{engine_inspection.stable_code}"
         )
