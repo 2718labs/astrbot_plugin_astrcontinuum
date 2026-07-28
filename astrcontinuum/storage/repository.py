@@ -1212,7 +1212,7 @@ class SQLiteRepository:
                         content,
                         source_hook,
                         idempotency_key,
-                        token_count,
+                        token_count_envelope,
                         created_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
@@ -1230,7 +1230,12 @@ class SQLiteRepository:
                         ),
                         event.source_hook.value,
                         event.idempotency_key,
-                        event.token_count,
+                        self._codec.encrypt_non_negative_int(
+                            "journal_events",
+                            "token_count",
+                            event.event_id,
+                            event.token_count,
+                        ),
                         normalized_created_at,
                     ),
                 )
@@ -1612,13 +1617,19 @@ class SQLiteRepository:
                 capsule.capsule_id,
                 str(row["canonical_capsule_json"]),
             )
+            stored_token_cost = self._codec.decrypt_non_negative_int(
+                "capsules",
+                "token_cost",
+                capsule.capsule_id,
+                row["token_cost_envelope"],
+            )
             if (
                 row["session_key_hash"] != capsule.session_key.session_key_hash
                 or row["level"] != capsule.level.value
                 or int(row["covered_event_start"]) != capsule.covered_event_start
                 or int(row["covered_event_end"]) != capsule.covered_event_end
                 or stored_canonical_json != canonical_json
-                or int(row["token_cost"]) != capsule.token_cost
+                or stored_token_cost != capsule.token_cost
                 or float(row["source_coverage"]) != capsule.quality.source_coverage
                 or row["created_at"] != _normalize_datetime(capsule.created_at)
             ):
@@ -1636,7 +1647,7 @@ class SQLiteRepository:
                 covered_event_start,
                 covered_event_end,
                 canonical_capsule_json,
-                token_cost,
+                token_cost_envelope,
                 source_coverage,
                 created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1653,7 +1664,12 @@ class SQLiteRepository:
                     capsule.capsule_id,
                     canonical_json,
                 ),
-                capsule.token_cost,
+                self._codec.encrypt_non_negative_int(
+                    "capsules",
+                    "token_cost",
+                    capsule.capsule_id,
+                    capsule.token_cost,
+                ),
                 capsule.quality.source_coverage,
                 _normalize_datetime(capsule.created_at),
             ),
@@ -1682,7 +1698,7 @@ class SQLiteRepository:
                 source_high_water_mark,
                 exact_anchor_ids_json,
                 rendered_context,
-                token_cost,
+                token_cost_envelope,
                 audit_outcome,
                 lifecycle_state,
                 created_at,
@@ -1707,7 +1723,12 @@ class SQLiteRepository:
                     snapshot.snapshot_id,
                     snapshot.rendered_context,
                 ),
-                snapshot.token_cost,
+                self._codec.encrypt_non_negative_int(
+                    "snapshots",
+                    "token_cost",
+                    snapshot.snapshot_id,
+                    snapshot.token_cost,
+                ),
                 self._codec.encrypt_object_json(
                     "snapshots",
                     "audit_outcome",
@@ -1938,6 +1959,12 @@ class SQLiteRepository:
             event_id,
             str(row["content"]),
         )
+        token_count = self._codec.decrypt_non_negative_int(
+            "journal_events",
+            "token_count",
+            event_id,
+            row["token_count_envelope"],
+        )
         try:
             return EventEnvelope(
                 event_id=event_id,
@@ -1948,7 +1975,7 @@ class SQLiteRepository:
                 content=content,
                 source_hook=SourceHook(row["source_hook"]),
                 idempotency_key=row["idempotency_key"],
-                token_count=row["token_count"],
+                token_count=token_count,
                 created_at=_parse_datetime(row["created_at"]),
             )
         except (TypeError, ValueError):
@@ -1990,6 +2017,12 @@ class SQLiteRepository:
                 capsule = ContextCapsuleEnvelope.model_validate_json(canonical_capsule_json)
             except (TypeError, ValueError):
                 raise RepositoryInvariantError("durable Capsule cannot be reconstructed") from None
+            stored_token_cost = self._codec.decrypt_non_negative_int(
+                "capsules",
+                "token_cost",
+                capsule_id,
+                row["token_cost_envelope"],
+            )
             if (
                 int(row["ordinal"]) != expected_ordinal
                 or capsule_id != capsule.capsule_id
@@ -1998,7 +2031,7 @@ class SQLiteRepository:
                 or row["level"] != capsule.level.value
                 or int(row["covered_event_start"]) != capsule.covered_event_start
                 or int(row["covered_event_end"]) != capsule.covered_event_end
-                or int(row["token_cost"]) != capsule.token_cost
+                or stored_token_cost != capsule.token_cost
                 or float(row["source_coverage"]) != capsule.quality.source_coverage
                 or row["created_at"] != _normalize_datetime(capsule.created_at)
             ):
@@ -2040,6 +2073,12 @@ class SQLiteRepository:
             snapshot_id,
             str(row["audit_outcome"]),
         )
+        token_cost = self._codec.decrypt_non_negative_int(
+            "snapshots",
+            "token_cost",
+            snapshot_id,
+            row["token_cost_envelope"],
+        )
         try:
             exact_anchor_ids = tuple(json.loads(exact_anchor_ids_json))
             audit_outcome = SnapshotAuditOutcome.model_validate_json(audit_outcome_json)
@@ -2052,7 +2091,7 @@ class SQLiteRepository:
                 capsule_ids=capsule_ids,
                 exact_anchor_ids=exact_anchor_ids,
                 rendered_context=rendered_context,
-                token_cost=row["token_cost"],
+                token_cost=token_cost,
                 audit_outcome=audit_outcome,
                 state=SnapshotState(row["lifecycle_state"]),
                 created_at=_parse_datetime(row["created_at"]),

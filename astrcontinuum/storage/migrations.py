@@ -38,6 +38,7 @@ class Migration:
     version: int
     name: str
     sql: str
+    requires_codec: bool = False
 
     def __post_init__(self) -> None:
         if self.version < 1:
@@ -46,6 +47,8 @@ class Migration:
             raise ValueError("migration name must be non-empty")
         if not self.sql.strip():
             raise ValueError("migration SQL must be non-empty")
+        if not isinstance(self.requires_codec, bool):
+            raise TypeError("requires_codec must be a bool")
 
     @property
     def checksum(self) -> str:
@@ -402,11 +405,323 @@ BEGIN
 END;
 """.strip()
 
+SECURE_FORMAT_V2_DDL = (
+    (
+        "create_journal_events",
+        """
+        CREATE TABLE _astrcontinuum_v2_journal_events (
+            event_id TEXT NOT NULL PRIMARY KEY CHECK (length(trim(event_id)) > 0),
+            session_key_hash TEXT NOT NULL,
+            sequence INTEGER NOT NULL CHECK (sequence >= 1),
+            event_type TEXT NOT NULL,
+            role TEXT NOT NULL,
+            content TEXT NOT NULL,
+            source_hook TEXT NOT NULL,
+            idempotency_key TEXT NOT NULL CHECK (length(trim(idempotency_key)) > 0),
+            token_count_envelope TEXT NOT NULL
+                CHECK (substr(token_count_envelope, 1, 9) = 'acenc:v1:'),
+            created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0),
+            UNIQUE (session_key_hash, sequence),
+            UNIQUE (session_key_hash, source_hook, idempotency_key),
+            FOREIGN KEY (session_key_hash) REFERENCES sessions(session_key_hash),
+            CHECK (
+                (
+                    event_type = 'USER_MESSAGE'
+                    AND role = 'USER'
+                    AND source_hook = 'ON_LLM_REQUEST'
+                )
+                OR (
+                    event_type = 'ASSISTANT_MESSAGE'
+                    AND role = 'ASSISTANT'
+                    AND source_hook = 'ON_AGENT_DONE'
+                )
+                OR (
+                    event_type = 'TOOL_CALL'
+                    AND role = 'TOOL'
+                    AND source_hook = 'ON_USING_LLM_TOOL'
+                )
+                OR (
+                    event_type = 'TOOL_RESULT'
+                    AND role = 'TOOL'
+                    AND source_hook = 'ON_LLM_TOOL_RESPOND'
+                )
+            )
+        )
+        """.strip(),
+    ),
+    (
+        "create_capsules",
+        """
+        CREATE TABLE _astrcontinuum_v2_capsules (
+            capsule_id TEXT NOT NULL PRIMARY KEY CHECK (length(trim(capsule_id)) > 0),
+            session_key_hash TEXT NOT NULL,
+            level TEXT NOT NULL CHECK (level IN ('micro', 'episode', 'task', 'global')),
+            covered_event_start INTEGER NOT NULL CHECK (covered_event_start >= 1),
+            covered_event_end INTEGER NOT NULL
+                CHECK (covered_event_end >= covered_event_start),
+            canonical_capsule_json TEXT NOT NULL
+                CHECK (
+                    json_valid(canonical_capsule_json)
+                    AND json_type(canonical_capsule_json) = 'object'
+                ),
+            token_cost_envelope TEXT NOT NULL
+                CHECK (substr(token_cost_envelope, 1, 9) = 'acenc:v1:'),
+            source_coverage REAL NOT NULL CHECK (source_coverage BETWEEN 0 AND 1),
+            created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0),
+            FOREIGN KEY (session_key_hash) REFERENCES sessions(session_key_hash)
+        )
+        """.strip(),
+    ),
+    (
+        "create_snapshots",
+        """
+        CREATE TABLE _astrcontinuum_v2_snapshots (
+            snapshot_id TEXT NOT NULL PRIMARY KEY CHECK (length(trim(snapshot_id)) > 0),
+            session_key_hash TEXT NOT NULL,
+            base_snapshot_id TEXT NULL
+                CHECK (base_snapshot_id IS NULL OR length(trim(base_snapshot_id)) > 0),
+            covered_event_end INTEGER NOT NULL CHECK (covered_event_end >= 1),
+            source_high_water_mark INTEGER NOT NULL
+                CHECK (source_high_water_mark >= covered_event_end),
+            exact_anchor_ids_json TEXT NOT NULL
+                CHECK (
+                    json_valid(exact_anchor_ids_json)
+                    AND json_type(exact_anchor_ids_json) = 'array'
+                    AND json_array_length(exact_anchor_ids_json) = 2
+                    AND json_extract(exact_anchor_ids_json, '$[0]')
+                        = '$astrcontinuum_encrypted'
+                    AND json_type(exact_anchor_ids_json, '$[1]') = 'text'
+                ),
+            rendered_context TEXT NOT NULL
+                CHECK (substr(rendered_context, 1, 9) = 'acenc:v1:'),
+            token_cost_envelope TEXT NOT NULL
+                CHECK (substr(token_cost_envelope, 1, 9) = 'acenc:v1:'),
+            audit_outcome TEXT NOT NULL
+                CHECK (
+                    json_valid(audit_outcome)
+                    AND json_type(audit_outcome) = 'object'
+                    AND json_type(
+                        audit_outcome,
+                        '$."$astrcontinuum_encrypted"'
+                    ) = 'text'
+                    AND json_remove(
+                        audit_outcome,
+                        '$."$astrcontinuum_encrypted"'
+                    ) = '{}'
+                ),
+            lifecycle_state TEXT NOT NULL CHECK (lifecycle_state = 'COMMITTED'),
+            created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0),
+            committed_at TEXT NOT NULL CHECK (length(trim(committed_at)) > 0),
+            UNIQUE (session_key_hash, covered_event_end),
+            FOREIGN KEY (session_key_hash) REFERENCES sessions(session_key_hash),
+            FOREIGN KEY (base_snapshot_id)
+                REFERENCES _astrcontinuum_v2_snapshots(snapshot_id)
+        )
+        """.strip(),
+    ),
+    (
+        "create_storage_security",
+        """
+        CREATE TABLE _astrcontinuum_v2_storage_security (
+            singleton_id INTEGER NOT NULL PRIMARY KEY CHECK (singleton_id = 1),
+            format_version INTEGER NOT NULL CHECK (format_version = 2),
+            active_key_id TEXT NOT NULL
+                CHECK (
+                    length(active_key_id) = 16
+                    AND active_key_id = lower(active_key_id)
+                    AND active_key_id NOT GLOB '*[^0-9a-f]*'
+                ),
+            state TEXT NOT NULL
+                CHECK (
+                    state IN ('NEEDS_MIGRATION', 'NEEDS_REKEY', 'NEEDS_SCRUB', 'ACTIVE')
+                ),
+            key_verifier TEXT NOT NULL
+                CHECK (substr(key_verifier, 1, 9) = 'acenc:v1:'),
+            created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0),
+            updated_at TEXT NOT NULL CHECK (length(trim(updated_at)) > 0)
+        )
+        """.strip(),
+    ),
+    ("drop_journal_events", "DROP TABLE journal_events"),
+    ("drop_capsules", "DROP TABLE capsules"),
+    ("drop_snapshots", "DROP TABLE snapshots"),
+    ("drop_storage_security", "DROP TABLE storage_security"),
+    (
+        "rename_journal_events",
+        "ALTER TABLE _astrcontinuum_v2_journal_events RENAME TO journal_events",
+    ),
+    (
+        "rename_capsules",
+        "ALTER TABLE _astrcontinuum_v2_capsules RENAME TO capsules",
+    ),
+    (
+        "rename_snapshots",
+        "ALTER TABLE _astrcontinuum_v2_snapshots RENAME TO snapshots",
+    ),
+    (
+        "rename_storage_security",
+        "ALTER TABLE _astrcontinuum_v2_storage_security RENAME TO storage_security",
+    ),
+    (
+        "index_journal_events",
+        """
+        CREATE INDEX idx_journal_events_session_created
+        ON journal_events (session_key_hash, created_at)
+        """.strip(),
+    ),
+    (
+        "index_capsules",
+        """
+        CREATE INDEX idx_capsules_session_coverage
+        ON capsules (session_key_hash, covered_event_end, covered_event_start)
+        """.strip(),
+    ),
+    (
+        "journal_events_immutable_update",
+        """
+        CREATE TRIGGER journal_events_immutable_update
+        BEFORE UPDATE ON journal_events
+        BEGIN
+            SELECT RAISE(ABORT, 'journal_events rows are immutable');
+        END
+        """.strip(),
+    ),
+    (
+        "journal_events_immutable_delete",
+        """
+        CREATE TRIGGER journal_events_immutable_delete
+        BEFORE DELETE ON journal_events
+        BEGIN
+            SELECT RAISE(ABORT, 'journal_events rows are immutable');
+        END
+        """.strip(),
+    ),
+    (
+        "capsules_immutable_update",
+        """
+        CREATE TRIGGER capsules_immutable_update
+        BEFORE UPDATE ON capsules
+        BEGIN
+            SELECT RAISE(ABORT, 'capsules rows are immutable');
+        END
+        """.strip(),
+    ),
+    (
+        "capsules_immutable_delete",
+        """
+        CREATE TRIGGER capsules_immutable_delete
+        BEFORE DELETE ON capsules
+        BEGIN
+            SELECT RAISE(ABORT, 'capsules rows are immutable');
+        END
+        """.strip(),
+    ),
+    (
+        "snapshots_immutable_update",
+        """
+        CREATE TRIGGER snapshots_immutable_update
+        BEFORE UPDATE ON snapshots
+        BEGIN
+            SELECT RAISE(ABORT, 'snapshots rows are immutable');
+        END
+        """.strip(),
+    ),
+    (
+        "snapshots_immutable_delete",
+        """
+        CREATE TRIGGER snapshots_immutable_delete
+        BEFORE DELETE ON snapshots
+        BEGIN
+            SELECT RAISE(ABORT, 'snapshots rows are immutable');
+        END
+        """.strip(),
+    ),
+    (
+        "journal_events_secure_insert",
+        """
+        CREATE TRIGGER journal_events_secure_insert
+        BEFORE INSERT ON journal_events
+        WHEN substr(NEW.content, 1, 9) <> 'acenc:v1:'
+        BEGIN
+            SELECT RAISE(ABORT, 'journal_events content must be encrypted');
+        END
+        """.strip(),
+    ),
+    (
+        "capsules_secure_insert",
+        """
+        CREATE TRIGGER capsules_secure_insert
+        BEFORE INSERT ON capsules
+        WHEN coalesce(
+            json_valid(NEW.canonical_capsule_json)
+            AND json_type(NEW.canonical_capsule_json) = 'object'
+            AND json_type(
+                NEW.canonical_capsule_json,
+                '$."$astrcontinuum_encrypted"'
+            ) = 'text'
+            AND json_remove(
+                NEW.canonical_capsule_json,
+                '$."$astrcontinuum_encrypted"'
+            ) = '{}'
+        , 0) = 0
+        BEGIN
+            SELECT RAISE(ABORT, 'capsules canonical JSON must be encrypted');
+        END
+        """.strip(),
+    ),
+    (
+        "token_metrics",
+        """
+        CREATE TABLE token_metrics (
+            artifact_kind TEXT NOT NULL
+                CHECK (artifact_kind IN ('EVENT', 'CAPSULE', 'SNAPSHOT')),
+            artifact_id TEXT NOT NULL CHECK (length(trim(artifact_id)) > 0),
+            tokenizer_profile_id TEXT NOT NULL
+                CHECK (length(trim(tokenizer_profile_id)) > 0),
+            metric_envelope TEXT NOT NULL
+                CHECK (substr(metric_envelope, 1, 9) = 'acenc:v1:'),
+            created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0),
+            PRIMARY KEY (artifact_kind, artifact_id, tokenizer_profile_id)
+        )
+        """.strip(),
+    ),
+    (
+        "token_metric_backfill_intents",
+        """
+        CREATE TABLE token_metric_backfill_intents (
+            session_key_hash TEXT NOT NULL,
+            artifact_kind TEXT NOT NULL
+                CHECK (artifact_kind IN ('EVENT', 'CAPSULE', 'SNAPSHOT')),
+            artifact_id TEXT NOT NULL CHECK (length(trim(artifact_id)) > 0),
+            tokenizer_profile_id TEXT NOT NULL
+                CHECK (length(trim(tokenizer_profile_id)) > 0),
+            created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0),
+            PRIMARY KEY (artifact_kind, artifact_id, tokenizer_profile_id),
+            FOREIGN KEY (session_key_hash) REFERENCES sessions(session_key_hash)
+        )
+        """.strip(),
+    ),
+    (
+        "idx_token_metric_backfill_session",
+        """
+        CREATE INDEX idx_token_metric_backfill_session
+        ON token_metric_backfill_intents
+            (session_key_hash, created_at, artifact_kind, artifact_id)
+        """.strip(),
+    ),
+)
+
+SECURE_FORMAT_V2_CONTRACT_SQL = "\n\n".join(
+    f"-- {name}\n{statement.rstrip(';')};" for name, statement in SECURE_FORMAT_V2_DDL
+)
+
 MIGRATIONS = (
+    Migration(version=1, name="initial_schema", sql=INITIAL_SCHEMA_SQL),
     Migration(
-        version=1,
-        name="initial_v1_schema",
-        sql=INITIAL_SCHEMA_SQL,
+        version=2,
+        name="encrypted_token_metrics",
+        sql=SECURE_FORMAT_V2_CONTRACT_SQL,
+        requires_codec=True,
     ),
 )
 
@@ -488,12 +803,12 @@ class SQLiteMigrator:
 
         return self._migrations
 
-    def migrate(self) -> int:
+    def migrate(self, *, include_keyed: bool = False) -> int:
         """Apply all pending migrations and return the durable schema version."""
 
         for attempt in range(_BUSY_RETRY_ATTEMPTS):
             try:
-                return self._migrate_once()
+                return self._migrate_once(include_keyed=include_keyed)
             except MigrationError:
                 raise
             except sqlite3.OperationalError as error:
@@ -506,16 +821,23 @@ class SQLiteMigrator:
 
         raise AssertionError("unreachable migration retry state")
 
-    def _migrate_once(self) -> int:
+    def _migrate_once(self, *, include_keyed: bool) -> int:
         with self._factory.transaction(immediate=True) as connection:
             self._check_sqlite_capabilities(connection)
             connection.execute(_MIGRATION_LEDGER_SQL)
             applied_count = self._validate_ledger(connection)
 
             for migration in self._migrations[applied_count:]:
+                if migration.requires_codec:
+                    if include_keyed:
+                        raise MigrationPlanError(
+                            "keyed migrations require the storage-security runner"
+                        )
+                    break
                 self._apply_one(connection, migration)
+                applied_count += 1
 
-            return self._migrations[-1].version if self._migrations else 0
+            return self._migrations[applied_count - 1].version if applied_count else 0
 
     @staticmethod
     def _check_sqlite_capabilities(connection: sqlite3.Connection) -> None:
@@ -563,7 +885,12 @@ class SQLiteMigrator:
                 raise MigrationChecksumError(
                     "applied migration ledger is not a contiguous plan prefix"
                 )
-            if row["name"] != expected.name:
+            legacy_v1_alias = (
+                expected.version == 1
+                and row["name"] == "initial_v1_schema"
+                and row["checksum"] == expected.checksum
+            )
+            if row["name"] != expected.name and not legacy_v1_alias:
                 raise MigrationChecksumError(
                     f"migration {expected.version} name does not match the ledger"
                 )

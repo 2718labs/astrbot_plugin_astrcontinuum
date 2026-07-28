@@ -81,6 +81,135 @@ def test_text_envelope_round_trips_utf8_and_uses_unique_nonces(plaintext: str) -
     assert codec.decrypt_text("journal_events", "content", "evt:1", second) == plaintext
 
 
+@pytest.mark.parametrize("value", [0, 1, 2**63 - 1])
+def test_non_negative_integer_round_trips_canonical_decimal(value: int) -> None:
+    codec = SecureCodec(RAW_KEY)
+
+    envelope = codec.encrypt_non_negative_int(
+        "journal_events",
+        "token_count",
+        "evt:1",
+        value,
+    )
+
+    assert envelope.startswith(f"acenc:v1:{codec.key_id}:")
+    assert (
+        codec.decrypt_non_negative_int(
+            "journal_events",
+            "token_count",
+            "evt:1",
+            envelope,
+        )
+        == value
+    )
+
+
+@pytest.mark.parametrize("value", [True, False, -1, 1.0, "1", "01", None])
+def test_non_negative_integer_encrypt_rejects_non_integer_domain_values(
+    value: object,
+) -> None:
+    codec = SecureCodec(RAW_KEY)
+
+    with pytest.raises(StorageSecurityError) as raised:
+        codec.encrypt_non_negative_int(
+            "journal_events",
+            "token_count",
+            "evt:1",
+            value,
+        )
+
+    _assert_code(raised, SecurityErrorCode.STORAGE_ENVELOPE_INVALID)
+    assert raised.value.__cause__ is None
+    assert repr(value) not in repr(raised.value)
+
+
+@pytest.mark.parametrize("plaintext", ["", "01", "+1", "-1", "1.0", "１２"])
+def test_non_negative_integer_decrypt_rejects_noncanonical_decimal(
+    plaintext: str,
+) -> None:
+    codec = SecureCodec(RAW_KEY)
+    envelope = codec.encrypt_text(
+        "journal_events",
+        "token_count",
+        "evt:1",
+        plaintext,
+    )
+
+    with pytest.raises(StorageSecurityError) as raised:
+        codec.decrypt_non_negative_int(
+            "journal_events",
+            "token_count",
+            "evt:1",
+            envelope,
+        )
+
+    _assert_code(raised, SecurityErrorCode.STORAGE_ENVELOPE_INVALID)
+    assert raised.value.__cause__ is None
+    if plaintext:
+        assert plaintext not in repr(raised.value)
+
+
+@pytest.mark.parametrize(
+    ("table", "column", "record_key"),
+    [
+        ("snapshots", "token_count", "evt:1"),
+        ("journal_events", "token_cost", "evt:1"),
+        ("journal_events", "token_count", "evt:2"),
+    ],
+)
+def test_non_negative_integer_aad_rejects_context_swaps(
+    table: str,
+    column: str,
+    record_key: str,
+) -> None:
+    codec = SecureCodec(RAW_KEY)
+    envelope = codec.encrypt_non_negative_int(
+        "journal_events",
+        "token_count",
+        "evt:1",
+        17,
+    )
+
+    with pytest.raises(StorageSecurityError) as raised:
+        codec.decrypt_non_negative_int(table, column, record_key, envelope)
+
+    _assert_code(raised, SecurityErrorCode.STORAGE_AUTHENTICATION_FAILED)
+
+
+def test_non_negative_integer_rejects_ciphertext_swapped_between_rows() -> None:
+    codec = SecureCodec(RAW_KEY)
+    first = codec.encrypt_non_negative_int(
+        "journal_events",
+        "token_count",
+        "evt:1",
+        17,
+    )
+    second = codec.encrypt_non_negative_int(
+        "journal_events",
+        "token_count",
+        "evt:2",
+        23,
+    )
+
+    with pytest.raises(StorageSecurityError) as first_swap:
+        codec.decrypt_non_negative_int(
+            "journal_events",
+            "token_count",
+            "evt:1",
+            second,
+        )
+    with pytest.raises(StorageSecurityError) as second_swap:
+        codec.decrypt_non_negative_int(
+            "journal_events",
+            "token_count",
+            "evt:2",
+            first,
+        )
+
+    _assert_code(first_swap, SecurityErrorCode.STORAGE_AUTHENTICATION_FAILED)
+    _assert_code(second_swap, SecurityErrorCode.STORAGE_AUTHENTICATION_FAILED)
+
+
 def test_plaintext_and_envelope_bounds_are_enforced_before_crypto() -> None:
     codec = SecureCodec(RAW_KEY, max_plaintext_bytes=8, max_envelope_chars=160)
 

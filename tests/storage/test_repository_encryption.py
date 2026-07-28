@@ -218,12 +218,12 @@ def test_compaction_rejects_cross_session_base_snapshot_relationship(
                 source_high_water_mark,
                 exact_anchor_ids_json,
                 rendered_context,
-                token_cost,
+                token_cost_envelope,
                 audit_outcome,
                 lifecycle_state,
                 created_at,
                 committed_at
-            ) VALUES (?, ?, NULL, 1, 1, ?, ?, 0, ?, 'COMMITTED', ?, ?)
+            ) VALUES (?, ?, NULL, 1, 1, ?, ?, ?, ?, 'COMMITTED', ?, ?)
             """,
             (
                 snapshot_id,
@@ -239,6 +239,12 @@ def test_compaction_rejects_cross_session_base_snapshot_relationship(
                     "rendered_context",
                     snapshot_id,
                     f"{PLAINTEXT_MARKER}-foreign-snapshot",
+                ),
+                activation.codec.encrypt_non_negative_int(
+                    "snapshots",
+                    "token_cost",
+                    snapshot_id,
+                    0,
                 ),
                 activation.codec.encrypt_object_json(
                     "snapshots",

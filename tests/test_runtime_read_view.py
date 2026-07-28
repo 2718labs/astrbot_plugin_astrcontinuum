@@ -324,7 +324,7 @@ def seed_active_snapshot(
             """
             INSERT INTO capsules (
                 capsule_id, session_key_hash, level, covered_event_start,
-                covered_event_end, canonical_capsule_json, token_cost,
+                covered_event_end, canonical_capsule_json, token_cost_envelope,
                 source_coverage, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
@@ -335,7 +335,12 @@ def seed_active_snapshot(
                 item.covered_event_start,
                 item.covered_event_end,
                 protected_capsule,
-                item.token_cost,
+                codec.encrypt_non_negative_int(
+                    "capsules",
+                    "token_cost",
+                    item.capsule_id,
+                    item.token_cost,
+                ),
                 item.quality.source_coverage,
                 timestamp,
             ),
@@ -345,7 +350,8 @@ def seed_active_snapshot(
             INSERT INTO snapshots (
                 snapshot_id, session_key_hash, base_snapshot_id, covered_event_end,
                 source_high_water_mark, exact_anchor_ids_json, rendered_context,
-                token_cost, audit_outcome, lifecycle_state, created_at, committed_at
+                token_cost_envelope, audit_outcome, lifecycle_state, created_at,
+                committed_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMMITTED', ?, ?)
             """,
             (
@@ -356,7 +362,12 @@ def seed_active_snapshot(
                 snapshot.source_high_water_mark,
                 protected_anchor_ids,
                 protected_rendered_context,
-                snapshot.token_cost,
+                codec.encrypt_non_negative_int(
+                    "snapshots",
+                    "token_cost",
+                    snapshot.snapshot_id,
+                    snapshot.token_cost,
+                ),
                 protected_audit_outcome,
                 timestamp,
                 timestamp,

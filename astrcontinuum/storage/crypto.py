@@ -279,6 +279,50 @@ class SecureCodec:
         except UnicodeDecodeError:
             _invalid()
 
+    def encrypt_non_negative_int(
+        self,
+        table: str,
+        column: str,
+        record_key: str,
+        value: object,
+    ) -> str:
+        """Encrypt one non-negative integer as canonical ASCII decimal."""
+
+        if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+            _invalid()
+        try:
+            plaintext = str(value)
+        except (OverflowError, ValueError):
+            _invalid()
+        return self.encrypt_text(table, column, record_key, plaintext)
+
+    def decrypt_non_negative_int(
+        self,
+        table: str,
+        column: str,
+        record_key: str,
+        envelope: object,
+    ) -> int:
+        """Authenticate and decode one canonical non-negative integer."""
+
+        if not isinstance(envelope, str):
+            _invalid()
+        plaintext = self.decrypt_text(table, column, record_key, envelope)
+        if (
+            not plaintext
+            or not plaintext.isascii()
+            or not plaintext.isdecimal()
+            or (plaintext != "0" and plaintext.startswith("0"))
+        ):
+            _invalid()
+        try:
+            value = int(plaintext)
+        except (OverflowError, ValueError):
+            _invalid()
+        if value < 0 or str(value) != plaintext:
+            _invalid()
+        return value
+
     def encrypt_object_json(
         self,
         table: str,

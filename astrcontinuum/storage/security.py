@@ -36,14 +36,20 @@ from .crypto import (
     key_id_for,
     parse_key_text,
 )
-from .migrations import MigrationError, SQLiteMigrator
+from .migrations import (
+    MIGRATIONS,
+    SECURE_FORMAT_V2_DDL,
+    MigrationError,
+    SQLiteMigrator,
+)
 from .sqlite import SQLiteConnectionFactory
 
 ACTIVE_KEY_ENV = "ASTRCONTINUUM_MASTER_KEY"
 PREVIOUS_KEY_ENV = "ASTRCONTINUUM_PREVIOUS_KEY"
 LOCAL_KEY_FILENAME = "astrcontinuum.key"
 MAX_KEY_FILE_BYTES = 128
-STORAGE_FORMAT_VERSION = 1
+STORAGE_FORMAT_VERSION = 2
+_LEGACY_STORAGE_FORMAT_VERSION = 1
 _SECURITY_SINGLETON_ID = 1
 _VERIFIER_PLAINTEXT = "astrcontinuum-storage-verifier:v1"
 _ENVELOPE_SQL_PREFIX = "acenc:v1:"
@@ -493,7 +499,8 @@ CREATE TABLE {_SECURE_SNAPSHOTS_TABLE} (
 _STORAGE_SECURITY_SQL = f"""
 CREATE TABLE storage_security (
     singleton_id INTEGER NOT NULL PRIMARY KEY CHECK (singleton_id = {_SECURITY_SINGLETON_ID}),
-    format_version INTEGER NOT NULL CHECK (format_version = {STORAGE_FORMAT_VERSION}),
+    format_version INTEGER NOT NULL
+        CHECK (format_version = {_LEGACY_STORAGE_FORMAT_VERSION}),
     active_key_id TEXT NOT NULL
         CHECK (
             length(active_key_id) = 16
@@ -1107,7 +1114,7 @@ def _transform_legacy(
         """,
         (
             _SECURITY_SINGLETON_ID,
-            STORAGE_FORMAT_VERSION,
+            _LEGACY_STORAGE_FORMAT_VERSION,
             codec.key_id,
             StorageMaintenanceState.NEEDS_SCRUB.value,
             verifier,
@@ -1174,7 +1181,7 @@ def _read_security_metadata(
         verifier = str(row["key_verifier"])
     except (TypeError, ValueError):
         _raise(SecurityErrorCode.STORAGE_MIGRATION_FAILED)
-    if format_version != STORAGE_FORMAT_VERSION:
+    if format_version not in (_LEGACY_STORAGE_FORMAT_VERSION, STORAGE_FORMAT_VERSION):
         _raise(SecurityErrorCode.STORAGE_MIGRATION_FAILED)
     return format_version, active_key_id, state, verifier
 
@@ -1275,6 +1282,635 @@ def _rekey_array(
     return (
         plaintext,
         active.encrypt_array_json(table, column, record_key, plaintext),
+    )
+
+
+def _rekey_non_negative_int(
+    previous: SecureCodec,
+    active: SecureCodec,
+    *,
+    table: str,
+    column: str,
+    record_key: str,
+    envelope: object,
+) -> tuple[int, str]:
+    plaintext = previous.decrypt_non_negative_int(
+        table,
+        column,
+        record_key,
+        envelope,
+    )
+    return (
+        plaintext,
+        active.encrypt_non_negative_int(
+            table,
+            column,
+            record_key,
+            plaintext,
+        ),
+    )
+
+
+_FORMAT_V2_DDL = dict(SECURE_FORMAT_V2_DDL)
+
+
+def _execute_format_v2_ddl(
+    connection: sqlite3.Connection,
+    *names: str,
+) -> None:
+    for name in names:
+        statement = _FORMAT_V2_DDL.get(name)
+        if statement is None:
+            _raise(SecurityErrorCode.STORAGE_MIGRATION_FAILED)
+        connection.execute(statement)
+
+
+def _format_one_count(value: object) -> int:
+    if type(value) is not int or value < 0:
+        _raise(SecurityErrorCode.STORAGE_MIGRATION_FAILED)
+    return value
+
+
+def _rewrite_format_two_sessions(
+    connection: sqlite3.Connection,
+    *,
+    source: SecureCodec,
+    target: SecureCodec,
+) -> None:
+    for row in _batched_rows(connection, "sessions", "session_key_hash"):
+        record_key = str(row["session_key_hash"])
+        canonical_plaintext, canonical_encrypted = _rekey_object(
+            source,
+            target,
+            table="sessions",
+            column="canonical_session_key_json",
+            record_key=record_key,
+            sentinel=str(row["canonical_session_key_json"]),
+        )
+        identity_plaintext: dict[str, str | None] = {}
+        identity_encrypted: dict[str, str | None] = {}
+        for column in _SESSION_IDENTITY_COLUMNS:
+            if row[column] is None:
+                identity_plaintext[column] = None
+                identity_encrypted[column] = None
+                continue
+            plaintext, encrypted = _rekey_text(
+                source,
+                target,
+                table="sessions",
+                column=column,
+                record_key=record_key,
+                envelope=str(row[column]),
+            )
+            identity_plaintext[column] = plaintext
+            identity_encrypted[column] = encrypted
+
+        connection.execute(
+            """
+            UPDATE sessions
+            SET
+                canonical_session_key_json = ?,
+                platform_instance_id = ?,
+                message_type = ?,
+                session_id = ?,
+                group_id = ?,
+                user_id = ?,
+                conversation_id = ?,
+                persona_id = ?
+            WHERE session_key_hash = ?
+            """,
+            (
+                canonical_encrypted,
+                identity_encrypted["platform_instance_id"],
+                identity_encrypted["message_type"],
+                identity_encrypted["session_id"],
+                identity_encrypted["group_id"],
+                identity_encrypted["user_id"],
+                identity_encrypted["conversation_id"],
+                identity_encrypted["persona_id"],
+                record_key,
+            ),
+        )
+        stored = connection.execute(
+            "SELECT * FROM sessions WHERE session_key_hash = ?",
+            (record_key,),
+        ).fetchone()
+        if stored is None:
+            _raise(SecurityErrorCode.STORAGE_MIGRATION_FAILED)
+        _assert_wire(
+            target.decrypt_object_json(
+                "sessions",
+                "canonical_session_key_json",
+                record_key,
+                stored["canonical_session_key_json"],
+            ),
+            canonical_plaintext,
+        )
+        for column in _SESSION_IDENTITY_COLUMNS:
+            expected_plaintext = identity_plaintext[column]
+            if expected_plaintext is None:
+                if stored[column] is not None:
+                    _raise(SecurityErrorCode.STORAGE_MIGRATION_FAILED)
+                continue
+            _assert_wire(
+                target.decrypt_text(
+                    "sessions",
+                    column,
+                    record_key,
+                    stored[column],
+                ),
+                expected_plaintext,
+            )
+
+
+def _copy_format_two_journal_events(
+    connection: sqlite3.Connection,
+    *,
+    source: SecureCodec,
+    target: SecureCodec,
+    fault_injector: StorageFaultInjector | None,
+) -> None:
+    for row in _batched_rows(connection, "journal_events", "event_id"):
+        record_key = str(row["event_id"])
+        content = source.decrypt_text(
+            "journal_events",
+            "content",
+            record_key,
+            str(row["content"]),
+        )
+        count = _format_one_count(row["token_count"])
+        encrypted_content = target.encrypt_text(
+            "journal_events",
+            "content",
+            record_key,
+            content,
+        )
+        encrypted_count = target.encrypt_non_negative_int(
+            "journal_events",
+            "token_count",
+            record_key,
+            count,
+        )
+        connection.execute(
+            """
+            INSERT INTO _astrcontinuum_v2_journal_events (
+                event_id,
+                session_key_hash,
+                sequence,
+                event_type,
+                role,
+                content,
+                source_hook,
+                idempotency_key,
+                token_count_envelope,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record_key,
+                row["session_key_hash"],
+                row["sequence"],
+                row["event_type"],
+                row["role"],
+                encrypted_content,
+                row["source_hook"],
+                row["idempotency_key"],
+                encrypted_count,
+                row["created_at"],
+            ),
+        )
+        stored = connection.execute(
+            """
+            SELECT content, token_count_envelope
+            FROM _astrcontinuum_v2_journal_events
+            WHERE event_id = ?
+            """,
+            (record_key,),
+        ).fetchone()
+        if stored is None:
+            _raise(SecurityErrorCode.STORAGE_MIGRATION_FAILED)
+        _assert_wire(
+            target.decrypt_text(
+                "journal_events",
+                "content",
+                record_key,
+                stored["content"],
+            ),
+            content,
+        )
+        if (
+            target.decrypt_non_negative_int(
+                "journal_events",
+                "token_count",
+                record_key,
+                stored["token_count_envelope"],
+            )
+            != count
+        ):
+            _raise(SecurityErrorCode.STORAGE_MIGRATION_FAILED)
+    _inject(fault_injector, "security_v2.after_journal_copy")
+
+
+def _copy_format_two_capsules(
+    connection: sqlite3.Connection,
+    *,
+    source: SecureCodec,
+    target: SecureCodec,
+    fault_injector: StorageFaultInjector | None,
+) -> None:
+    for row in _batched_rows(connection, "capsules", "capsule_id"):
+        record_key = str(row["capsule_id"])
+        canonical = source.decrypt_object_json(
+            "capsules",
+            "canonical_capsule_json",
+            record_key,
+            str(row["canonical_capsule_json"]),
+        )
+        count = _format_one_count(row["token_cost"])
+        encrypted_canonical = target.encrypt_object_json(
+            "capsules",
+            "canonical_capsule_json",
+            record_key,
+            canonical,
+        )
+        encrypted_count = target.encrypt_non_negative_int(
+            "capsules",
+            "token_cost",
+            record_key,
+            count,
+        )
+        connection.execute(
+            """
+            INSERT INTO _astrcontinuum_v2_capsules (
+                capsule_id,
+                session_key_hash,
+                level,
+                covered_event_start,
+                covered_event_end,
+                canonical_capsule_json,
+                token_cost_envelope,
+                source_coverage,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record_key,
+                row["session_key_hash"],
+                row["level"],
+                row["covered_event_start"],
+                row["covered_event_end"],
+                encrypted_canonical,
+                encrypted_count,
+                row["source_coverage"],
+                row["created_at"],
+            ),
+        )
+        stored = connection.execute(
+            """
+            SELECT canonical_capsule_json, token_cost_envelope
+            FROM _astrcontinuum_v2_capsules
+            WHERE capsule_id = ?
+            """,
+            (record_key,),
+        ).fetchone()
+        if stored is None:
+            _raise(SecurityErrorCode.STORAGE_MIGRATION_FAILED)
+        _assert_wire(
+            target.decrypt_object_json(
+                "capsules",
+                "canonical_capsule_json",
+                record_key,
+                stored["canonical_capsule_json"],
+            ),
+            canonical,
+        )
+        if (
+            target.decrypt_non_negative_int(
+                "capsules",
+                "token_cost",
+                record_key,
+                stored["token_cost_envelope"],
+            )
+            != count
+        ):
+            _raise(SecurityErrorCode.STORAGE_MIGRATION_FAILED)
+    _inject(fault_injector, "security_v2.after_capsule_copy")
+
+
+def _copy_format_two_snapshots(
+    connection: sqlite3.Connection,
+    *,
+    source: SecureCodec,
+    target: SecureCodec,
+    fault_injector: StorageFaultInjector | None,
+) -> None:
+    for row in _batched_rows(connection, "snapshots", "snapshot_id"):
+        record_key = str(row["snapshot_id"])
+        exact_anchors = source.decrypt_array_json(
+            "snapshots",
+            "exact_anchor_ids_json",
+            record_key,
+            str(row["exact_anchor_ids_json"]),
+        )
+        rendered = source.decrypt_text(
+            "snapshots",
+            "rendered_context",
+            record_key,
+            str(row["rendered_context"]),
+        )
+        audit = source.decrypt_object_json(
+            "snapshots",
+            "audit_outcome",
+            record_key,
+            str(row["audit_outcome"]),
+        )
+        count = _format_one_count(row["token_cost"])
+        encrypted_exact = target.encrypt_array_json(
+            "snapshots",
+            "exact_anchor_ids_json",
+            record_key,
+            exact_anchors,
+        )
+        encrypted_rendered = target.encrypt_text(
+            "snapshots",
+            "rendered_context",
+            record_key,
+            rendered,
+        )
+        encrypted_count = target.encrypt_non_negative_int(
+            "snapshots",
+            "token_cost",
+            record_key,
+            count,
+        )
+        encrypted_audit = target.encrypt_object_json(
+            "snapshots",
+            "audit_outcome",
+            record_key,
+            audit,
+        )
+        connection.execute(
+            """
+            INSERT INTO _astrcontinuum_v2_snapshots (
+                snapshot_id,
+                session_key_hash,
+                base_snapshot_id,
+                covered_event_end,
+                source_high_water_mark,
+                exact_anchor_ids_json,
+                rendered_context,
+                token_cost_envelope,
+                audit_outcome,
+                lifecycle_state,
+                created_at,
+                committed_at
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                record_key,
+                row["session_key_hash"],
+                row["base_snapshot_id"],
+                row["covered_event_end"],
+                row["source_high_water_mark"],
+                encrypted_exact,
+                encrypted_rendered,
+                encrypted_count,
+                encrypted_audit,
+                row["lifecycle_state"],
+                row["created_at"],
+                row["committed_at"],
+            ),
+        )
+        stored = connection.execute(
+            """
+            SELECT
+                exact_anchor_ids_json,
+                rendered_context,
+                token_cost_envelope,
+                audit_outcome
+            FROM _astrcontinuum_v2_snapshots
+            WHERE snapshot_id = ?
+            """,
+            (record_key,),
+        ).fetchone()
+        if stored is None:
+            _raise(SecurityErrorCode.STORAGE_MIGRATION_FAILED)
+        _assert_wire(
+            target.decrypt_array_json(
+                "snapshots",
+                "exact_anchor_ids_json",
+                record_key,
+                stored["exact_anchor_ids_json"],
+            ),
+            exact_anchors,
+        )
+        _assert_wire(
+            target.decrypt_text(
+                "snapshots",
+                "rendered_context",
+                record_key,
+                stored["rendered_context"],
+            ),
+            rendered,
+        )
+        if (
+            target.decrypt_non_negative_int(
+                "snapshots",
+                "token_cost",
+                record_key,
+                stored["token_cost_envelope"],
+            )
+            != count
+        ):
+            _raise(SecurityErrorCode.STORAGE_MIGRATION_FAILED)
+        _assert_wire(
+            target.decrypt_object_json(
+                "snapshots",
+                "audit_outcome",
+                record_key,
+                stored["audit_outcome"],
+            ),
+            audit,
+        )
+    _inject(fault_injector, "security_v2.after_snapshot_copy")
+
+
+def _apply_secure_format_two(
+    connection: sqlite3.Connection,
+    *,
+    source: SecureCodec,
+    target: SecureCodec,
+    fault_injector: StorageFaultInjector | None,
+) -> None:
+    metadata = connection.execute(
+        """
+        SELECT *
+        FROM storage_security
+        WHERE singleton_id = ?
+        """,
+        (_SECURITY_SINGLETON_ID,),
+    ).fetchone()
+    if (
+        metadata is None
+        or metadata["format_version"] != _LEGACY_STORAGE_FORMAT_VERSION
+        or metadata["active_key_id"] != source.key_id
+        or metadata["state"] != StorageMaintenanceState.ACTIVE.value
+    ):
+        _raise(SecurityErrorCode.STORAGE_MIGRATION_FAILED)
+    _authenticate_verifier(source, str(metadata["key_verifier"]))
+    counts = {
+        table: int(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+        for table in _COUNTED_TABLES
+    }
+
+    _execute_format_v2_ddl(
+        connection,
+        "create_journal_events",
+        "create_capsules",
+        "create_snapshots",
+        "create_storage_security",
+    )
+    _rewrite_format_two_sessions(connection, source=source, target=target)
+    _copy_format_two_journal_events(
+        connection,
+        source=source,
+        target=target,
+        fault_injector=fault_injector,
+    )
+    _copy_format_two_capsules(
+        connection,
+        source=source,
+        target=target,
+        fault_injector=fault_injector,
+    )
+    _copy_format_two_snapshots(
+        connection,
+        source=source,
+        target=target,
+        fault_injector=fault_injector,
+    )
+
+    verifier = target.encrypt_text(
+        "storage_security",
+        "key_verifier",
+        str(_SECURITY_SINGLETON_ID),
+        _VERIFIER_PLAINTEXT,
+    )
+    now = _utc_now()
+    connection.execute(
+        """
+        INSERT INTO _astrcontinuum_v2_storage_security (
+            singleton_id,
+            format_version,
+            active_key_id,
+            state,
+            key_verifier,
+            created_at,
+            updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            _SECURITY_SINGLETON_ID,
+            STORAGE_FORMAT_VERSION,
+            target.key_id,
+            StorageMaintenanceState.NEEDS_SCRUB.value,
+            verifier,
+            metadata["created_at"],
+            now,
+        ),
+    )
+
+    _execute_format_v2_ddl(
+        connection,
+        "drop_journal_events",
+        "drop_capsules",
+        "drop_snapshots",
+        "drop_storage_security",
+        "rename_journal_events",
+        "rename_capsules",
+        "rename_snapshots",
+        "rename_storage_security",
+        "index_journal_events",
+        "index_capsules",
+        "journal_events_immutable_update",
+        "journal_events_immutable_delete",
+        "capsules_immutable_update",
+        "capsules_immutable_delete",
+        "snapshots_immutable_update",
+        "snapshots_immutable_delete",
+        "journal_events_secure_insert",
+        "capsules_secure_insert",
+        "token_metrics",
+        "token_metric_backfill_intents",
+        "idx_token_metric_backfill_session",
+    )
+
+    for table, expected in counts.items():
+        actual = int(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
+        if actual != expected:
+            _raise(SecurityErrorCode.STORAGE_MIGRATION_FAILED)
+    if connection.execute("PRAGMA foreign_key_check").fetchall():
+        _raise(SecurityErrorCode.STORAGE_MIGRATION_FAILED)
+    _authenticate_verifier(target, verifier)
+    _inject(fault_injector, "security_v2.after_verify")
+
+    migration = MIGRATIONS[1]
+    connection.execute(
+        """
+        INSERT INTO schema_migrations (version, name, checksum, applied_at)
+        VALUES (?, ?, ?, ?)
+        """,
+        (
+            migration.version,
+            migration.name,
+            migration.checksum,
+            now,
+        ),
+    )
+    connection.execute(f"PRAGMA user_version = {STORAGE_FORMAT_VERSION}")
+
+
+def _upgrade_secure_format_one(
+    factory: SQLiteConnectionFactory,
+    *,
+    source: SecureCodec,
+    target: SecureCodec,
+    rekeyed: bool,
+    fault_injector: StorageFaultInjector | None,
+) -> StorageSecurityActivation:
+    try:
+        with factory.startup_exclusive_transaction(enforce_foreign_keys=False) as connection:
+            _apply_secure_format_two(
+                connection,
+                source=source,
+                target=target,
+                fault_injector=fault_injector,
+            )
+    except StorageSecurityError:
+        _raise(SecurityErrorCode.STORAGE_MIGRATION_FAILED)
+    except (OSError, RuntimeError, TypeError, ValueError, sqlite3.Error):
+        _raise(SecurityErrorCode.STORAGE_MIGRATION_FAILED)
+
+    try:
+        _inject(fault_injector, "security_v2.after_commit")
+    except _InjectedStorageFault:
+        _raise(SecurityErrorCode.STORAGE_SCRUB_FAILED)
+    _scrub_storage(factory, fault_injector=fault_injector)
+    format_version, key_id, state, verifier = _read_security_metadata(factory)
+    if (
+        format_version != STORAGE_FORMAT_VERSION
+        or key_id != target.key_id
+        or state is not StorageMaintenanceState.ACTIVE
+    ):
+        _raise(SecurityErrorCode.STORAGE_MIGRATION_FAILED)
+    _authenticate_verifier(target, verifier)
+    return StorageSecurityActivation(
+        codec=target,
+        key_id=target.key_id,
+        state=state,
+        migrated=True,
+        rekeyed=rekeyed,
+        scrubbed=True,
     )
 
 
@@ -1403,12 +2039,28 @@ def _rekey_storage(
             record_key=record_key,
             envelope=str(row["content"]),
         )
+        count_plaintext, count_encrypted = _rekey_non_negative_int(
+            previous,
+            active,
+            table="journal_events",
+            column="token_count",
+            record_key=record_key,
+            envelope=row["token_count_envelope"],
+        )
         connection.execute(
-            "UPDATE journal_events SET content = ? WHERE event_id = ?",
-            (encrypted, record_key),
+            """
+            UPDATE journal_events
+            SET content = ?, token_count_envelope = ?
+            WHERE event_id = ?
+            """,
+            (encrypted, count_encrypted, record_key),
         )
         stored = connection.execute(
-            "SELECT content FROM journal_events WHERE event_id = ?",
+            """
+            SELECT content, token_count_envelope
+            FROM journal_events
+            WHERE event_id = ?
+            """,
             (record_key,),
         ).fetchone()
         _assert_wire(
@@ -1420,6 +2072,16 @@ def _rekey_storage(
             ),
             plaintext,
         )
+        if (
+            active.decrypt_non_negative_int(
+                "journal_events",
+                "token_count",
+                record_key,
+                stored["token_count_envelope"],
+            )
+            != count_plaintext
+        ):
+            _raise(SecurityErrorCode.STORAGE_REKEY_FAILED)
 
     for row in _batched_rows(connection, "capsules", "capsule_id"):
         record_key = str(row["capsule_id"])
@@ -1431,16 +2093,28 @@ def _rekey_storage(
             record_key=record_key,
             sentinel=str(row["canonical_capsule_json"]),
         )
+        count_plaintext, count_encrypted = _rekey_non_negative_int(
+            previous,
+            active,
+            table="capsules",
+            column="token_cost",
+            record_key=record_key,
+            envelope=row["token_cost_envelope"],
+        )
         connection.execute(
             """
             UPDATE capsules
-            SET canonical_capsule_json = ?
+            SET canonical_capsule_json = ?, token_cost_envelope = ?
             WHERE capsule_id = ?
             """,
-            (encrypted, record_key),
+            (encrypted, count_encrypted, record_key),
         )
         stored = connection.execute(
-            "SELECT canonical_capsule_json FROM capsules WHERE capsule_id = ?",
+            """
+            SELECT canonical_capsule_json, token_cost_envelope
+            FROM capsules
+            WHERE capsule_id = ?
+            """,
             (record_key,),
         ).fetchone()
         _assert_wire(
@@ -1452,6 +2126,16 @@ def _rekey_storage(
             ),
             plaintext,
         )
+        if (
+            active.decrypt_non_negative_int(
+                "capsules",
+                "token_cost",
+                record_key,
+                stored["token_cost_envelope"],
+            )
+            != count_plaintext
+        ):
+            _raise(SecurityErrorCode.STORAGE_REKEY_FAILED)
 
     for row in _batched_rows(connection, "snapshots", "snapshot_id"):
         record_key = str(row["snapshot_id"])
@@ -1471,6 +2155,14 @@ def _rekey_storage(
             record_key=record_key,
             envelope=str(row["rendered_context"]),
         )
+        count_plaintext, count_encrypted = _rekey_non_negative_int(
+            previous,
+            active,
+            table="snapshots",
+            column="token_cost",
+            record_key=record_key,
+            envelope=row["token_cost_envelope"],
+        )
         audit_plaintext, audit_encrypted = _rekey_object(
             previous,
             active,
@@ -1485,12 +2177,14 @@ def _rekey_storage(
             SET
                 exact_anchor_ids_json = ?,
                 rendered_context = ?,
+                token_cost_envelope = ?,
                 audit_outcome = ?
             WHERE snapshot_id = ?
             """,
             (
                 exact_encrypted,
                 rendered_encrypted,
+                count_encrypted,
                 audit_encrypted,
                 record_key,
             ),
@@ -1517,6 +2211,16 @@ def _rekey_storage(
             ),
             rendered_plaintext,
         )
+        if (
+            active.decrypt_non_negative_int(
+                "snapshots",
+                "token_cost",
+                record_key,
+                stored["token_cost_envelope"],
+            )
+            != count_plaintext
+        ):
+            _raise(SecurityErrorCode.STORAGE_REKEY_FAILED)
         _assert_wire(
             active.decrypt_object_json(
                 "snapshots",
@@ -1638,31 +2342,63 @@ def _activate_existing(
     *,
     fault_injector: StorageFaultInjector | None,
 ) -> StorageSecurityActivation:
-    _, durable_key_id, state, verifier = _read_security_metadata(factory)
-    codec = SecureCodec(keys.active.raw_key)
-    if durable_key_id != codec.key_id:
-        return _rotate_storage(
-            factory,
-            keys,
-            durable_key_id=durable_key_id,
-            verifier=verifier,
-            fault_injector=fault_injector,
-        )
-    _authenticate_verifier(codec, verifier)
+    format_version, durable_key_id, state, verifier = _read_security_metadata(factory)
+    target = SecureCodec(keys.active.raw_key)
+    rekeyed = durable_key_id != target.key_id
+    if rekeyed:
+        if keys.previous is None or keys.previous.key_id != durable_key_id:
+            _raise(SecurityErrorCode.STORAGE_PREVIOUS_KEY_REQUIRED)
+        source = SecureCodec(keys.previous.raw_key)
+        try:
+            _authenticate_verifier(source, verifier)
+        except StorageSecurityError:
+            _raise(SecurityErrorCode.STORAGE_PREVIOUS_KEY_REQUIRED)
+    else:
+        source = target
+        _authenticate_verifier(source, verifier)
+
     scrubbed = False
     if state is StorageMaintenanceState.NEEDS_SCRUB:
         _scrub_storage(factory, fault_injector=fault_injector)
         scrubbed = True
     elif state is not StorageMaintenanceState.ACTIVE:
         _raise(SecurityErrorCode.STORAGE_MIGRATION_FAILED)
-    _, active_key_id, final_state, final_verifier = _read_security_metadata(factory)
-    if active_key_id != codec.key_id or final_state is not StorageMaintenanceState.ACTIVE:
+
+    (
+        current_format,
+        current_key_id,
+        current_state,
+        current_verifier,
+    ) = _read_security_metadata(factory)
+    if (
+        current_format != format_version
+        or current_key_id != durable_key_id
+        or current_state is not StorageMaintenanceState.ACTIVE
+    ):
         _raise(SecurityErrorCode.STORAGE_MIGRATION_FAILED)
-    _authenticate_verifier(codec, final_verifier)
+    _authenticate_verifier(source, current_verifier)
+
+    if format_version == _LEGACY_STORAGE_FORMAT_VERSION:
+        return _upgrade_secure_format_one(
+            factory,
+            source=source,
+            target=target,
+            rekeyed=rekeyed,
+            fault_injector=fault_injector,
+        )
+    if rekeyed:
+        return _rotate_storage(
+            factory,
+            keys,
+            durable_key_id=durable_key_id,
+            verifier=current_verifier,
+            fault_injector=fault_injector,
+        )
+
     return StorageSecurityActivation(
-        codec=codec,
-        key_id=codec.key_id,
-        state=final_state,
+        codec=target,
+        key_id=target.key_id,
+        state=current_state,
         migrated=False,
         rekeyed=False,
         scrubbed=scrubbed,
@@ -1725,15 +2461,8 @@ def activate_storage_security(
     except _InjectedStorageFault:
         _raise(SecurityErrorCode.STORAGE_SCRUB_FAILED)
     _scrub_storage(factory, fault_injector=fault_injector)
-    _, key_id, state, verifier = _read_security_metadata(factory)
-    if key_id != codec.key_id or state is not StorageMaintenanceState.ACTIVE:
-        _raise(SecurityErrorCode.STORAGE_MIGRATION_FAILED)
-    _authenticate_verifier(codec, verifier)
-    return StorageSecurityActivation(
-        codec=codec,
-        key_id=codec.key_id,
-        state=state,
-        migrated=True,
-        rekeyed=False,
-        scrubbed=True,
+    return _activate_existing(
+        factory,
+        keys,
+        fault_injector=fault_injector,
     )

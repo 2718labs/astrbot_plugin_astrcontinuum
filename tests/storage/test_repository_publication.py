@@ -370,7 +370,7 @@ def seed_winning_snapshot(store: ac.SQLiteRepository) -> ac.SnapshotEnvelope:
                 covered_event_start,
                 covered_event_end,
                 canonical_capsule_json,
-                token_cost,
+                token_cost_envelope,
                 source_coverage,
                 created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -387,7 +387,12 @@ def seed_winning_snapshot(store: ac.SQLiteRepository) -> ac.SnapshotEnvelope:
                     item.capsule_id,
                     canonical_json(item),
                 ),
-                item.token_cost,
+                codec.encrypt_non_negative_int(
+                    "capsules",
+                    "token_cost",
+                    item.capsule_id,
+                    item.token_cost,
+                ),
                 item.quality.source_coverage,
                 timestamp,
             ),
@@ -402,7 +407,7 @@ def seed_winning_snapshot(store: ac.SQLiteRepository) -> ac.SnapshotEnvelope:
                 source_high_water_mark,
                 exact_anchor_ids_json,
                 rendered_context,
-                token_cost,
+                token_cost_envelope,
                 audit_outcome,
                 lifecycle_state,
                 created_at,
@@ -424,7 +429,12 @@ def seed_winning_snapshot(store: ac.SQLiteRepository) -> ac.SnapshotEnvelope:
                     committed.snapshot_id,
                     committed.rendered_context,
                 ),
-                committed.token_cost,
+                codec.encrypt_non_negative_int(
+                    "snapshots",
+                    "token_cost",
+                    committed.snapshot_id,
+                    committed.token_cost,
+                ),
                 codec.encrypt_object_json(
                     "snapshots",
                     "audit_outcome",
