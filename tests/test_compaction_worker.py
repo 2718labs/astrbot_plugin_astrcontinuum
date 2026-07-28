@@ -14,6 +14,8 @@ from astrcontinuum.context_graph.candidate_verification import (
     CandidateVerificationError,
     CandidateVerificationErrorCode,
 )
+from astrcontinuum.storage import CanonicalMetricObservation
+from astrcontinuum.tokenization import CANONICAL_O200K
 
 NOW = datetime(2026, 7, 27, 4, 0, tzinfo=timezone.utc)
 TEST_KEY = bytes(range(32))
@@ -128,6 +130,7 @@ def capture(
         content=f"message {sequence}",
         idempotency_key=f"request-{sequence}",
         token_count=2,
+        canonical=CanonicalMetricObservation(CANONICAL_O200K.profile_id, None),
         created_at=NOW + timedelta(seconds=sequence),
     )
 

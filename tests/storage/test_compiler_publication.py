@@ -6,6 +6,8 @@ from pathlib import Path
 import pytest
 
 import astrcontinuum as ac
+from astrcontinuum.storage import CanonicalMetricObservation
+from astrcontinuum.tokenization import CANONICAL_O200K
 from tests.storage.security_testkit import secure_repository
 
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
@@ -67,6 +69,7 @@ def capture(store: ac.SQLiteRepository, sequence: int) -> ac.EventEnvelope:
         content=f"message {sequence}",
         idempotency_key=f"request-{sequence}",
         token_count=2,
+        canonical=CanonicalMetricObservation(CANONICAL_O200K.profile_id, None),
         created_at=NOW + timedelta(seconds=sequence),
     )
 

@@ -8,10 +8,12 @@ from typing import Any
 import pytest
 
 import astrcontinuum as ac
+from astrcontinuum.storage import CanonicalMetricObservation
 from tests.storage.security_testkit import activate_test_storage, secure_repository
 
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
 LEASE_END = NOW + timedelta(minutes=10)
+CANONICAL_PROFILE_ID = "canonical-o200k-v1"
 
 
 class InjectedCrash(RuntimeError):
@@ -36,13 +38,22 @@ def migrated_factory(data_dir: Path) -> ac.SQLiteConnectionFactory:
     return factory
 
 
-def capture(store: ac.SQLiteRepository, sequence: int) -> ac.EventEnvelope:
+def capture(
+    store: ac.SQLiteRepository,
+    sequence: int,
+    *,
+    canonical_count: int | None = 17,
+) -> ac.EventEnvelope:
     return store.capture_user_event(
         event_id=f"event-{sequence}",
         session_key=session_key(),
         content=f"message {sequence}",
         idempotency_key=f"request-{sequence}",
         token_count=2,
+        canonical=CanonicalMetricObservation(
+            tokenizer_profile_id=CANONICAL_PROFILE_ID,
+            token_count=canonical_count,
+        ),
         created_at=NOW,
     )
 
@@ -333,6 +344,7 @@ def assert_conflict_crash_rolled_back(
         "capture.after_allocate",
         "capture.before_insert",
         "capture.after_insert",
+        "capture.after_metric",
     ),
 )
 def test_capture_crash_rolls_back_session_sequence_and_event(
@@ -348,8 +360,36 @@ def test_capture_crash_rolls_back_session_sequence_and_event(
     with factory.connection(read_only=True) as connection:
         assert connection.execute("SELECT count(*) FROM sessions").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM token_metrics").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT count(*) FROM token_metric_backfill_intents").fetchone()[0]
+            == 0
+        )
 
     recovered = capture(secure_repository(factory), 1)
+    assert recovered.sequence == 1
+
+
+def test_capture_after_metric_crash_rolls_back_backfill_intent(tmp_path: Path) -> None:
+    factory = migrated_factory(tmp_path)
+    crashing = secure_repository(
+        factory,
+        fault_injector=fail_at("capture.after_metric"),
+    )
+
+    with pytest.raises(InjectedCrash, match="capture.after_metric"):
+        capture(crashing, 1, canonical_count=None)
+
+    with factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM sessions").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM token_metrics").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT count(*) FROM token_metric_backfill_intents").fetchone()[0]
+            == 0
+        )
+
+    recovered = capture(secure_repository(factory), 1, canonical_count=None)
     assert recovered.sequence == 1
 
 

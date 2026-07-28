@@ -21,6 +21,7 @@ from astrcontinuum.storage import (
     SQLiteRepository,
     activate_storage_security,
 )
+from astrcontinuum.tokenization import CANONICAL_O200K
 
 TEST_KEY = bytes(range(32))
 
@@ -176,6 +177,26 @@ async def test_authoritative_hooks_are_idempotent_and_allocate_contiguous_rows(
         assert json.loads(contents[2])["kind"] == "result"
         assert contents[3] == "done"
         assert connection.execute("SELECT next_event_sequence FROM sessions").fetchone()[0] == 5
+        intents = connection.execute(
+            """
+            SELECT artifact_kind, artifact_id, tokenizer_profile_id
+            FROM token_metric_backfill_intents
+            ORDER BY artifact_id
+            """
+        ).fetchall()
+        assert [(row["artifact_kind"], row["tokenizer_profile_id"]) for row in intents] == [
+            ("EVENT", CANONICAL_O200K.profile_id),
+            ("EVENT", CANONICAL_O200K.profile_id),
+            ("EVENT", CANONICAL_O200K.profile_id),
+            ("EVENT", CANONICAL_O200K.profile_id),
+        ]
+        assert {row["artifact_id"] for row in intents} == {
+            first_prepare.user_event.event_id,
+            first_call.event_id,
+            first_result.event_id,
+            first_assistant.event_id,
+        }
+        assert connection.execute("SELECT count(*) FROM token_metrics").fetchone()[0] == 0
         job_rows = connection.execute(
             """
             SELECT state, target_high_water_mark, intent_target_high_water_mark

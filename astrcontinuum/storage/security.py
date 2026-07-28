@@ -43,6 +43,7 @@ from .migrations import (
     SQLiteMigrator,
 )
 from .sqlite import SQLiteConnectionFactory
+from .token_metrics import ArtifactKind, _metric_record_key
 
 ACTIVE_KEY_ENV = "ASTRCONTINUUM_MASTER_KEY"
 PREVIOUS_KEY_ENV = "ASTRCONTINUUM_PREVIOUS_KEY"
@@ -680,6 +681,27 @@ def _batched_rows(
             return
         yield from batch
         last_key = str(batch[-1][primary_key])
+
+
+def _batched_token_metrics(
+    connection: sqlite3.Connection,
+) -> Iterator[sqlite3.Row]:
+    last_rowid = 0
+    while True:
+        batch = connection.execute(
+            """
+            SELECT rowid, *
+            FROM token_metrics
+            WHERE rowid > ?
+            ORDER BY rowid
+            LIMIT 128
+            """,
+            (last_rowid,),
+        ).fetchall()
+        if not batch:
+            return
+        yield from batch
+        last_rowid = int(batch[-1]["rowid"])
 
 
 def _validate_legacy_session(
@@ -1956,7 +1978,11 @@ def _rekey_storage(
 ) -> None:
     counts = {
         table: int(connection.execute(f"SELECT count(*) FROM {table}").fetchone()[0])
-        for table in _COUNTED_TABLES
+        for table in (
+            *_COUNTED_TABLES,
+            "token_metrics",
+            "token_metric_backfill_intents",
+        )
     }
     update_triggers = {
         **_IMMUTABLE_UPDATE_TRIGGERS,
@@ -2246,6 +2272,78 @@ def _rekey_storage(
                 stored["audit_outcome"],
             ),
             audit_plaintext,
+        )
+
+    for row in _batched_token_metrics(connection):
+        raw_artifact_kind = row["artifact_kind"]
+        artifact_id = row["artifact_id"]
+        tokenizer_profile_id = row["tokenizer_profile_id"]
+        envelope = row["metric_envelope"]
+        if (
+            not isinstance(raw_artifact_kind, str)
+            or not isinstance(artifact_id, str)
+            or not artifact_id.strip()
+            or not isinstance(tokenizer_profile_id, str)
+            or not tokenizer_profile_id.strip()
+            or not isinstance(envelope, str)
+        ):
+            _raise(SecurityErrorCode.STORAGE_REKEY_FAILED)
+        try:
+            artifact_kind = ArtifactKind(raw_artifact_kind)
+            record_key = _metric_record_key(
+                artifact_kind,
+                artifact_id,
+                tokenizer_profile_id,
+            )
+        except (TypeError, ValueError):
+            _raise(SecurityErrorCode.STORAGE_REKEY_FAILED)
+        plaintext, encrypted = _rekey_text(
+            previous,
+            active,
+            table="token_metrics",
+            column="metric_envelope",
+            record_key=record_key,
+            envelope=envelope,
+        )
+        connection.execute(
+            """
+            UPDATE token_metrics
+            SET metric_envelope = ?
+            WHERE artifact_kind = ?
+              AND artifact_id = ?
+              AND tokenizer_profile_id = ?
+            """,
+            (
+                encrypted,
+                artifact_kind.value,
+                artifact_id,
+                tokenizer_profile_id,
+            ),
+        )
+        stored = connection.execute(
+            """
+            SELECT metric_envelope
+            FROM token_metrics
+            WHERE artifact_kind = ?
+              AND artifact_id = ?
+              AND tokenizer_profile_id = ?
+            """,
+            (
+                artifact_kind.value,
+                artifact_id,
+                tokenizer_profile_id,
+            ),
+        ).fetchone()
+        if stored is None:
+            _raise(SecurityErrorCode.STORAGE_REKEY_FAILED)
+        _assert_wire(
+            active.decrypt_text(
+                "token_metrics",
+                "metric_envelope",
+                record_key,
+                stored["metric_envelope"],
+            ),
+            plaintext,
         )
 
     _inject(fault_injector, "security.after_rekey_encrypt")

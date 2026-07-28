@@ -27,6 +27,12 @@ from ..domain import (
 )
 from .crypto import SecureCodec
 from .sqlite import SQLiteConnectionFactory
+from .token_metrics import (
+    ArtifactKind,
+    CanonicalMetricObservation,
+    TokenMetric,
+    TokenMetricStore,
+)
 
 FaultInjector = Callable[[str], None]
 
@@ -183,6 +189,7 @@ class SQLiteRepository:
             raise TypeError("codec must be a SecureCodec")
         self._factory = factory
         self._codec = codec
+        self._metric_store = TokenMetricStore(codec)
         self._fault_injector = fault_injector
 
     @property
@@ -226,6 +233,7 @@ class SQLiteRepository:
         content: str,
         idempotency_key: str,
         token_count: int,
+        canonical: CanonicalMetricObservation,
         created_at: datetime,
     ) -> EventEnvelope:
         """Run ``TX_CAPTURE_USER_EVENT``."""
@@ -237,6 +245,7 @@ class SQLiteRepository:
             content=content,
             idempotency_key=idempotency_key,
             token_count=token_count,
+            canonical=canonical,
             created_at=created_at,
         )
 
@@ -248,6 +257,7 @@ class SQLiteRepository:
         content: str,
         idempotency_key: str,
         token_count: int,
+        canonical: CanonicalMetricObservation,
         created_at: datetime,
     ) -> EventEnvelope:
         """Run ``TX_CAPTURE_ASSISTANT_EVENT``."""
@@ -259,6 +269,7 @@ class SQLiteRepository:
             content=content,
             idempotency_key=idempotency_key,
             token_count=token_count,
+            canonical=canonical,
             created_at=created_at,
         )
 
@@ -271,6 +282,7 @@ class SQLiteRepository:
         content: str,
         idempotency_key: str,
         token_count: int,
+        canonical: CanonicalMetricObservation,
         created_at: datetime,
     ) -> EventEnvelope:
         """Run ``TX_CAPTURE_TOOL_EVENT`` for a call or result."""
@@ -284,6 +296,7 @@ class SQLiteRepository:
             content=content,
             idempotency_key=idempotency_key,
             token_count=token_count,
+            canonical=canonical,
             created_at=created_at,
         )
 
@@ -1128,8 +1141,11 @@ class SQLiteRepository:
         content: str,
         idempotency_key: str,
         token_count: int,
+        canonical: CanonicalMetricObservation,
         created_at: datetime,
     ) -> EventEnvelope:
+        if not isinstance(canonical, CanonicalMetricObservation):
+            raise TypeError("canonical must be a CanonicalMetricObservation")
         normalized_created_at = _normalize_datetime(created_at)
         requested = EventEnvelope.create(
             event_id=event_id,
@@ -1160,6 +1176,14 @@ class SQLiteRepository:
                     raise IdempotencyConflict(
                         "event idempotency tuple was reused with different immutable data"
                     )
+                self._record_canonical_observation(
+                    connection,
+                    session_key_hash=session_key.session_key_hash,
+                    artifact_id=existing.event_id,
+                    canonical=canonical,
+                    normalized_created_at=normalized_created_at,
+                )
+                self._inject("capture.after_metric")
                 return existing
 
             row = connection.execute(
@@ -1244,7 +1268,79 @@ class SQLiteRepository:
                     "event identity or sequence conflicts with durable state"
                 ) from None
             self._inject("capture.after_insert")
+            self._record_canonical_observation(
+                connection,
+                session_key_hash=session_key.session_key_hash,
+                artifact_id=event.event_id,
+                canonical=canonical,
+                normalized_created_at=normalized_created_at,
+            )
+            self._inject("capture.after_metric")
             return event
+
+    def _record_canonical_observation(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        session_key_hash: str,
+        artifact_id: str,
+        canonical: CanonicalMetricObservation,
+        normalized_created_at: str,
+    ) -> None:
+        if canonical.token_count is not None:
+            self._metric_store.put_in_transaction(
+                connection,
+                TokenMetric(
+                    artifact_kind=ArtifactKind.EVENT,
+                    artifact_id=artifact_id,
+                    tokenizer_profile_id=canonical.tokenizer_profile_id,
+                    token_count=canonical.token_count,
+                ),
+                created_at=_parse_datetime(normalized_created_at),
+            )
+            connection.execute(
+                """
+                DELETE FROM token_metric_backfill_intents
+                WHERE artifact_kind = ?
+                  AND artifact_id = ?
+                  AND tokenizer_profile_id = ?
+                """,
+                (
+                    ArtifactKind.EVENT.value,
+                    artifact_id,
+                    canonical.tokenizer_profile_id,
+                ),
+            )
+            return
+
+        existing = self._metric_store.get_in_transaction(
+            connection,
+            artifact_kind=ArtifactKind.EVENT,
+            artifact_id=artifact_id,
+            tokenizer_profile_id=canonical.tokenizer_profile_id,
+        )
+        if existing is not None:
+            return
+        connection.execute(
+            """
+            INSERT INTO token_metric_backfill_intents (
+                session_key_hash,
+                artifact_kind,
+                artifact_id,
+                tokenizer_profile_id,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (artifact_kind, artifact_id, tokenizer_profile_id)
+            DO NOTHING
+            """,
+            (
+                session_key_hash,
+                ArtifactKind.EVENT.value,
+                artifact_id,
+                canonical.tokenizer_profile_id,
+                normalized_created_at,
+            ),
+        )
 
     def _ensure_session(
         self,

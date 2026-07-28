@@ -10,6 +10,8 @@ from typing import Any
 import pytest
 
 import astrcontinuum as ac
+from astrcontinuum.storage import CanonicalMetricObservation
+from astrcontinuum.tokenization import CANONICAL_O200K
 
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
 TEST_KEY = bytes(range(32))
@@ -428,6 +430,7 @@ def test_file_backed_read_facade_preserves_all_durable_runtime_state(
             content=f"message {sequence}",
             idempotency_key=f"request-{sequence}",
             token_count=2,
+            canonical=CanonicalMetricObservation(CANONICAL_O200K.profile_id, None),
             created_at=NOW,
         )
     seed_active_snapshot(store, codec, key)

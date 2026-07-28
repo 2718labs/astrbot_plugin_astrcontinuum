@@ -37,7 +37,8 @@ from ..runtime import (
     read_request_view,
     select_candidates,
 )
-from ..storage import RequestView, SQLiteRepository
+from ..storage import CanonicalMetricObservation, RequestView, SQLiteRepository
+from ..tokenization import CANONICAL_O200K
 
 _MESSAGE_MODULE = "astrbot.core.agent.message"
 _NO_RESULT = object()
@@ -727,6 +728,7 @@ class AstrBotHookBridge:
             content=current_input,
             idempotency_key=identity.idempotency_key,
             token_count=self._content_cost(current_input),
+            canonical=CanonicalMetricObservation(CANONICAL_O200K.profile_id, None),
             created_at=turn.created_at,
         )
         view = await asyncio.to_thread(
@@ -813,6 +815,7 @@ class AstrBotHookBridge:
             content=content,
             idempotency_key=identity.idempotency_key,
             token_count=self._content_cost(content),
+            canonical=CanonicalMetricObservation(CANONICAL_O200K.profile_id, None),
             created_at=prepared.turn.created_at,
         )
 
@@ -882,6 +885,7 @@ class AstrBotHookBridge:
             content=metadata,
             idempotency_key=identity.idempotency_key,
             token_count=self._content_cost(metadata),
+            canonical=CanonicalMetricObservation(CANONICAL_O200K.profile_id, None),
             created_at=prepared.turn.created_at,
         )
 

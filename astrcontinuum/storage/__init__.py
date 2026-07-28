@@ -51,12 +51,21 @@ from .sqlite import (
     MAX_BUSY_TIMEOUT_MS,
     SQLiteConnectionFactory,
 )
+from .token_metrics import (
+    ArtifactKind,
+    CanonicalMetricObservation,
+    TokenMetric,
+    TokenMetricConflict,
+    TokenMetricStore,
+)
 
 __all__ = [
     "DATABASE_FILENAME",
     "DEFAULT_BUSY_TIMEOUT_MS",
     "MAX_BUSY_TIMEOUT_MS",
     "MIGRATIONS",
+    "ArtifactKind",
+    "CanonicalMetricObservation",
     "EventIdentityConflict",
     "GeneratedKeyFile",
     "IdempotencyConflict",
@@ -87,6 +96,9 @@ __all__ = [
     "StorageMaintenanceState",
     "StorageSecurityActivation",
     "StorageSecurityError",
+    "TokenMetric",
+    "TokenMetricConflict",
+    "TokenMetricStore",
     "activate_storage_security",
     "encode_key_text",
     "fingerprint_key_file",
