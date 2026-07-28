@@ -183,7 +183,7 @@ def test_duplicate_block_id_is_a_hard_conflict_before_any_count_or_fallback() ->
 def test_primary_count_failure_discards_the_run_and_restarts_with_byte_fallback() -> None:
     primary = RecordingCounter(
         tokenization.OPENAI_O200K,
-        fail_on_call=4,
+        fail_on_call=5,
         offset=1_000,
     )
     fallback = RecordingCounter(tokenization.BYTE_FALLBACK)
@@ -195,7 +195,7 @@ def test_primary_count_failure_discards_the_run_and_restarts_with_byte_fallback(
         fallback=fallback,
     )
 
-    assert len(primary.calls) == 4
+    assert len(primary.calls) == 5
     assert outcome.tokenizer_profile_id == tokenization.BYTE_FALLBACK.profile_id
     assert outcome.profile.profile_id == tokenization.BYTE_FALLBACK.profile_id
     assert outcome.tokenizer_mode == tokenization.TokenizerMode.BYTE_FALLBACK.value
@@ -287,22 +287,27 @@ def test_required_input_overflow_keeps_its_code_and_does_not_fallback() -> None:
         request,
         profile=replace(
             request.profile,
-            context_limit=16,
-            target_input_budget=16,
-            hard_input_ceiling=16,
+            context_limit=20,
+            target_input_budget=20,
+            hard_input_ceiling=20,
         ),
     )
     primary = RecordingCounter(tokenization.OPENAI_O200K)
     fallback = RecordingCounter(tokenization.BYTE_FALLBACK)
 
-    with pytest.raises(runtime.BudgetInvariantError) as captured:
-        tokenization.run_request_budget(
-            request,
-            primary=primary,
-            fallback=fallback,
-        )
+    outcome = tokenization.run_request_budget(
+        request,
+        primary=primary,
+        fallback=fallback,
+    )
 
-    assert captured.value.code == "REQUIRED_INPUT_EXCEEDS_BUDGET"
+    assert outcome.stable_code == "REQUIRED_INPUT_EXCEEDS_BUDGET"
+    assert outcome.mutation_allowed is False
+    assert outcome.assembly is None
+    assert outcome.fallback_code == "NONE"
+    assert outcome.primary_result_discarded is False
+    assert outcome.tokenizer_profile_id == tokenization.OPENAI_O200K.profile_id
+    assert "candidate" in primary.calls
     assert fallback.calls == []
 
 

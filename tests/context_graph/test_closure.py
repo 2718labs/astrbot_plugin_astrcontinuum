@@ -5,6 +5,7 @@ from datetime import datetime, timezone
 
 import pytest
 
+import astrcontinuum.context_graph.closure as closure_module
 from astrcontinuum.context_graph.closure import (
     ClosureError,
     close_dependency_closure,
@@ -113,3 +114,48 @@ def test_closure_is_bounded_before_recursive_expansion() -> None:
 
     with pytest.raises(ClosureError, match="DEPENDENCY_CLOSURE_CAPACITY_EXCEEDED"):
         close_dependency_closure((), required, max_blocks=2)
+
+
+def test_removable_groups_keep_dependency_components_and_tool_pairs_atomic() -> None:
+    dependency_left = replace(
+        candidate("dependency-left"),
+        kind=CandidateKind.DEPENDENCY,
+        capsule_id="capsule-dependency",
+    )
+    dependency_right = replace(
+        candidate("dependency-right"),
+        kind=CandidateKind.DEPENDENCY,
+        capsule_id="capsule-dependency",
+    )
+    tool_call = replace(
+        candidate("tool-call"),
+        kind=CandidateKind.RAW_EVENT,
+        slot=RuntimeSlot.RECENT_RAW,
+        event_sequence=10,
+        event_type=EventType.TOOL_CALL,
+        tool_name="weather",
+    )
+    tool_result = replace(
+        candidate("tool-result"),
+        kind=CandidateKind.RAW_EVENT,
+        slot=RuntimeSlot.RECENT_RAW,
+        event_sequence=11,
+        event_type=EventType.TOOL_RESULT,
+        tool_name="weather",
+    )
+    required = candidate("required", required=True)
+
+    groups = closure_module.removable_dependency_groups(
+        (
+            dependency_left,
+            dependency_right,
+            tool_call,
+            tool_result,
+            required,
+        )
+    )
+    group_ids = tuple(tuple(block.block_id for block in group) for group in groups)
+
+    assert ("dependency-left", "dependency-right") in group_ids
+    assert ("tool-call", "tool-result") in group_ids
+    assert all(not any(block.required for block in group) for group in groups)

@@ -202,21 +202,58 @@ def _run_once(
 
     assembly = None
     if pressure.should_project:
-        assembly = assemble(
-            prepared.view,
-            prepared.candidates,
-            current_input=prepared.current_input,
-            opaque_token_cost=opaque_cost,
-            fixed_required_cost=fixed_cost,
-            counter=counter,
-            config=BudgetConfig(
-                target_input_budget=profile.target_input_budget,
-                hard_input_ceiling=profile.hard_input_ceiling,
-                model_context_limit=profile.context_limit,
-                reserved_output_and_tools=profile.reserved_output_and_tools,
-                safety_margin=profile.safety_margin,
-            ),
-        )
+        block_token_counts = {
+            candidate.block_id: counter.count_block(
+                candidate.block_id,
+                candidate.text,
+            )
+            for candidate in prepared.candidates
+        }
+        try:
+            assembly = assemble(
+                prepared.view,
+                prepared.candidates,
+                current_input=prepared.current_input,
+                opaque_token_cost=opaque_cost,
+                fixed_required_cost=fixed_cost,
+                counter=counter,
+                config=BudgetConfig(
+                    target_input_budget=profile.target_input_budget,
+                    hard_input_ceiling=profile.hard_input_ceiling,
+                    model_context_limit=profile.context_limit,
+                    reserved_output_and_tools=profile.reserved_output_and_tools,
+                    safety_margin=profile.safety_margin,
+                ),
+                block_token_counts=block_token_counts,
+            )
+        except BudgetInvariantError as error:
+            if error.code != BudgetErrorCode.REQUIRED_INPUT_EXCEEDS_BUDGET.value:
+                raise
+            return RequestBudgetOutcome(
+                pressure=pressure,
+                assembly=None,
+                tokenizer_profile_id=counter.profile.profile_id,
+                tokenizer_mode=counter.profile.mode.value,
+                fallback_code="NONE",
+                stable_code=BudgetErrorCode.REQUIRED_INPUT_EXCEEDS_BUDGET.value,
+                mutation_allowed=False,
+                primary_result_discarded=False,
+            )
+        required_ids = {
+            candidate.block_id for candidate in prepared.candidates if candidate.required
+        }
+        selected_ids = {candidate.block_id for candidate in assembly.selected_blocks}
+        if not required_ids.issubset(selected_ids):
+            return RequestBudgetOutcome(
+                pressure=pressure,
+                assembly=None,
+                tokenizer_profile_id=counter.profile.profile_id,
+                tokenizer_mode=counter.profile.mode.value,
+                fallback_code="NONE",
+                stable_code=BudgetErrorCode.REQUIRED_INPUT_EXCEEDS_BUDGET.value,
+                mutation_allowed=False,
+                primary_result_discarded=False,
+            )
 
     return RequestBudgetOutcome(
         pressure=pressure,

@@ -2,12 +2,13 @@
 
 from __future__ import annotations
 
+from collections.abc import Mapping
 from dataclasses import dataclass, field, replace
 from enum import Enum
 from typing import Protocol
 
 from ..domain import EventType
-from ..runtime.budget import assemble
+from ..runtime.budget import assemble, canonical_candidates, count_candidate_blocks
 from ..runtime.retrieval import required_candidates_complete
 from ..runtime.types import (
     AssemblyResult,
@@ -16,6 +17,7 @@ from ..runtime.types import (
     TokenCounter,
 )
 from ..storage import RequestView
+from ..tokenization.types import TokenizerError
 from .build import BuiltContextGraph, build_context_graph
 from .closure import (
     ClosureError,
@@ -146,16 +148,18 @@ def _score_for_pack(
     blocks: tuple[CandidateBlock, ...],
     *,
     scores: dict[str, float],
-    counter: TokenCounter,
+    block_token_counts: Mapping[str, int],
 ) -> tuple[CandidateBlock, ...]:
     packed: list[CandidateBlock] = []
     for block in blocks:
         if block.required:
             packed.append(block)
             continue
-        cost = counter.count_text(block.text)
+        if block.block_id not in block_token_counts:
+            raise TypeError("block token count is missing")
+        cost = block_token_counts[block.block_id]
         if isinstance(cost, bool) or not isinstance(cost, int) or cost < 0:
-            raise TypeError("token counter returned an invalid cost")
+            raise TypeError("block token count is invalid")
         packed.append(
             replace(
                 block,
@@ -180,7 +184,8 @@ def select_live_context(
 ) -> LiveSelectionResult:
     """Compute deterministic fallback first and replace it only after every gate."""
 
-    materialized = tuple(candidates)
+    materialized = canonical_candidates(candidates)
+    block_token_counts = count_candidate_blocks(materialized, counter)
     fallback = assemble(
         view,
         materialized,
@@ -189,6 +194,7 @@ def select_live_context(
         fixed_required_cost=fixed_required_cost,
         counter=counter,
         config=budget_config,
+        block_token_counts=block_token_counts,
     )
     satisfied_event_ids: tuple[str, ...] = ()
     if view.delta:
@@ -327,7 +333,7 @@ def select_live_context(
         scored = _score_for_pack(
             closure.blocks,
             scores=_verified_scores(result, built),
-            counter=counter,
+            block_token_counts=block_token_counts,
         )
         final = assemble(
             view,
@@ -337,21 +343,26 @@ def select_live_context(
             fixed_required_cost=fixed_required_cost,
             counter=counter,
             config=budget_config,
+            block_token_counts=block_token_counts,
         )
         final_ids = {item.block_id for item in final.selected_blocks}
         closure_ids = {item.block_id for item in closure.blocks}
         required_ids = {item.block_id for item in materialized if item.required}
+        canonical_final = tuple(item for item in materialized if item.block_id in final_ids)
         if (
             not required_ids.issubset(final_ids)
             or not closure_ids.issubset(final_ids)
+            or final.trace.total_input_cost > final.trace.b_input
             or not validate_dependency_closure(
-                final.selected_blocks,
+                canonical_final,
                 materialized,
                 max_blocks=config.max_coordinates,
             )
         ):
             raise ClosureError("LIVE_FINAL_PACK_GATE_FAILED")
-    except Exception:  # noqa: BLE001 - fail-open boundary must redact validation details
+    except TokenizerError:
+        raise
+    except (ClosureError, TypeError, ValueError):
         return LiveSelectionResult(
             fallback,
             _trace(

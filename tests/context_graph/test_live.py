@@ -15,6 +15,7 @@ from astrcontinuum.context_graph.live import select_live_context
 from astrcontinuum.domain import SessionKey
 from astrcontinuum.runtime import BudgetConfig, Utf8ByteTokenCounter, assemble
 from astrcontinuum.storage import RequestView
+from astrcontinuum.tokenization import TokenizerError, TokenizerErrorCode
 from tests.context_graph.helpers import candidate
 
 
@@ -115,6 +116,37 @@ def test_active_replaces_fallback_only_after_verified_final_pack() -> None:
     )
     assert selected.trace.required_passed is True
     assert selected.trace.provenance_passed is True
+
+
+def test_off_mode_canonicalizes_duplicate_ids_before_counting_and_fallback() -> None:
+    class RecordingCounter:
+        def __init__(self) -> None:
+            self.texts: list[str] = []
+
+        def count_text(self, text: str) -> int:
+            self.texts.append(text)
+            return len(text)
+
+    canonical = candidate("duplicate", text="a")
+    duplicate = candidate("duplicate", text="z")
+    counter = RecordingCounter()
+
+    selected = select_live_context(
+        request_view(),
+        (duplicate, canonical),
+        current_input="",
+        opaque_token_cost=0,
+        fixed_required_cost=0,
+        counter=counter,
+        budget_config=budget(),
+        mode=ContextEngineMode.OFF,
+        engine=FixedEngine(()),
+    )
+
+    assert selected.trace.outcome is EngineOutcome.OFF
+    assert selected.trace.candidate_count == 1
+    assert selected.assembly.projected_text == canonical.text
+    assert duplicate.text not in counter.texts
 
 
 def test_off_shadow_and_fault_return_the_exact_deterministic_fallback(
@@ -269,3 +301,49 @@ def test_incomplete_required_selection_forces_content_free_raw_fallback() -> Non
     assert engine.activations == []
     assert not hasattr(selected.trace, "fallback_block_ids")
     assert not hasattr(selected.trace, "final_block_ids")
+
+
+def test_final_validation_does_not_redact_or_degrade_tokenizer_failures() -> None:
+    class ArmableCounter:
+        def __init__(self) -> None:
+            self.armed = False
+            self.texts: list[str] = []
+
+        def count_text(self, text: str) -> int:
+            self.texts.append(text)
+            if self.armed and text == "required\n\noptional":
+                raise TokenizerError(TokenizerErrorCode.TOKENIZER_COUNT_FAILED)
+            return len(text.encode("utf-8"))
+
+    required = candidate("required", required=True, text="required")
+    optional = candidate("optional", text="optional")
+    counter = ArmableCounter()
+
+    class ArmingEngine(FixedEngine):
+        def solve(
+            self,
+            _graph: object,
+            activation: object,
+            *,
+            mode: object,
+        ) -> EngineResult:
+            self.activations.append(activation)
+            counter.armed = True
+            return verified_result((required, optional))
+
+    with pytest.raises(TokenizerError) as captured:
+        select_live_context(
+            request_view(),
+            (required, optional),
+            current_input="",
+            opaque_token_cost=0,
+            fixed_required_cost=0,
+            counter=counter,
+            budget_config=budget(),
+            mode=ContextEngineMode.ACTIVE,
+            engine=ArmingEngine((required, optional)),
+        )
+
+    assert captured.value.code is TokenizerErrorCode.TOKENIZER_COUNT_FAILED
+    assert counter.texts.count(required.text) == 1
+    assert counter.texts.count(optional.text) == 1

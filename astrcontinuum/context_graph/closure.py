@@ -49,6 +49,46 @@ def _companions(left: CandidateBlock, right: CandidateBlock) -> bool:
     )
 
 
+def dependency_groups(
+    candidates: tuple[CandidateBlock, ...],
+) -> tuple[tuple[CandidateBlock, ...], ...]:
+    """Return deterministic structural connected components."""
+
+    if not isinstance(candidates, tuple) or any(
+        not isinstance(item, CandidateBlock) for item in candidates
+    ):
+        raise TypeError("candidates must be a tuple of CandidateBlock values")
+    if len({item.block_id for item in candidates}) != len(candidates):
+        raise ClosureError("DEPENDENCY_GROUP_DUPLICATE_BLOCK")
+
+    groups: list[tuple[CandidateBlock, ...]] = []
+    remaining = set(range(len(candidates)))
+    while remaining:
+        pending = [min(remaining)]
+        component_indexes: set[int] = set()
+        while pending:
+            index = pending.pop()
+            if index in component_indexes:
+                continue
+            component_indexes.add(index)
+            remaining.discard(index)
+            for other in tuple(remaining):
+                if _companions(candidates[index], candidates[other]):
+                    pending.append(other)
+        groups.append(tuple(candidates[index] for index in sorted(component_indexes)))
+    return tuple(groups)
+
+
+def removable_dependency_groups(
+    candidates: tuple[CandidateBlock, ...],
+) -> tuple[tuple[CandidateBlock, ...], ...]:
+    """Return all-optional structural components that can be removed atomically."""
+
+    return tuple(
+        group for group in dependency_groups(candidates) if not any(item.required for item in group)
+    )
+
+
 def close_dependency_closure(
     selected_blocks: tuple[CandidateBlock, ...],
     universe: tuple[CandidateBlock, ...],
