@@ -90,6 +90,22 @@ def test_profile_ids_modes_and_multipliers_are_stable() -> None:
     )
 
 
+def test_tiktoken_profiles_identify_the_stable_offline_adapter_contract() -> None:
+    profiles = (
+        CANONICAL_O200K,
+        OPENAI_O200K,
+        OPENAI_CL100K,
+        REFERENCE_O200K,
+    )
+
+    # This is AstrContinuum's adapter contract version, not the installed
+    # tiktoken package version.
+    assert {profile.implementation_name for profile in profiles} == {
+        "astrcontinuum-offline-tiktoken"
+    }
+    assert {profile.implementation_version for profile in profiles} == {"1"}
+
+
 @pytest.mark.parametrize(
     ("raw_count", "basis_points", "expected"),
     [
@@ -168,5 +184,6 @@ def test_encoding_failure_is_translated_without_content() -> None:
         counter.count_text("private")
 
     assert raised.value.code is TokenizerErrorCode.TOKENIZER_COUNT_FAILED
+    assert raised.value.__context__ is None
     assert "private" not in str(raised.value)
     assert "private" not in repr(raised.value)

@@ -53,14 +53,18 @@ class TokenizerProfile:
 
 _CL100K_DIGEST: Final = "223921b76ee99bde995b7ff738513eef100fb51d18c93597a113bcffe865b2a7"
 _O200K_DIGEST: Final = "446a9538cb6c348e3516120d7c08b09f57c36495e2acfffe59a5bf8b0cfb1a2d"
+# These identify AstrContinuum's stable offline adapter contract. They are not
+# the version of the installed tiktoken package.
+_OFFLINE_IMPLEMENTATION_NAME: Final = "astrcontinuum-offline-tiktoken"
+_OFFLINE_IMPLEMENTATION_VERSION: Final = "1"
 
 CANONICAL_O200K: Final = TokenizerProfile(
     profile_id="canonical-o200k-v1",
     schema_version=1,
     mode=TokenizerMode.CANONICAL,
     encoding_name="o200k_base",
-    implementation_name="tiktoken",
-    implementation_version="0.12.0",
+    implementation_name=_OFFLINE_IMPLEMENTATION_NAME,
+    implementation_version=_OFFLINE_IMPLEMENTATION_VERSION,
     asset_digest=_O200K_DIGEST,
     count_multiplier_basis_points=10_000,
 )
@@ -69,8 +73,8 @@ OPENAI_O200K: Final = TokenizerProfile(
     schema_version=1,
     mode=TokenizerMode.EXACT_TEXT,
     encoding_name="o200k_base",
-    implementation_name="tiktoken",
-    implementation_version="0.12.0",
+    implementation_name=_OFFLINE_IMPLEMENTATION_NAME,
+    implementation_version=_OFFLINE_IMPLEMENTATION_VERSION,
     asset_digest=_O200K_DIGEST,
     count_multiplier_basis_points=10_000,
 )
@@ -79,8 +83,8 @@ OPENAI_CL100K: Final = TokenizerProfile(
     schema_version=1,
     mode=TokenizerMode.EXACT_TEXT,
     encoding_name="cl100k_base",
-    implementation_name="tiktoken",
-    implementation_version="0.12.0",
+    implementation_name=_OFFLINE_IMPLEMENTATION_NAME,
+    implementation_version=_OFFLINE_IMPLEMENTATION_VERSION,
     asset_digest=_CL100K_DIGEST,
     count_multiplier_basis_points=10_000,
 )
@@ -89,8 +93,8 @@ REFERENCE_O200K: Final = TokenizerProfile(
     schema_version=1,
     mode=TokenizerMode.REFERENCE,
     encoding_name="o200k_base",
-    implementation_name="tiktoken",
-    implementation_version="0.12.0",
+    implementation_name=_OFFLINE_IMPLEMENTATION_NAME,
+    implementation_version=_OFFLINE_IMPLEMENTATION_VERSION,
     asset_digest=_O200K_DIGEST,
     count_multiplier_basis_points=11_000,
 )
@@ -129,10 +133,13 @@ class ProfileCounter:
     _encoding: OrdinaryEncoding = field(repr=False, compare=False)
 
     def count_text(self, text: str) -> int:
+        raw_count: int | None = None
         try:
             raw_count = len(self._encoding.encode_ordinary(text))
-        except Exception:  # noqa: BLE001 - redact content and implementation failures
-            raise TokenizerError(TokenizerErrorCode.TOKENIZER_COUNT_FAILED) from None
+        except Exception:  # noqa: BLE001,S110 - redact implementation failures
+            pass
+        if raw_count is None:
+            raise TokenizerError(TokenizerErrorCode.TOKENIZER_COUNT_FAILED)
         return apply_multiplier(raw_count, self.profile.count_multiplier_basis_points)
 
     def count_texts(self, texts: Sequence[str]) -> tuple[int, ...]:

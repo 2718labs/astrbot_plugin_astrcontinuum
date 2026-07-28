@@ -1,8 +1,12 @@
 from __future__ import annotations
 
 import hashlib
+import os
 import socket
+import subprocess
+import sys
 import tempfile
+import textwrap
 import urllib.request
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
@@ -92,6 +96,73 @@ def test_tiktoken_profile_reports_stable_import_failure(
     assert str(raised.value) == TOKENIZER_IMPORT_FAILED
 
 
+def test_package_imports_without_tiktoken_in_a_fresh_interpreter() -> None:
+    repo_root = Path(__file__).resolve().parents[2]
+    environment = os.environ.copy()
+    existing_pythonpath = environment.get("PYTHONPATH")
+    environment["PYTHONPATH"] = os.pathsep.join(
+        part for part in (str(repo_root), existing_pythonpath) if part
+    )
+    script = textwrap.dedent(
+        """
+        import sys
+
+        PRIVATE_IMPORT_DETAIL = "private-tiktoken-import-detail"
+
+        class BlockTiktoken:
+            seen = []
+
+            def find_spec(self, fullname, path=None, target=None):
+                if fullname == "tiktoken" or fullname.startswith("tiktoken."):
+                    self.seen.append(fullname)
+                    raise ImportError(PRIVATE_IMPORT_DETAIL)
+                return None
+
+        assert "astrcontinuum.tokenization" not in sys.modules
+        blocker = BlockTiktoken()
+        sys.meta_path.insert(0, blocker)
+
+        from astrcontinuum.tokenization import (
+            BYTE_FALLBACK,
+            CANONICAL_O200K,
+            TOKENIZER_IMPORT_FAILED,
+            TokenizerError,
+            TokenizerErrorCode,
+            TokenizerRegistry,
+        )
+
+        registry = TokenizerRegistry()
+        assert blocker.seen
+        assert registry.counter_for(BYTE_FALLBACK).count_text("你好") == 6
+        try:
+            registry.counter_for(CANONICAL_O200K)
+        except TokenizerError as error:
+            assert error.code is TokenizerErrorCode.TOKENIZER_IMPORT_FAILED
+            assert str(error) == TOKENIZER_IMPORT_FAILED
+            assert error.__context__ is None
+            assert PRIVATE_IMPORT_DETAIL not in str(error)
+            assert PRIVATE_IMPORT_DETAIL not in repr(error)
+        else:
+            raise AssertionError("canonical tokenizer unexpectedly constructed")
+
+        print("fresh optional-import boundary verified")
+        """
+    )
+
+    completed = subprocess.run(
+        [sys.executable, "-c", script],
+        cwd=repo_root,
+        env=environment,
+        capture_output=True,
+        text=True,
+        check=False,
+        timeout=30,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    assert completed.stdout.strip() == "fresh optional-import boundary verified"
+
+
 def test_bundled_assets_have_pinned_sizes_and_digests() -> None:
     asset_root = Path(__file__).parents[2] / "astrcontinuum" / "tokenization" / "assets"
 
@@ -108,8 +179,29 @@ def test_missing_asset_has_stable_content_free_error(tmp_path: Path) -> None:
         load_mergeable_ranks(missing, ASSET_DIGESTS["o200k_base"])
 
     assert raised.value.code is TokenizerErrorCode.TOKENIZER_ASSET_MISSING
+    assert raised.value.__context__ is None
     assert "private" not in str(raised.value)
     assert str(missing) not in repr(raised.value)
+
+
+def test_asset_os_error_has_no_dynamic_exception_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    private_path = Path("private-os-error-asset.tiktoken")
+
+    def fail_read_bytes(path: Path) -> bytes:
+        raise OSError(f"private-os-detail:{path}")
+
+    monkeypatch.setattr(Path, "read_bytes", fail_read_bytes)
+
+    with pytest.raises(TokenizerError) as raised:
+        load_mergeable_ranks(private_path, ASSET_DIGESTS["o200k_base"])
+
+    assert raised.value.code is TokenizerErrorCode.TOKENIZER_ASSET_INVALID
+    assert raised.value.__context__ is None
+    assert "private-os-detail" not in str(raised.value)
+    assert "private-os-detail" not in repr(raised.value)
+    assert str(private_path) not in repr(raised.value)
 
 
 def test_replaced_asset_has_stable_content_free_error(tmp_path: Path) -> None:
@@ -130,7 +222,7 @@ def test_replaced_asset_has_stable_content_free_error(tmp_path: Path) -> None:
         b"",
         b"\n",
         b"%%% 0\n",
-        b"YQ== nope\n",
+        b"YQ== private-rank\n",
         b"YQ== -1\n",
         b"YQ== 0 extra\n",
         b"YQ== 0\nYQ== 1\n",
@@ -146,6 +238,11 @@ def test_malformed_asset_lines_are_rejected(data: bytes, tmp_path: Path) -> None
         load_mergeable_ranks(asset, digest)
 
     assert raised.value.code is TokenizerErrorCode.TOKENIZER_ASSET_INVALID
+    assert raised.value.__context__ is None
+    assert "malformed" not in str(raised.value)
+    assert "private-rank" not in str(raised.value)
+    assert "private-rank" not in repr(raised.value)
+    assert str(asset) not in repr(raised.value)
 
 
 def test_valid_asset_lines_are_parsed_without_runtime_cache(tmp_path: Path) -> None:
@@ -185,6 +282,31 @@ def test_registry_never_uses_network_loader_or_temp_cache(
     assert counter.count_text("离线") > 0
     assert not cache_root.exists()
     assert not data_gym_root.exists()
+
+
+def test_encoding_construction_failure_has_no_dynamic_exception_context(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import astrcontinuum.tokenization.registry as registry_module
+
+    class BrokenTiktokenRuntime:
+        @staticmethod
+        def Encoding(*args: object, **kwargs: object) -> NoReturn:
+            raise RuntimeError("private-construction-detail")
+
+    monkeypatch.setattr(
+        registry_module,
+        "_tiktoken_runtime",
+        BrokenTiktokenRuntime(),
+    )
+
+    with pytest.raises(TokenizerError) as raised:
+        TokenizerRegistry().counter_for(CANONICAL_O200K)
+
+    assert raised.value.code is TokenizerErrorCode.TOKENIZER_CONSTRUCTION_FAILED
+    assert raised.value.__context__ is None
+    assert "private-construction-detail" not in str(raised.value)
+    assert "private-construction-detail" not in repr(raised.value)
 
 
 def test_registry_reuses_one_encoding_safely_across_threads(

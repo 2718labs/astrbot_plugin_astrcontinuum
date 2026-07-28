@@ -49,12 +49,18 @@ def _invalid(code: TokenizerErrorCode) -> NoReturn:
 
 
 def load_mergeable_ranks(path: Path, expected_digest: str) -> dict[bytes, int]:
+    data: bytes | None = None
+    read_failure: TokenizerErrorCode | None = None
     try:
         data = path.read_bytes()
     except FileNotFoundError:
-        raise TokenizerError(TokenizerErrorCode.TOKENIZER_ASSET_MISSING) from None
+        read_failure = TokenizerErrorCode.TOKENIZER_ASSET_MISSING
     except OSError:
-        raise TokenizerError(TokenizerErrorCode.TOKENIZER_ASSET_INVALID) from None
+        read_failure = TokenizerErrorCode.TOKENIZER_ASSET_INVALID
+    if read_failure is not None:
+        raise TokenizerError(read_failure)
+    if data is None:
+        _invalid(TokenizerErrorCode.TOKENIZER_ASSET_INVALID)
 
     if not isinstance(expected_digest, str) or not hmac.compare_digest(
         hashlib.sha256(data).hexdigest(),
@@ -68,20 +74,22 @@ def load_mergeable_ranks(path: Path, expected_digest: str) -> dict[bytes, int]:
     if not lines:
         _invalid(TokenizerErrorCode.TOKENIZER_ASSET_INVALID)
 
-    try:
-        for line in lines:
-            parts = line.split()
-            if len(parts) != 2:
-                _invalid(TokenizerErrorCode.TOKENIZER_ASSET_INVALID)
+    parse_failed = False
+    for line in lines:
+        parts = line.split()
+        if len(parts) != 2:
+            _invalid(TokenizerErrorCode.TOKENIZER_ASSET_INVALID)
+        try:
             token = base64.b64decode(parts[0], validate=True)
             rank = int(parts[1])
-            if not token or token in ranks or rank < 0 or rank in seen_ranks:
-                _invalid(TokenizerErrorCode.TOKENIZER_ASSET_INVALID)
-            ranks[token] = rank
-            seen_ranks.add(rank)
-    except TokenizerError:
-        raise
-    except (ValueError, binascii.Error, OverflowError):
-        raise TokenizerError(TokenizerErrorCode.TOKENIZER_ASSET_INVALID) from None
+        except (ValueError, binascii.Error, OverflowError):
+            parse_failed = True
+            break
+        if not token or token in ranks or rank < 0 or rank in seen_ranks:
+            _invalid(TokenizerErrorCode.TOKENIZER_ASSET_INVALID)
+        ranks[token] = rank
+        seen_ranks.add(rank)
+    if parse_failed:
+        raise TokenizerError(TokenizerErrorCode.TOKENIZER_ASSET_INVALID)
 
     return ranks

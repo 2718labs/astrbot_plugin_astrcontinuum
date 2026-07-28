@@ -24,6 +24,9 @@ except Exception:  # noqa: BLE001 - optional dependency must not prevent package
     _tiktoken_runtime = None
 
 
+# Patterns and special-token maps are pinned from
+# tiktoken_ext.openai_public 0.12.0; they are adapter inputs, not a runtime
+# package-version claim.
 _CL100K_PATTERN: Final = (
     r"'(?i:[sdmt]|ll|ve|re)|[^\r\n\p{L}\p{N}]?+\p{L}++|\p{N}{1,3}+|"
     r" ?[^\s\p{L}\p{N}]++[\r\n]*+|\s++$|\s*[\r\n]|\s+(?!\S)|\s"
@@ -135,6 +138,7 @@ class TokenizerRegistry:
                 self._asset_root / spec.asset.filename,
                 spec.asset.digest,
             )
+            encoding: object | None = None
             try:
                 encoding = _tiktoken_runtime.Encoding(
                     encoding_name,
@@ -142,8 +146,10 @@ class TokenizerRegistry:
                     mergeable_ranks=ranks,
                     special_tokens=dict(spec.special_tokens),
                 )
-            except Exception:  # noqa: BLE001 - redact construction implementation details
-                raise TokenizerError(TokenizerErrorCode.TOKENIZER_CONSTRUCTION_FAILED) from None
+            except Exception:  # noqa: BLE001,S110 - redact construction details
+                pass
+            if encoding is None:
+                raise TokenizerError(TokenizerErrorCode.TOKENIZER_CONSTRUCTION_FAILED)
             ordinary_encoding = cast(OrdinaryEncoding, encoding)
             self._encoding_cache[encoding_name] = ordinary_encoding
             return ordinary_encoding
