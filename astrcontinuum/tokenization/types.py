@@ -110,6 +110,108 @@ BYTE_FALLBACK: Final = TokenizerProfile(
 )
 
 
+@dataclass(frozen=True, slots=True)
+class TokenizerRoute:
+    """Content-free result of resolving one model to a tokenizer profile."""
+
+    profile: TokenizerProfile
+    stable_code: str
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.profile, TokenizerProfile):
+            raise TypeError("profile must be a TokenizerProfile")
+        if not isinstance(self.stable_code, str) or not self.stable_code:
+            raise ValueError("stable_code must be a non-empty string")
+
+
+class ContextLimitSource(str, Enum):
+    """Stable source labels for one resolved context limit."""
+
+    MANUAL = "MANUAL"
+    AUTO_ASTRBOT = "AUTO_ASTRBOT"
+    AUTO_SAFE_FALLBACK = "AUTO_SAFE_FALLBACK"
+
+
+@dataclass(frozen=True, slots=True)
+class ContextLimitDecision:
+    """Content-free context-limit resolution result."""
+
+    limit: int
+    source: ContextLimitSource
+    stable_code: str
+
+    def __post_init__(self) -> None:
+        if isinstance(self.limit, bool) or not isinstance(self.limit, int) or self.limit < 1:
+            raise ValueError("limit must be a positive integer")
+        if not isinstance(self.source, ContextLimitSource):
+            raise TypeError("source must be a ContextLimitSource")
+        if not isinstance(self.stable_code, str) or not self.stable_code:
+            raise ValueError("stable_code must be a non-empty string")
+
+
+@dataclass(frozen=True, slots=True)
+class RequestBudgetProfile:
+    """Resolved, content-free request budget inputs."""
+
+    model_identity: str | None = field(repr=False)
+    context_limit: int
+    context_limit_source: ContextLimitSource
+    tokenizer_profile: TokenizerProfile
+    target_input_budget: int
+    hard_input_ceiling: int
+    reserved_output_and_tools: int = 32_000
+    safety_margin: int = 2_000
+    stable_code: str = "NONE"
+
+    def __post_init__(self) -> None:
+        if self.model_identity is not None and not isinstance(self.model_identity, str):
+            raise TypeError("model_identity must be a string or None")
+        positive_fields = (
+            "context_limit",
+            "target_input_budget",
+            "hard_input_ceiling",
+        )
+        non_negative_fields = (
+            "reserved_output_and_tools",
+            "safety_margin",
+        )
+        for field_name in positive_fields:
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{field_name} must be a positive integer")
+        for field_name in non_negative_fields:
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{field_name} must be a non-negative integer")
+        if not isinstance(self.context_limit_source, ContextLimitSource):
+            raise TypeError("context_limit_source must be a ContextLimitSource")
+        if not isinstance(self.tokenizer_profile, TokenizerProfile):
+            raise TypeError("tokenizer_profile must be a TokenizerProfile")
+        if not isinstance(self.stable_code, str) or not self.stable_code:
+            raise ValueError("stable_code must be a non-empty string")
+
+    @property
+    def effective_input_budget(self) -> int:
+        return min(
+            self.target_input_budget,
+            self.hard_input_ceiling,
+            self.context_limit - self.reserved_output_and_tools,
+        )
+
+
+@dataclass(frozen=True, slots=True, repr=False)
+class AstrBotRequestMetadata:
+    """Minimal normalized metadata obtained through AstrBot's public API."""
+
+    model_identity: str | None
+    request_model: str | None
+    provider_model: str | None
+    provider_limit: int | None
+
+    def __repr__(self) -> str:
+        return "AstrBotRequestMetadata()"
+
+
 def apply_multiplier(raw_count: int, basis_points: int) -> int:
     if (
         isinstance(raw_count, bool)

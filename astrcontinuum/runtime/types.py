@@ -251,6 +251,26 @@ class BudgetErrorCode(str, Enum):
 
 
 @dataclass(frozen=True, slots=True)
+class BudgetSafetyConfig:
+    """Provider-independent request budget safety defaults."""
+
+    target_input_budget: int = 130_000
+    hard_input_ceiling: int = 150_000
+    reserved_output_and_tools: int = 32_000
+    safety_margin: int = 2_000
+
+    def __post_init__(self) -> None:
+        for field_name in ("target_input_budget", "hard_input_ceiling"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{field_name} must be a positive integer")
+        for field_name in ("reserved_output_and_tools", "safety_margin"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{field_name} must be a non-negative integer")
+
+
+@dataclass(frozen=True, slots=True)
 class BudgetConfig:
     """Canonical request-input budget configuration."""
 

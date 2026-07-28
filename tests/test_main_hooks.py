@@ -141,9 +141,11 @@ def fake_request(
     prompt: str = "current input",
     *,
     token_usage: int = 0,
+    model: object = None,
 ) -> SimpleNamespace:
     return SimpleNamespace(
         prompt=prompt,
+        model=model,
         contexts=[FakeMessage(role="assistant", content="native context")],
         conversation=SimpleNamespace(
             cid="conversation-1",
@@ -189,10 +191,16 @@ def fake_context_trace(
 
 
 class FakeContext:
-    def __init__(self) -> None:
+    def __init__(self, *, provider: object = None) -> None:
+        self.provider = provider
         self.provider_requests: list[str] = []
+        self.using_provider_requests: list[str] = []
         self.generate_calls: list[dict[str, object]] = []
         self.conversation_manager = FakeConversationManager()
+
+    def get_using_provider(self, *, umo: str) -> object:
+        self.using_provider_requests.append(umo)
+        return self.provider
 
     async def get_current_chat_provider_id(self, *, umo: str) -> str:
         self.provider_requests.append(umo)

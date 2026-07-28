@@ -1,4 +1,6 @@
+from .context import ContextLimitResolver, resolve_astrbot_request_metadata
 from .registry import TokenizerRegistry
+from .router import TokenizerRouter, normalize_model_identity
 from .types import (
     BYTE_FALLBACK,
     CANONICAL_O200K,
@@ -6,11 +8,16 @@ from .types import (
     OPENAI_O200K,
     REFERENCE_O200K,
     TOKENIZER_IMPORT_FAILED,
+    AstrBotRequestMetadata,
+    ContextLimitDecision,
+    ContextLimitSource,
     ProfileCounter,
+    RequestBudgetProfile,
     TokenizerError,
     TokenizerErrorCode,
     TokenizerMode,
     TokenizerProfile,
+    TokenizerRoute,
     apply_multiplier,
 )
 
@@ -21,11 +28,20 @@ __all__ = [
     "OPENAI_O200K",
     "REFERENCE_O200K",
     "TOKENIZER_IMPORT_FAILED",
+    "AstrBotRequestMetadata",
+    "ContextLimitDecision",
+    "ContextLimitResolver",
+    "ContextLimitSource",
     "ProfileCounter",
+    "RequestBudgetProfile",
     "TokenizerError",
     "TokenizerErrorCode",
     "TokenizerMode",
     "TokenizerProfile",
     "TokenizerRegistry",
+    "TokenizerRoute",
+    "TokenizerRouter",
     "apply_multiplier",
+    "normalize_model_identity",
+    "resolve_astrbot_request_metadata",
 ]
