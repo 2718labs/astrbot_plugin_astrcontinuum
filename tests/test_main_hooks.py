@@ -2073,9 +2073,7 @@ def test_completed_budget_diagnostics_follow_completion_order_and_bound_session_
             session_key,
             profile,
             outcome(
-                "CONTEXT_LIMIT_UNAVAILABLE"
-                if index % 2 == 0
-                else "CONTEXT_LIMIT_CONFIG_INVALID"
+                "CONTEXT_LIMIT_UNAVAILABLE" if index % 2 == 0 else "CONTEXT_LIMIT_CONFIG_INVALID"
             ),
         )
 
@@ -2165,10 +2163,7 @@ async def test_status_and_inspect_report_content_free_budget_diagnostics(
     )
     combined = status_text + inspect_text + repr(plugin._latest_completed_budget)
     assert all(value not in combined for value in forbidden)
-    assert all(
-        all(value not in str(record) for value in forbidden)
-        for record in logger.records
-    )
+    assert all(all(value not in str(record) for value in forbidden) for record in logger.records)
     await plugin.terminate()
 
 

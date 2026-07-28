@@ -158,9 +158,7 @@ def request(
     canonical_counts: dict[str, int] | None = None,
     token_ceiling: int = 10_000,
 ) -> ac.CompilationRequest:
-    resolved_counts = canonical_counts or {
-        item.event_id: item.token_count for item in events
-    }
+    resolved_counts = canonical_counts or {item.event_id: item.token_count for item in events}
     return ac.CompilationRequest(
         base_snapshot=None,
         base_capsules=base_capsules,
@@ -431,7 +429,9 @@ async def test_provider_binding_refreshes_between_jobs_but_is_frozen_within_one_
 
 
 @pytest.mark.asyncio
-async def test_preflight_counter_failure_replays_whole_request_before_provider_side_effect() -> None:
+async def test_preflight_counter_failure_replays_whole_request_before_provider_side_effect() -> (
+    None
+):
     registry = SessionProviderRegistry(max_entries=2)
     registry.remember(key(), binding("provider-primary"))
     events = (event(1, "primary-one"), event(2, "primary-two"))
@@ -440,24 +440,26 @@ async def test_preflight_counter_failure_replays_whole_request_before_provider_s
     generator = RecordingGenerator(
         extraction_for((events[0],)),
         extraction_for((events[1],)),
-        before_call=lambda: pytest.fail("provider called before complete primary preflight")
-        if not primary.failed
-        else None,
+        before_call=lambda: (
+            pytest.fail("provider called before complete primary preflight")
+            if not primary.failed
+            else None
+        ),
     )
     compiler = AstrBotExtractiveCompilerBackend(
         generator=generator,
         providers=registry,
         compatibility_counter=LengthCounter(),
         tokenizer_router=TokenizerRouter(lambda _model: "o200k_base"),
-        counter_provider=lambda profile: fallback
-        if profile is BYTE_FALLBACK
-        else primary,
+        counter_provider=lambda profile: fallback if profile is BYTE_FALLBACK else primary,
     )
 
     output = await compiler.compile(request(events, max_events_per_segment=1))
 
     assert len(generator.calls) == 2
-    assert all(events[0].content in text or events[1].content in text for text in fallback.texts[1::2])
+    assert all(
+        events[0].content in text or events[1].content in text for text in fallback.texts[1::2]
+    )
     assert output.fit_provenance.tokenizer_profile_id == BYTE_FALLBACK.profile_id
     assert output.fit_provenance.primary_result_discarded is True
     assert output.fitted_segments == request(events, max_events_per_segment=1).segments
@@ -489,8 +491,7 @@ async def test_preflight_splits_only_on_atomic_event_group_boundaries() -> None:
     output = await compiler.compile(request(events))
 
     assert tuple(
-        tuple(item.event_type for item in segment.events)
-        for segment in output.fitted_segments
+        tuple(item.event_type for item in segment.events) for segment in output.fitted_segments
     ) == (
         (ac.EventType.USER_MESSAGE,),
         (ac.EventType.TOOL_CALL, ac.EventType.TOOL_RESULT),
@@ -531,8 +532,7 @@ async def test_preflight_repairs_an_existing_segment_boundary_that_splits_tool_p
     output = await compiler.compile(source_request)
 
     fitted_event_groups = tuple(
-        tuple(item.event_type for item in segment.events)
-        for segment in output.fitted_segments
+        tuple(item.event_type for item in segment.events) for segment in output.fitted_segments
     )
     assert (ac.EventType.TOOL_CALL, ac.EventType.TOOL_RESULT) in fitted_event_groups
     assert all(
@@ -569,9 +569,7 @@ async def test_fitted_segment_token_cost_remains_the_canonical_lane_sum() -> Non
         counter_provider=lambda profile: ProfiledCounter(profile),
     )
 
-    output = await compiler.compile(
-        request(events, canonical_counts=canonical_counts)
-    )
+    output = await compiler.compile(request(events, canonical_counts=canonical_counts))
 
     assert tuple(segment.token_cost for segment in output.fitted_segments) == (10, 50, 40)
 
@@ -593,9 +591,9 @@ async def test_router_tokenizer_failure_replays_the_complete_byte_preflight() ->
     generator = RecordingGenerator(
         extraction_for((events[0],)),
         extraction_for((events[1],)),
-        before_call=lambda: None
-        if route_failed
-        else pytest.fail("provider called before route fallback preflight"),
+        before_call=lambda: (
+            None if route_failed else pytest.fail("provider called before route fallback preflight")
+        ),
     )
     compiler = AstrBotExtractiveCompilerBackend(
         generator=generator,
@@ -693,8 +691,7 @@ async def test_compiler_returns_backend_fitted_segments_and_profile_provenance()
     )
 
     assert tuple(
-        tuple(item.event_type for item in segment.events)
-        for segment in candidate.segments
+        tuple(item.event_type for item in segment.events) for segment in candidate.segments
     ) == (
         (ac.EventType.USER_MESSAGE,),
         (ac.EventType.TOOL_CALL, ac.EventType.TOOL_RESULT),

@@ -52,6 +52,7 @@ CounterProvider = Callable[[TokenizerProfile], TokenCounter]
 class TokenizerRouteResolver(Protocol):
     def route(self, model_identity: object) -> TokenizerRoute: ...
 
+
 _SYSTEM_PROMPT = """You extract source-verifiable state from a conversation segment.
 Do not summarize or paraphrase. Every quote, rationale, alternative, rejection reason,
 entity name, alias, and anchor must be copied verbatim from the declared event.
@@ -169,9 +170,7 @@ class SessionProviderRegistry:
         if isinstance(max_entries, bool) or not isinstance(max_entries, int) or max_entries < 1:
             raise ValueError("max_entries must be a positive integer")
         self._override = provider_override
-        self._override_configured = (
-            provider_override is not None or provider_override_configured
-        )
+        self._override_configured = provider_override is not None or provider_override_configured
         self._max_entries = max_entries
         self._providers: OrderedDict[str, CompactionProviderBinding | None] = OrderedDict()
 
@@ -671,9 +670,7 @@ class AstrBotExtractiveCompilerBackend:
         source_events: tuple[EventEnvelope, ...],
         canonical_counts: Mapping[str, int],
     ) -> tuple[EventSegment, ...]:
-        boundaries = tuple(
-            (segment.end_sequence, segment.boundary_reason) for segment in segments
-        )
+        boundaries = tuple((segment.end_sequence, segment.boundary_reason) for segment in segments)
         normalized: list[EventSegment] = []
         current: tuple[EventEnvelope, ...] = ()
         boundary_index = 0

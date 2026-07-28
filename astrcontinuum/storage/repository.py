@@ -1057,9 +1057,7 @@ class SQLiteRepository:
                 "TOKEN_METRIC_UNAVAILABLE",
             }
         ):
-            raise ValueError(
-                "attempt preservation is limited to retryable transient deferrals"
-            )
+            raise ValueError("attempt preservation is limited to retryable transient deferrals")
 
         now_text = _normalize_datetime(now)
         if retry_at is None:

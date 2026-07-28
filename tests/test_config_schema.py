@@ -100,8 +100,7 @@ def test_schema_does_not_expose_tokenizer_implementation_controls() -> None:
         "path",
     )
     assert all(
-        all(fragment not in key.lower() for fragment in forbidden_fragments)
-        for key in schema
+        all(fragment not in key.lower() for fragment in forbidden_fragments) for key in schema
     )
     assert "advanced_settings" not in schema
 

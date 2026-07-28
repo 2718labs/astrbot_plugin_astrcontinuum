@@ -367,9 +367,9 @@ class AstrContinuumPlugin(Star):
             else "UNAVAILABLE"
         )
         self._latest_completed_budget: _CompletedBudgetDiagnostics | None = None
-        self._completed_budget_sessions: OrderedDict[
-            str, _CompletedBudgetDiagnostics
-        ] = OrderedDict()
+        self._completed_budget_sessions: OrderedDict[str, _CompletedBudgetDiagnostics] = (
+            OrderedDict()
+        )
 
     def _configured_context_engine_mode(self) -> ContextEngineMode:
         value = self.config.get("context_engine_mode", ContextEngineMode.ACTIVE.value)
@@ -474,10 +474,7 @@ class AstrContinuumPlugin(Star):
         session_hash = session_key.session_key_hash
         profile_id = getattr(outcome, "tokenizer_profile_id", None)
         online_mode = getattr(outcome, "tokenizer_mode", None)
-        if (
-            not isinstance(profile_id, str)
-            or _ONLINE_PROFILE_MODES.get(profile_id) != online_mode
-        ):
+        if not isinstance(profile_id, str) or _ONLINE_PROFILE_MODES.get(profile_id) != online_mode:
             profile_id = "INVALID"
             online_mode = "INVALID"
         source = getattr(getattr(profile, "context_limit_source", None), "value", None)
@@ -492,13 +489,11 @@ class AstrContinuumPlugin(Star):
         )
         assembly = getattr(outcome, "assembly", None)
         trace = getattr(assembly, "trace", None)
-        selected_input_tokens = self._diagnostic_count(
-            getattr(trace, "total_input_cost", 0)
-        )
+        selected_input_tokens = self._diagnostic_count(getattr(trace, "total_input_cost", 0))
         previous = self._completed_budget_sessions.get(session_hash)
-        byte_fallback_count = (
-            previous.byte_fallback_count if previous is not None else 0
-        ) + (1 if online_mode == BYTE_FALLBACK.mode.value else 0)
+        byte_fallback_count = (previous.byte_fallback_count if previous is not None else 0) + (
+            1 if online_mode == BYTE_FALLBACK.mode.value else 0
+        )
         completed = _CompletedBudgetDiagnostics(
             context_limit=self._diagnostic_count(getattr(profile, "context_limit", 0)),
             context_limit_source=context_limit_source,
@@ -697,18 +692,12 @@ class AstrContinuumPlugin(Star):
             if provider is None:
                 return None
             get_model = getattr(provider, "get_model", None)
-            model_identity = (
-                normalize_model_identity(get_model()) if callable(get_model) else None
-            )
+            model_identity = normalize_model_identity(get_model()) if callable(get_model) else None
             provider_limit: int | None = None
             provider_config = getattr(provider, "provider_config", None)
             if isinstance(provider_config, Mapping):
                 raw_limit = provider_config.get("max_context_tokens")
-                if (
-                    not isinstance(raw_limit, bool)
-                    and isinstance(raw_limit, int)
-                    and raw_limit > 0
-                ):
+                if not isinstance(raw_limit, bool) and isinstance(raw_limit, int) and raw_limit > 0:
                     provider_limit = raw_limit
             context_limit = self._context_limit_resolver.resolve(
                 self.config.get("model_context_limit", 0),
@@ -863,18 +852,14 @@ class AstrContinuumPlugin(Star):
                     context_engine_mode=self._context_engine_mode,
                 )
                 configured_provider = self.config.get("compaction_provider_id", "")
-                provider_override_configured = (
-                    isinstance(configured_provider, str) and bool(configured_provider.strip())
+                provider_override_configured = isinstance(configured_provider, str) and bool(
+                    configured_provider.strip()
                 )
                 provider_override = self._resolve_explicit_compaction_binding()
                 self._compaction_provider_status = (
                     "EXPLICIT"
                     if provider_override_configured and provider_override is not None
-                    else (
-                        "UNAVAILABLE"
-                        if provider_override_configured
-                        else "FOLLOW_CURRENT"
-                    )
+                    else ("UNAVAILABLE" if provider_override_configured else "FOLLOW_CURRENT")
                 )
                 providers = SessionProviderRegistry(
                     provider_override=provider_override,
@@ -1866,9 +1851,12 @@ class AstrContinuumPlugin(Star):
 
         query_failed = False
         try:
-            event_count, checkpoint_count, pending_count, canonical_metrics = await asyncio.to_thread(
-                read_counts
-            )
+            (
+                event_count,
+                checkpoint_count,
+                pending_count,
+                canonical_metrics,
+            ) = await asyncio.to_thread(read_counts)
         except Exception:  # noqa: BLE001 - never expose storage details to chat
             logger.error(
                 "AstrContinuum status query failed code=%s",
@@ -2074,8 +2062,6 @@ class AstrContinuumPlugin(Star):
             f"残差带：{engine_inspection.residual_band}\n"
             f"恢复次数：{engine_inspection.recovery_count}\n"
             f"必选覆盖：{engine_inspection.required_coverage}\n"
-            f"来源覆盖：{engine_inspection.provenance_coverage}\n"
-            + "\n".join(budget_lines)
-            + "\n"
+            f"来源覆盖：{engine_inspection.provenance_coverage}\n" + "\n".join(budget_lines) + "\n"
             f"稳定代码：{engine_inspection.stable_code}"
         )

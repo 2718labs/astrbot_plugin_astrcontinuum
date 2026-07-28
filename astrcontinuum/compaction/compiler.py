@@ -274,8 +274,7 @@ def _validate_backend_output(
         not isinstance(fitted_segments, tuple)
         or not fitted_segments
         or any(not isinstance(item, EventSegment) for item in fitted_segments)
-        or tuple(event for segment in fitted_segments for event in segment.events)
-        != source_events
+        or tuple(event for segment in fitted_segments for event in segment.events) != source_events
     ):
         raise CompilerInvariantError(CompilerErrorCode.BACKEND_OUTPUT_INVALID)
     fit_provenance = output.fit_provenance
