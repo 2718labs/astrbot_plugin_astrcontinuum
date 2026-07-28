@@ -3,8 +3,8 @@ from __future__ import annotations
 import hashlib
 import json
 from collections import OrderedDict
-from collections.abc import Awaitable, Callable, Iterable
-from typing import NoReturn
+from collections.abc import Awaitable, Callable, Iterable, Mapping
+from typing import NoReturn, Protocol
 
 from pydantic import BaseModel, ConfigDict, Field, ValidationError
 
@@ -18,19 +18,39 @@ from ..domain import (
     ContextCapsuleEnvelope,
     Decision,
     Entity,
+    EventEnvelope,
+    EventType,
     SemanticStatus,
     SessionKey,
 )
 from ..runtime.types import TokenCounter
+from ..tokenization import (
+    BYTE_FALLBACK,
+    RequestScopedTokenCounter,
+    TokenizerError,
+    TokenizerErrorCode,
+    TokenizerMode,
+    TokenizerProfile,
+    TokenizerRoute,
+    TokenizerRouter,
+)
 from .rendering import render_capsule
 from .types import (
+    CompactionFitProvenance,
+    CompactionProviderBinding,
     CompilationRequest,
     CompilerBackendDeferred,
     CompilerOutput,
     EventSegment,
+    SegmentBoundaryReason,
 )
 
 LLMGenerator = Callable[[str, str, str], Awaitable[str]]
+CounterProvider = Callable[[TokenizerProfile], TokenCounter]
+
+
+class TokenizerRouteResolver(Protocol):
+    def route(self, model_identity: object) -> TokenizerRoute: ...
 
 _SYSTEM_PROMPT = """You extract source-verifiable state from a conversation segment.
 Do not summarize or paraphrase. Every quote, rationale, alternative, rejection reason,
@@ -135,35 +155,66 @@ class SessionProviderRegistry:
     def __init__(
         self,
         *,
-        provider_override: str | None = None,
+        provider_override: CompactionProviderBinding | None = None,
+        provider_override_configured: bool = False,
         max_entries: int = 1_024,
     ) -> None:
-        override = provider_override.strip() if isinstance(provider_override, str) else ""
+        if provider_override is not None and not isinstance(
+            provider_override,
+            CompactionProviderBinding,
+        ):
+            raise TypeError("provider_override must be a CompactionProviderBinding or None")
+        if not isinstance(provider_override_configured, bool):
+            raise TypeError("provider_override_configured must be a bool")
         if isinstance(max_entries, bool) or not isinstance(max_entries, int) or max_entries < 1:
             raise ValueError("max_entries must be a positive integer")
-        self._override = override or None
+        self._override = provider_override
+        self._override_configured = (
+            provider_override is not None or provider_override_configured
+        )
         self._max_entries = max_entries
-        self._providers: OrderedDict[str, str] = OrderedDict()
+        self._providers: OrderedDict[str, CompactionProviderBinding | None] = OrderedDict()
 
-    def remember(self, session_key: SessionKey, provider_id: str) -> None:
+    def remember(
+        self,
+        session_key: SessionKey,
+        binding: CompactionProviderBinding,
+    ) -> None:
         if not isinstance(session_key, SessionKey):
             raise TypeError("session_key must be a SessionKey")
-        if not isinstance(provider_id, str) or not provider_id.strip():
-            raise ValueError("provider_id must be non-empty")
+        if not isinstance(binding, CompactionProviderBinding):
+            raise TypeError("binding must be a CompactionProviderBinding")
+        self._remember_value(session_key, binding)
+
+    def remember_unavailable(self, session_key: SessionKey) -> None:
+        """Replace any stale session binding with an unavailable sentinel."""
+
+        self._remember_value(session_key, None)
+
+    def _remember_value(
+        self,
+        session_key: SessionKey,
+        binding: CompactionProviderBinding | None,
+    ) -> None:
+        if not isinstance(session_key, SessionKey):
+            raise TypeError("session_key must be a SessionKey")
         key = session_key.session_key_hash
         self._providers.pop(key, None)
-        self._providers[key] = provider_id.strip()
+        self._providers[key] = binding
         while len(self._providers) > self._max_entries:
             self._providers.popitem(last=False)
 
-    def resolve(self, session_key: SessionKey) -> str:
-        if self._override is not None:
+    def resolve(self, session_key: SessionKey) -> CompactionProviderBinding:
+        if self._override_configured:
+            if self._override is None:
+                raise CompilerBackendDeferred("EXTRACTIVE_PROVIDER_UNAVAILABLE")
             return self._override
-        provider_id = self._providers.get(session_key.session_key_hash)
-        if provider_id is None:
+        key = session_key.session_key_hash
+        binding = self._providers.get(key)
+        if binding is None:
             raise CompilerBackendDeferred("EXTRACTIVE_PROVIDER_UNAVAILABLE")
-        self._providers.move_to_end(session_key.session_key_hash)
-        return provider_id
+        self._providers.move_to_end(key)
+        return binding
 
 
 def _stable_id(prefix: str, payload: object) -> str:
@@ -376,18 +427,35 @@ class AstrBotExtractiveCompilerBackend:
         *,
         generator: LLMGenerator,
         providers: SessionProviderRegistry,
-        counter: TokenCounter,
+        compatibility_counter: TokenCounter | None = None,
+        tokenizer_router: TokenizerRouteResolver | None = None,
+        counter_provider: CounterProvider | None = None,
+        counter: TokenCounter | None = None,
     ) -> None:
+        resolved_compatibility_counter = (
+            compatibility_counter if compatibility_counter is not None else counter
+        )
+        if resolved_compatibility_counter is None:
+            raise TypeError("compatibility_counter must be provided")
         self._generator = generator
         self._providers = providers
-        self._counter = counter
+        self._compatibility_counter = resolved_compatibility_counter
+        self._tokenizer_router = tokenizer_router or TokenizerRouter()
+        self._counter_provider = counter_provider or (
+            lambda _profile: resolved_compatibility_counter
+        )
 
     async def compile(self, request: CompilationRequest) -> CompilerOutput:
-        provider_id = self._providers.resolve(request.source_events[0].session_key)
+        binding = request.provider_binding
+        if binding is None:
+            if request.provider_binding_captured:
+                raise CompilerBackendDeferred("EXTRACTIVE_PROVIDER_UNAVAILABLE")
+            binding = self._providers.resolve(request.source_events[0].session_key)
+        fitted_segments, provenance = self._preflight(request, binding)
         new_capsules: list[ContextCapsuleEnvelope] = []
-        for segment in request.segments:
+        for segment in fitted_segments:
             prompt = self._segment_prompt(segment)
-            raw = await self._generator(provider_id, _SYSTEM_PROMPT, prompt)
+            raw = await self._generator(binding.provider_id, _SYSTEM_PROMPT, prompt)
             extraction = _parse_output(raw)
             event_contents = _validate_extraction(extraction, segment)
             capsule = self._capsule(segment, extraction, event_contents)
@@ -400,6 +468,267 @@ class AstrBotExtractiveCompilerBackend:
         return CompilerOutput(
             capsules=capsules,
             rendered_context=rendered_context,
+            fitted_segments=fitted_segments,
+            fit_provenance=provenance,
+        )
+
+    def _preflight(
+        self,
+        request: CompilationRequest,
+        binding: CompactionProviderBinding,
+    ) -> tuple[tuple[EventSegment, ...], CompactionFitProvenance]:
+        input_limit = binding.context_limit
+        try:
+            route = self._tokenizer_router.route(binding.model_identity)
+            if route.profile.mode is TokenizerMode.BYTE_FALLBACK:
+                fitted = self._fit_with_profile(
+                    request,
+                    profile=BYTE_FALLBACK,
+                    input_limit=input_limit,
+                )
+                return fitted, CompactionFitProvenance(
+                    tokenizer_profile_id=BYTE_FALLBACK.profile_id,
+                    tokenizer_mode=BYTE_FALLBACK.mode.value,
+                    fallback_code="TOKENIZER_BYTE_FALLBACK",
+                    primary_result_discarded=False,
+                )
+            fitted = self._fit_with_profile(
+                request,
+                profile=route.profile,
+                input_limit=input_limit,
+            )
+        except CompilerBackendDeferred:
+            raise
+        except TokenizerError:
+            fitted = self._fit_fallback(
+                request,
+                input_limit=input_limit,
+            )
+            return fitted, CompactionFitProvenance(
+                tokenizer_profile_id=BYTE_FALLBACK.profile_id,
+                tokenizer_mode=BYTE_FALLBACK.mode.value,
+                fallback_code="TOKENIZER_BYTE_FALLBACK",
+                primary_result_discarded=True,
+            )
+        return fitted, CompactionFitProvenance(
+            tokenizer_profile_id=route.profile.profile_id,
+            tokenizer_mode=route.profile.mode.value,
+            fallback_code="NONE",
+            primary_result_discarded=False,
+        )
+
+    def _fit_fallback(
+        self,
+        request: CompilationRequest,
+        *,
+        input_limit: int,
+    ) -> tuple[EventSegment, ...]:
+        try:
+            return self._fit_with_profile(
+                request,
+                profile=BYTE_FALLBACK,
+                input_limit=input_limit,
+            )
+        except CompilerBackendDeferred:
+            raise
+        except TokenizerError:
+            raise CompilerBackendDeferred("COMPACTION_TOKENIZER_UNAVAILABLE") from None
+
+    def _fit_with_profile(
+        self,
+        request: CompilationRequest,
+        *,
+        profile: TokenizerProfile,
+        input_limit: int,
+    ) -> tuple[EventSegment, ...]:
+        try:
+            raw_counter = self._counter_provider(profile)
+            counter = RequestScopedTokenCounter(raw_counter, profile=profile)
+            return self._fit_segments(
+                request.segments,
+                source_events=request.source_events,
+                canonical_counts=request.canonical_event_token_counts,
+                counter=counter,
+                input_limit=input_limit,
+            )
+        except CompilerBackendDeferred:
+            raise
+        except TokenizerError:
+            raise
+        except Exception:  # noqa: BLE001 - translate pluggable counter failures
+            raise TokenizerError(TokenizerErrorCode.TOKENIZER_COUNT_FAILED) from None
+
+    def _fit_segments(
+        self,
+        segments: tuple[EventSegment, ...],
+        *,
+        source_events: tuple[EventEnvelope, ...],
+        canonical_counts: Mapping[str, int],
+        counter: RequestScopedTokenCounter,
+        input_limit: int,
+    ) -> tuple[EventSegment, ...]:
+        expected_event_ids = {event.event_id for event in source_events}
+        if set(canonical_counts) != expected_event_ids:
+            raise CompilerBackendDeferred("TOKEN_METRIC_MISSING")
+        atomic_segments = self._normalize_atomic_segments(
+            segments,
+            source_events=source_events,
+            canonical_counts=canonical_counts,
+        )
+        fitted: list[EventSegment] = []
+        for segment in atomic_segments:
+            if self._serialized_cost(segment, counter) <= input_limit:
+                fitted.append(segment)
+                continue
+            fitted.extend(
+                self._split_segment(
+                    segment,
+                    canonical_counts=canonical_counts,
+                    counter=counter,
+                    input_limit=input_limit,
+                )
+            )
+        return tuple(fitted)
+
+    def _split_segment(
+        self,
+        segment: EventSegment,
+        *,
+        canonical_counts: Mapping[str, int],
+        counter: RequestScopedTokenCounter,
+        input_limit: int,
+    ) -> tuple[EventSegment, ...]:
+        groups = self._atomic_event_groups(segment)
+        split: list[EventSegment] = []
+        current: tuple[EventEnvelope, ...] = ()
+        for group in groups:
+            proposed_events = (*current, *group)
+            proposed = self._fitted_segment(
+                proposed_events,
+                canonical_counts=canonical_counts,
+                boundary_reason=SegmentBoundaryReason.MAX_TOKENS,
+            )
+            proposed_cost = self._serialized_cost(proposed, counter)
+            if proposed_cost <= input_limit:
+                current = proposed_events
+                continue
+            if current:
+                split.append(
+                    self._fitted_segment(
+                        current,
+                        canonical_counts=canonical_counts,
+                        boundary_reason=SegmentBoundaryReason.MAX_TOKENS,
+                    )
+                )
+            current = tuple(group)
+            single = self._fitted_segment(
+                current,
+                canonical_counts=canonical_counts,
+                boundary_reason=segment.boundary_reason,
+            )
+            if self._serialized_cost(single, counter) > input_limit:
+                raise CompilerBackendDeferred("COMPACTION_INPUT_TOO_LARGE")
+        if current:
+            split.append(
+                self._fitted_segment(
+                    current,
+                    canonical_counts=canonical_counts,
+                    boundary_reason=segment.boundary_reason,
+                )
+            )
+        return tuple(split)
+
+    @staticmethod
+    def _atomic_event_groups(
+        segment: EventSegment,
+    ) -> tuple[tuple[EventEnvelope, ...], ...]:
+        return AstrBotExtractiveCompilerBackend._event_groups(segment.events)
+
+    @staticmethod
+    def _event_groups(
+        events: tuple[EventEnvelope, ...],
+    ) -> tuple[tuple[EventEnvelope, ...], ...]:
+        groups: list[tuple[EventEnvelope, ...]] = []
+        index = 0
+        while index < len(events):
+            event = events[index]
+            if (
+                event.event_type is EventType.TOOL_CALL
+                and index + 1 < len(events)
+                and events[index + 1].event_type is EventType.TOOL_RESULT
+            ):
+                groups.append((event, events[index + 1]))
+                index += 2
+            else:
+                groups.append((event,))
+                index += 1
+        return tuple(groups)
+
+    @staticmethod
+    def _normalize_atomic_segments(
+        segments: tuple[EventSegment, ...],
+        *,
+        source_events: tuple[EventEnvelope, ...],
+        canonical_counts: Mapping[str, int],
+    ) -> tuple[EventSegment, ...]:
+        boundaries = tuple(
+            (segment.end_sequence, segment.boundary_reason) for segment in segments
+        )
+        normalized: list[EventSegment] = []
+        current: tuple[EventEnvelope, ...] = ()
+        boundary_index = 0
+        for group in AstrBotExtractiveCompilerBackend._event_groups(source_events):
+            current = (*current, *group)
+            crossed_reason: SegmentBoundaryReason | None = None
+            while (
+                boundary_index < len(boundaries)
+                and boundaries[boundary_index][0] <= group[-1].sequence
+            ):
+                crossed_reason = boundaries[boundary_index][1]
+                boundary_index += 1
+            if crossed_reason is not None:
+                normalized.append(
+                    AstrBotExtractiveCompilerBackend._fitted_segment(
+                        current,
+                        canonical_counts=canonical_counts,
+                        boundary_reason=crossed_reason,
+                    )
+                )
+                current = ()
+        if current:
+            normalized.append(
+                AstrBotExtractiveCompilerBackend._fitted_segment(
+                    current,
+                    canonical_counts=canonical_counts,
+                    boundary_reason=SegmentBoundaryReason.END_OF_INPUT,
+                )
+            )
+        return tuple(normalized)
+
+    @staticmethod
+    def _fitted_segment(
+        events: tuple[EventEnvelope, ...],
+        *,
+        canonical_counts: Mapping[str, int],
+        boundary_reason: SegmentBoundaryReason,
+    ) -> EventSegment:
+        first = events[0]
+        last = events[-1]
+        return EventSegment(
+            start_sequence=first.sequence,
+            end_sequence=last.sequence,
+            events=events,
+            token_cost=sum(canonical_counts[event.event_id] for event in events),
+            boundary_reason=boundary_reason,
+        )
+
+    def _serialized_cost(
+        self,
+        segment: EventSegment,
+        counter: RequestScopedTokenCounter,
+    ) -> int:
+        return counter.count_text(_SYSTEM_PROMPT) + counter.count_text(
+            self._segment_prompt(segment)
         )
 
     @staticmethod
@@ -495,7 +824,7 @@ class AstrBotExtractiveCompilerBackend:
             created_at=segment.events[-1].created_at,
         )
         try:
-            token_cost = self._counter.count_text(render_capsule(capsule))
+            token_cost = self._compatibility_counter.count_text(render_capsule(capsule))
         except Exception:  # noqa: BLE001 - pluggable counter details stay private
             _invalid("EXTRACTIVE_TOKEN_COUNTER_FAILURE")
         if isinstance(token_cost, bool) or not isinstance(token_cost, int) or token_cost < 0:

@@ -10,8 +10,10 @@ import pytest
 import astrcontinuum as ac
 import astrcontinuum.compaction.worker as worker_module
 from astrcontinuum.compaction import (
+    CompactionProviderBinding,
     CompactionWorker,
     CompactionWorkerConfig,
+    SessionProviderRegistry,
     render_capsule,
 )
 from astrcontinuum.context_graph.candidate_verification import (
@@ -24,7 +26,7 @@ from astrcontinuum.storage import (
     TokenMetric,
     TokenMetricStore,
 )
-from astrcontinuum.tokenization import CANONICAL_O200K
+from astrcontinuum.tokenization import CANONICAL_O200K, ContextLimitSource
 
 NOW = datetime(2026, 7, 27, 4, 0, tzinfo=timezone.utc)
 TEST_KEY = bytes(range(32))
@@ -117,6 +119,14 @@ class ExactBackend:
 class SlowExactBackend(ExactBackend):
     async def compile(self, request: ac.CompilationRequest) -> ac.CompilerOutput:
         await asyncio.sleep(0.15)
+        return await super().compile(request)
+
+
+class CapturedBindingBackend(ExactBackend):
+    async def compile(self, request: ac.CompilationRequest) -> ac.CompilerOutput:
+        if request.provider_binding_captured and request.provider_binding is None:
+            self.requests.append(request)
+            raise ac.CompilerBackendDeferred("EXTRACTIVE_PROVIDER_UNAVAILABLE")
         return await super().compile(request)
 
 
@@ -400,7 +410,95 @@ async def test_worker_defers_unavailable_canonical_counter_without_byte_fallback
     assert backend.requests == []
 
 
-def test_attempt_preservation_rejects_non_metric_failures(tmp_path: Path) -> None:
+@pytest.mark.asyncio
+async def test_worker_captures_provider_binding_immediately_after_claim(
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    session_key = key("binding-at-claim")
+    capture(store, session_key, 1)
+    raise_intent(store, session_key, 1, job_id="job-binding-first")
+    providers = SessionProviderRegistry(max_entries=2)
+    first_binding = CompactionProviderBinding(
+        provider_id="provider-first",
+        model_identity="gpt-4o",
+        context_limit=262_144,
+        context_limit_source=ContextLimitSource.AUTO_ASTRBOT,
+    )
+    second_binding = CompactionProviderBinding(
+        provider_id="provider-second",
+        model_identity="MiniMax-Text-01",
+        context_limit=128_000,
+        context_limit_source=ContextLimitSource.AUTO_SAFE_FALLBACK,
+    )
+    providers.remember(session_key, first_binding)
+    backend = ExactBackend()
+    instance = CompactionWorker(
+        repository=store,
+        backend=backend,
+        compatibility_counter=LengthCounter(),
+        canonical_counter=LengthCounter(),
+        canonical_profile_id=CANONICAL_O200K.profile_id,
+        provider_bindings=providers,
+        worker_id="worker-binding-at-claim",
+        clock=FrozenClock(NOW + timedelta(minutes=2)),
+        config=CompactionWorkerConfig(token_ceiling=10_000),
+    )
+    entered_backfill = asyncio.Event()
+    release_backfill = asyncio.Event()
+    original_backfill = instance._backfill_metrics
+
+    async def blocked_backfill(claimed_session: ac.SessionKey) -> None:
+        entered_backfill.set()
+        await release_backfill.wait()
+        await original_backfill(claimed_session)
+
+    instance._backfill_metrics = blocked_backfill  # type: ignore[method-assign]
+    first_iteration = asyncio.create_task(instance.run_iteration())
+    await entered_backfill.wait()
+
+    providers.remember(session_key, second_binding)
+    release_backfill.set()
+    assert await first_iteration is True
+
+    assert backend.requests[0].provider_binding is first_binding
+    capture(store, session_key, 2)
+    raise_intent(store, session_key, 2, job_id="job-binding-second")
+    assert await instance.run_iteration() is True
+    assert backend.requests[1].provider_binding is second_binding
+
+
+@pytest.mark.asyncio
+async def test_missing_claim_binding_still_backfills_before_safe_deferral(
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    session_key = key("binding-missing-backfill")
+    source = capture(store, session_key, 1)
+    raise_intent(store, session_key, 1, job_id="job-binding-missing")
+    providers = SessionProviderRegistry(max_entries=2)
+    backend = CapturedBindingBackend()
+    instance = CompactionWorker(
+        repository=store,
+        backend=backend,
+        compatibility_counter=LengthCounter(),
+        canonical_counter=LengthCounter(),
+        canonical_profile_id=CANONICAL_O200K.profile_id,
+        provider_bindings=providers,
+        worker_id="worker-binding-missing",
+        clock=FrozenClock(NOW + timedelta(minutes=2)),
+        config=CompactionWorkerConfig(token_ceiling=10_000),
+    )
+
+    assert await instance.run_iteration() is True
+
+    assert read_metric(store, ArtifactKind.EVENT, source.event_id) is not None
+    assert backend.requests[0].provider_binding is None
+    assert backend.requests[0].provider_binding_captured is True
+    assert job_row(store, "job-binding-missing")[3] == "EXTRACTIVE_PROVIDER_UNAVAILABLE"
+
+
+def test_attempt_preservation_rejects_nontransient_failures(tmp_path: Path) -> None:
     store = repository(tmp_path)
     session_key = key("attempt-guard")
     capture(store, session_key, 1)
@@ -414,7 +512,7 @@ def test_attempt_preservation_rejects_non_metric_failures(tmp_path: Path) -> Non
 
     with pytest.raises(
         ValueError,
-        match="^attempt preservation is limited to retryable canonical metric deferrals$",
+        match="^attempt preservation is limited to retryable transient deferrals$",
     ):
         store.fail_job(
             job_id=leased.job_id,
@@ -593,13 +691,15 @@ async def test_missing_session_provider_waits_without_exhausting_attempts(
     capture(store, session_key, 1)
     raise_intent(store, session_key, 1, job_id="job-provider-wait")
     clock = FrozenClock(NOW + timedelta(minutes=2))
-    backend = ExactBackend(error=ac.CompilerBackendDeferred("EXTRACTIVE_PROVIDER_UNAVAILABLE"))
+    providers = SessionProviderRegistry(max_entries=2)
+    backend = CapturedBindingBackend()
     instance = CompactionWorker(
         repository=store,
         backend=backend,
-        counter=LengthCounter(),
+        compatibility_counter=LengthCounter(),
         canonical_counter=LengthCounter(),
         canonical_profile_id=CANONICAL_O200K.profile_id,
+        provider_bindings=providers,
         worker_id="worker-provider-wait",
         clock=clock,
         config=CompactionWorkerConfig(
@@ -615,14 +715,28 @@ async def test_missing_session_provider_waits_without_exhausting_attempts(
     assert await instance.run_iteration() is True
     first_wait = job_row(store, "job-provider-wait")
     assert first_wait[0] == "RETRY_WAIT"
-    assert first_wait[1] == 1
+    assert first_wait[1] == 0
     assert first_wait[3] == "EXTRACTIVE_PROVIDER_UNAVAILABLE"
 
     clock.now += timedelta(seconds=11)
     assert await instance.run_iteration() is True
     second_wait = job_row(store, "job-provider-wait")
     assert second_wait[0] == "RETRY_WAIT"
-    assert second_wait[1] == 2
+    assert second_wait[1] == 0
+
+    providers.remember(
+        session_key,
+        CompactionProviderBinding(
+            provider_id="provider-recovered",
+            model_identity="gpt-4o",
+            context_limit=10_000,
+            context_limit_source=ContextLimitSource.AUTO_ASTRBOT,
+        ),
+    )
+    clock.now += timedelta(seconds=11)
+    assert await instance.run_iteration() is True
+    assert job_row(store, "job-provider-wait")[:2] == ("COMMITTED", 1)
+    assert backend.requests[-1].provider_binding is providers.resolve(session_key)
 
 
 @pytest.mark.asyncio

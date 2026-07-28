@@ -205,6 +205,7 @@ class FakeContext:
     def __init__(self, *, provider: object = None) -> None:
         self.provider = provider
         self.provider_requests: list[str] = []
+        self.provider_by_id_requests: list[str] = []
         self.using_provider_requests: list[str] = []
         self.generate_calls: list[dict[str, object]] = []
         self.conversation_manager = FakeConversationManager()
@@ -216,6 +217,10 @@ class FakeContext:
     async def get_current_chat_provider_id(self, *, umo: str) -> str:
         self.provider_requests.append(umo)
         return "conversation-provider"
+
+    def get_provider_by_id(self, provider_id: str) -> object:
+        self.provider_by_id_requests.append(provider_id)
+        return self.provider
 
     async def llm_generate(self, **kwargs: object) -> SimpleNamespace:
         self.generate_calls.append(kwargs)
@@ -573,8 +578,227 @@ async def test_initialize_injects_dedicated_canonical_o200k_counter(
     assert worker is not None
     assert worker._canonical_profile_id == module.CANONICAL_O200K.profile_id
     assert not hasattr(plugin, "_counter")
-    assert worker._canonical_counter is not worker._counter
+    assert worker._canonical_counter is not worker._compatibility_counter
     assert worker._canonical_counter.profile == module.CANONICAL_O200K
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_explicit_compaction_provider_resolves_through_public_registry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = SimpleNamespace(
+        get_model=lambda: "MiniMax-Text-01",
+        provider_config={"max_context_tokens": 262_144},
+    )
+    context = FakeContext(provider=provider)
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        context,
+        {
+            "enabled": True,
+            "compaction_provider_id": "private-provider-id",
+            "model_context_limit": 0,
+        },
+    )
+
+    await plugin.initialize()
+
+    assert context.provider_by_id_requests == ["private-provider-id"]
+    providers = plugin._providers
+    assert providers is not None
+    arbitrary_session = module.SessionKey(
+        platform_instance_id="platform",
+        message_type="friend_message",
+        session_id="session",
+        group_id=None,
+        user_id="user",
+        conversation_id="conversation",
+        persona_id=None,
+    )
+    resolved = providers.resolve(arbitrary_session)
+    assert resolved.context_limit == 130_000
+    assert resolved.context_limit_source.value == "AUTO_ASTRBOT"
+    assert "private-provider-id" not in repr(resolved)
+    assert "MiniMax-Text-01" not in repr(resolved)
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_unavailable_explicit_provider_cannot_fall_back_to_live_session_binding(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    context = FakeContext(provider=None)
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        context,
+        {
+            "enabled": True,
+            "compaction_provider_id": "missing-private-provider",
+        },
+    )
+    await plugin.initialize()
+    providers = plugin._providers
+    assert providers is not None
+    session = module.SessionKey(
+        platform_instance_id="platform",
+        message_type="friend_message",
+        session_id="session",
+        group_id=None,
+        user_id="user",
+        conversation_id="conversation",
+        persona_id=None,
+    )
+    providers.remember(
+        session,
+        module.CompactionProviderBinding(
+            provider_id="live-provider",
+            model_identity="gpt-4o",
+            context_limit=1,
+            context_limit_source=plugin._context_limit_resolver.resolve(200_000).source,
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        providers.resolve(session)
+
+    assert getattr(caught.value, "code", None) == "EXTRACTIVE_PROVIDER_UNAVAILABLE"
+    assert context.provider_by_id_requests == ["missing-private-provider"]
+    assert context.generate_calls == []
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_live_request_only_refreshes_binding_without_running_compaction_lane(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = SimpleNamespace(
+        get_model=lambda: "gpt-4o",
+        provider_config={"max_context_tokens": 262_144},
+    )
+    context = FakeContext(provider=provider)
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        context,
+        {"enabled": True, "model_context_limit": 0},
+    )
+    await plugin.initialize()
+    worker = plugin._worker
+    assert worker is not None
+
+    async def forbidden_lane(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("live request awaited the background compaction lane")
+
+    monkeypatch.setattr(worker, "_backfill_metrics", forbidden_lane)
+    event = FakeEvent(message_id="binding-only")
+
+    await plugin.on_llm_request(event, fake_request(model="gpt-4o"))
+
+    assert context.generate_calls == []
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    providers = plugin._providers
+    assert providers is not None
+    resolved = providers.resolve(state.prepared.turn.session_key)
+    assert resolved.model_identity == "gpt-4o"
+    assert resolved.context_limit == 130_000
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_small_model_window_marks_live_provider_unavailable_before_compaction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = SimpleNamespace(
+        get_model=lambda: "gpt-4o-mini",
+        provider_config={"max_context_tokens": 20_000},
+    )
+    context = FakeContext(provider=provider)
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        context,
+        {"enabled": True, "model_context_limit": 0},
+    )
+    await plugin.initialize()
+    event = FakeEvent(message_id="small-window")
+
+    await plugin.on_llm_request(event, fake_request(model="gpt-4o-mini"))
+
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    providers = plugin._providers
+    assert providers is not None
+    with pytest.raises(RuntimeError) as caught:
+        providers.resolve(state.prepared.turn.session_key)
+    assert getattr(caught.value, "code", None) == "EXTRACTIVE_PROVIDER_UNAVAILABLE"
+    assert context.generate_calls == []
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_failed_live_refresh_clears_stale_binding_and_later_success_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = SimpleNamespace(
+        get_model=lambda: "gpt-4o",
+        provider_config={"max_context_tokens": 262_144},
+    )
+
+    class MutableProviderContext(FakeContext):
+        current_provider: str | BaseException = "provider-one"
+
+        async def get_current_chat_provider_id(self, *, umo: str) -> str:
+            self.provider_requests.append(umo)
+            if isinstance(self.current_provider, BaseException):
+                raise self.current_provider
+            return self.current_provider
+
+    context = MutableProviderContext(provider=provider)
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        context,
+        {"enabled": True, "model_context_limit": 0},
+    )
+    await plugin.initialize()
+    first = FakeEvent(message_id="refresh-one")
+    await plugin.on_llm_request(first, fake_request(model="gpt-4o"))
+    first_state = plugin._state(first)
+    assert first_state is not None and first_state.prepared is not None
+    session = first_state.prepared.turn.session_key
+    providers = plugin._providers
+    assert providers is not None
+    assert providers.resolve(session).provider_id == "provider-one"
+
+    original_metadata_resolver = module.resolve_astrbot_request_metadata
+
+    def fail_metadata(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("private metadata failure")
+
+    monkeypatch.setattr(module, "resolve_astrbot_request_metadata", fail_metadata)
+    second = FakeEvent(message_id="refresh-two")
+    await plugin.on_llm_request(second, fake_request(model="gpt-4o"))
+    with pytest.raises(RuntimeError) as metadata_failure:
+        providers.resolve(session)
+    assert getattr(metadata_failure.value, "code", None) == "EXTRACTIVE_PROVIDER_UNAVAILABLE"
+
+    monkeypatch.setattr(module, "resolve_astrbot_request_metadata", original_metadata_resolver)
+    context.current_provider = RuntimeError("private provider id failure")
+    third = FakeEvent(message_id="refresh-three")
+    await plugin.on_llm_request(third, fake_request(model="gpt-4o"))
+    with pytest.raises(RuntimeError) as provider_failure:
+        providers.resolve(session)
+    assert getattr(provider_failure.value, "code", None) == "EXTRACTIVE_PROVIDER_UNAVAILABLE"
+
+    context.current_provider = "provider-two"
+    fourth = FakeEvent(message_id="refresh-four")
+    await plugin.on_llm_request(fourth, fake_request(model="gpt-4o"))
+    assert providers.resolve(session).provider_id == "provider-two"
+    assert context.generate_calls == []
     await plugin.terminate()
 
 

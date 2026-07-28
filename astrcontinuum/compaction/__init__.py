@@ -9,6 +9,8 @@ from .rendering import render_capsule
 from .segmenter import segment
 from .types import (
     AuditedCandidate,
+    CompactionFitProvenance,
+    CompactionProviderBinding,
     CompilationCandidate,
     CompilationRequest,
     CompilerBackend,
@@ -31,6 +33,8 @@ from .worker import CompactionWorker, CompactionWorkerConfig
 __all__ = [
     "AstrBotExtractiveCompilerBackend",
     "AuditedCandidate",
+    "CompactionFitProvenance",
+    "CompactionProviderBinding",
     "CompactionWorker",
     "CompactionWorkerConfig",
     "CompilationCandidate",

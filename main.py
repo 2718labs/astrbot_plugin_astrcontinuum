@@ -27,6 +27,7 @@ if TYPE_CHECKING or not __package__:
     )
     from astrcontinuum.compaction import (
         AstrBotExtractiveCompilerBackend,
+        CompactionProviderBinding,
         CompactionWorker,
         CompactionWorkerConfig,
         SessionProviderRegistry,
@@ -73,6 +74,7 @@ if TYPE_CHECKING or not __package__:
         TokenizerRegistry,
         TokenizerRoute,
         TokenizerRouter,
+        normalize_model_identity,
         resolve_astrbot_request_metadata,
     )
 else:
@@ -88,6 +90,7 @@ else:
     )
     from .astrcontinuum.compaction import (
         AstrBotExtractiveCompilerBackend,
+        CompactionProviderBinding,
         CompactionWorker,
         CompactionWorkerConfig,
         SessionProviderRegistry,
@@ -134,6 +137,7 @@ else:
         TokenizerRegistry,
         TokenizerRoute,
         TokenizerRouter,
+        normalize_model_identity,
         resolve_astrbot_request_metadata,
     )
 
@@ -513,6 +517,73 @@ class AstrContinuumPlugin(Star):
             raise RuntimeError("compaction provider returned no text")
         return content
 
+    def _resolve_explicit_compaction_binding(self) -> CompactionProviderBinding | None:
+        configured = self.config.get("compaction_provider_id", "")
+        provider_id = configured.strip() if isinstance(configured, str) else ""
+        if not provider_id:
+            return None
+        resolver = getattr(self.context, "get_provider_by_id", None)
+        if not callable(resolver):
+            return None
+        try:
+            provider = resolver(provider_id)
+            if provider is None:
+                return None
+            get_model = getattr(provider, "get_model", None)
+            model_identity = (
+                normalize_model_identity(get_model()) if callable(get_model) else None
+            )
+            provider_limit: int | None = None
+            provider_config = getattr(provider, "provider_config", None)
+            if isinstance(provider_config, Mapping):
+                raw_limit = provider_config.get("max_context_tokens")
+                if (
+                    not isinstance(raw_limit, bool)
+                    and isinstance(raw_limit, int)
+                    and raw_limit > 0
+                ):
+                    provider_limit = raw_limit
+            context_limit = self._context_limit_resolver.resolve(
+                self.config.get("model_context_limit", 0),
+                provider_limit=provider_limit,
+                request_model=model_identity,
+                provider_model=model_identity,
+            )
+            route = self._tokenizer_router.route(model_identity)
+            profile = self._request_profile(
+                route,
+                context_limit,
+                model_identity=model_identity,
+            )
+            if profile.effective_input_budget < 1:
+                return None
+            return CompactionProviderBinding(
+                provider_id=provider_id,
+                model_identity=model_identity,
+                context_limit=profile.effective_input_budget,
+                context_limit_source=context_limit.source,
+            )
+        except Exception:  # noqa: BLE001 - defer with a stable unavailable code
+            return None
+
+    def _invalidate_current_provider_binding(
+        self,
+        event: AstrMessageEvent,
+        request: Any,
+    ) -> None:
+        providers = self._providers
+        if providers is None:
+            return
+        override = self.config.get("compaction_provider_id", "")
+        if isinstance(override, str) and override.strip():
+            return
+        try:
+            conversation = request.conversation
+            session_key = extract_host_session_key(event, conversation)
+        except Exception:  # noqa: BLE001 - request preparation reports identity faults
+            return
+        providers.remember_unavailable(session_key)
+
     async def _remember_current_provider(
         self,
         event: AstrMessageEvent,
@@ -528,6 +599,7 @@ class AstrContinuumPlugin(Star):
         resolver = getattr(self.context, "get_current_chat_provider_id", None)
         umo = getattr(event, "unified_msg_origin", None)
         if not callable(resolver) or not isinstance(umo, str) or not umo:
+            providers.remember_unavailable(prepared.turn.session_key)
             self._record_fault(
                 state,
                 _generic_fault("PROVIDER_RESOLUTION_UNAVAILABLE", "REQUEST"),
@@ -535,8 +607,21 @@ class AstrContinuumPlugin(Star):
             return
         try:
             provider_id = await resolver(umo=umo)
-            providers.remember(prepared.turn.session_key, provider_id)
+            profile = prepared.budget_profile
+            if profile.effective_input_budget < 1:
+                providers.remember_unavailable(prepared.turn.session_key)
+                return
+            providers.remember(
+                prepared.turn.session_key,
+                CompactionProviderBinding(
+                    provider_id=provider_id,
+                    model_identity=profile.model_identity,
+                    context_limit=profile.effective_input_budget,
+                    context_limit_source=profile.context_limit_source,
+                ),
+            )
         except Exception:  # noqa: BLE001 - provider details stay private
+            providers.remember_unavailable(prepared.turn.session_key)
             self._record_fault(
                 state,
                 _generic_fault("PROVIDER_RESOLUTION_FAILED", "REQUEST"),
@@ -610,16 +695,20 @@ class AstrContinuumPlugin(Star):
                     counter_provider=self._tokenizer_registry.counter_for,
                     context_engine_mode=self._context_engine_mode,
                 )
-                provider_override = self.config.get("compaction_provider_id", "")
+                configured_provider = self.config.get("compaction_provider_id", "")
+                provider_override_configured = (
+                    isinstance(configured_provider, str) and bool(configured_provider.strip())
+                )
                 providers = SessionProviderRegistry(
-                    provider_override=(
-                        provider_override if isinstance(provider_override, str) else None
-                    ),
+                    provider_override=self._resolve_explicit_compaction_binding(),
+                    provider_override_configured=provider_override_configured,
                 )
                 backend = AstrBotExtractiveCompilerBackend(
                     generator=self._generate_compaction,
                     providers=providers,
-                    counter=compatibility_counter,
+                    compatibility_counter=compatibility_counter,
+                    tokenizer_router=self._tokenizer_router,
+                    counter_provider=self._tokenizer_registry.counter_for,
                 )
                 try:
                     canonical_counter = await asyncio.to_thread(
@@ -631,9 +720,10 @@ class AstrContinuumPlugin(Star):
                 worker = CompactionWorker(
                     repository=repository,
                     backend=backend,
-                    counter=compatibility_counter,
+                    compatibility_counter=compatibility_counter,
                     canonical_counter=canonical_counter,
                     canonical_profile_id=CANONICAL_O200K.profile_id,
+                    provider_bindings=providers,
                     worker_id=f"astrbot-{uuid.uuid4().hex}",
                     config=self._worker_config(),
                     fatal_storage_callback=self._on_worker_storage_failure,
@@ -794,6 +884,7 @@ class AstrContinuumPlugin(Star):
         bridge = self._bridge
         if bridge is None:
             return
+        self._invalidate_current_provider_binding(event, req)
         try:
             metadata = resolve_astrbot_request_metadata(self.context, event, req)
             context_limit = self._context_limit_resolver.resolve(

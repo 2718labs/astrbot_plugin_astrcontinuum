@@ -1052,12 +1052,13 @@ class SQLiteRepository:
             or error_stage != "COMPILING"
             or error_code
             not in {
+                "EXTRACTIVE_PROVIDER_UNAVAILABLE",
                 "TOKEN_METRIC_MISSING",
                 "TOKEN_METRIC_UNAVAILABLE",
             }
         ):
             raise ValueError(
-                "attempt preservation is limited to retryable canonical metric deferrals"
+                "attempt preservation is limited to retryable transient deferrals"
             )
 
         now_text = _normalize_datetime(now)

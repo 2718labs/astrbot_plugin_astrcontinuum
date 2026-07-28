@@ -4,6 +4,7 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import Protocol
 
 from ..context_graph.candidate_verification import (
     CandidateVerificationError,
@@ -23,6 +24,7 @@ from .compiler import compile_candidate
 from .rendering import render_capsule
 from .types import (
     AuditedCandidate,
+    CompactionProviderBinding,
     CompilerBackend,
     CompilerBackendDeferred,
     CompilerInvariantError,
@@ -34,6 +36,10 @@ from .types import (
 Clock = Callable[[], datetime]
 FatalStorageCallback = Callable[[StorageSecurityError], Awaitable[None]]
 _MIN_SQLITE_LEASE_HORIZON_SECONDS = 1.0
+
+
+class ProviderBindingSource(Protocol):
+    def resolve(self, session_key: SessionKey) -> CompactionProviderBinding: ...
 
 
 def _utc_now() -> datetime:
@@ -96,7 +102,6 @@ class CompactionWorker:
         *,
         repository: SQLiteRepository,
         backend: CompilerBackend,
-        counter: TokenCounter,
         canonical_counter: TokenCounter | None,
         canonical_profile_id: str,
         worker_id: str,
@@ -104,14 +109,24 @@ class CompactionWorker:
         semantic_backend: SemanticAuditBackend | None = None,
         clock: Clock = _utc_now,
         fatal_storage_callback: FatalStorageCallback | None = None,
+        compatibility_counter: TokenCounter | None = None,
+        counter: TokenCounter | None = None,
+        provider_bindings: ProviderBindingSource | None = None,
     ) -> None:
         if not worker_id.strip():
             raise ValueError("worker_id must be non-empty")
         if not isinstance(canonical_profile_id, str) or not canonical_profile_id.strip():
             raise ValueError("canonical_profile_id must be non-empty")
+        if compatibility_counter is not None and counter is not None:
+            raise TypeError("provide only compatibility_counter")
+        resolved_compatibility_counter = (
+            compatibility_counter if compatibility_counter is not None else counter
+        )
+        if resolved_compatibility_counter is None:
+            raise TypeError("compatibility_counter must be provided")
         self._repository = repository
         self._backend = backend
-        self._counter = counter
+        self._compatibility_counter = resolved_compatibility_counter
         self._canonical_counter = canonical_counter
         self._canonical_profile_id = canonical_profile_id
         self._worker_id = worker_id
@@ -119,6 +134,7 @@ class CompactionWorker:
         self._semantic_backend = semantic_backend
         self._clock = clock
         self._fatal_storage_callback = fatal_storage_callback
+        self._provider_bindings = provider_bindings
         self._wake_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._closed = False
@@ -166,9 +182,18 @@ class CompactionWorker:
             name=f"astrcontinuum-lease:{leased.job_id}",
         )
         stage = "LEASED"
+        provider_binding: CompactionProviderBinding | None = None
+        provider_binding_captured = self._provider_bindings is not None
         primary_exception_escaping = False
         try:
             try:
+                if self._provider_bindings is not None:
+                    # No await has occurred since claim returned: freeze before yielding.
+                    try:
+                        provider_binding = self._provider_bindings.resolve(leased.session_key)
+                    except CompilerBackendDeferred as error:
+                        if error.code != "EXTRACTIVE_PROVIDER_UNAVAILABLE":
+                            raise
                 stage = "COMPILING"
                 await self._backfill_metrics(leased.session_key)
                 compiling = await asyncio.to_thread(
@@ -202,7 +227,9 @@ class CompactionWorker:
                     target_high_water_mark=compiling.target_high_water_mark,
                     token_ceiling=self._config.token_ceiling,
                     backend=self._backend,
-                    counter=self._counter,
+                    compatibility_counter=self._compatibility_counter,
+                    provider_binding=provider_binding,
+                    provider_binding_captured=provider_binding_captured,
                     now=self._clock(),
                     segmenter_config=self._config.segmenter_config,
                 )
@@ -294,6 +321,7 @@ class CompactionWorker:
                 retry_at=self._clock() + timedelta(seconds=self._config.retry_base_seconds),
                 preserve_attempt=error.code
                 in {
+                    "EXTRACTIVE_PROVIDER_UNAVAILABLE",
                     "TOKEN_METRIC_MISSING",
                     "TOKEN_METRIC_UNAVAILABLE",
                 },

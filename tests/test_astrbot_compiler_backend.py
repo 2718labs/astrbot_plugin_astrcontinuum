@@ -8,9 +8,18 @@ import pytest
 import astrcontinuum as ac
 from astrcontinuum.compaction import (
     AstrBotExtractiveCompilerBackend,
+    CompactionProviderBinding,
     CompilerBackendDeferred,
     ExtractiveCompilerError,
     SessionProviderRegistry,
+)
+from astrcontinuum.tokenization import (
+    BYTE_FALLBACK,
+    OPENAI_O200K,
+    ContextLimitSource,
+    TokenizerError,
+    TokenizerErrorCode,
+    TokenizerRouter,
 )
 
 NOW = datetime(2026, 7, 27, 5, 0, tzinfo=timezone.utc)
@@ -21,10 +30,31 @@ class LengthCounter:
         return len(text)
 
 
+class ProfiledCounter:
+    def __init__(self, profile: object, *, fail_on: str | None = None) -> None:
+        self.profile = profile
+        self.fail_on = fail_on
+        self.texts: list[str] = []
+        self.failed = False
+
+    def count_text(self, text: str) -> int:
+        self.texts.append(text)
+        if self.fail_on is not None and self.fail_on in text:
+            self.failed = True
+            raise RuntimeError("private tokenizer failure")
+        try:
+            payload = json.loads(text)
+        except (TypeError, json.JSONDecodeError):
+            return 0
+        events = payload.get("events", ())
+        return len(events) * 4 if isinstance(events, list) else 0
+
+
 class RecordingGenerator:
-    def __init__(self, *responses: str) -> None:
+    def __init__(self, *responses: str, before_call: object | None = None) -> None:
         self.responses = list(responses)
         self.calls: list[tuple[str, str, str]] = []
+        self.before_call = before_call
 
     async def __call__(
         self,
@@ -32,6 +62,8 @@ class RecordingGenerator:
         system_prompt: str,
         prompt: str,
     ) -> str:
+        if callable(self.before_call):
+            self.before_call()
         self.calls.append((provider_id, system_prompt, prompt))
         return self.responses.pop(0)
 
@@ -56,11 +88,7 @@ def event(
     event_type: ac.EventType = ac.EventType.USER_MESSAGE,
 ) -> ac.EventEnvelope:
     selected_key = session_key or key()
-    creator = {
-        ac.EventType.USER_MESSAGE: ac.EventEnvelope.create,
-        ac.EventType.ASSISTANT_MESSAGE: ac.EventEnvelope.create,
-    }[event_type]
-    return creator(
+    return ac.EventEnvelope.create(
         event_id=f"event-{sequence}",
         session_key=selected_key,
         sequence=sequence,
@@ -102,25 +130,66 @@ def extraction(
     return json.dumps(payload, ensure_ascii=False)
 
 
+def extraction_for(events: tuple[ac.EventEnvelope, ...]) -> str:
+    payload = json.loads(
+        extraction(
+            events[0].event_id,
+            events[0].content,
+            acknowledged=tuple(item.event_id for item in events),
+        )
+    )
+    payload["goals"] = [
+        {
+            "event_id": item.event_id,
+            "quote": item.content,
+            "confidence": 0.95,
+        }
+        for item in events
+        if item.content
+    ]
+    return json.dumps(payload, ensure_ascii=False)
+
+
 def request(
     events: tuple[ac.EventEnvelope, ...],
     *,
     base_capsules: tuple[ac.ContextCapsuleEnvelope, ...] = (),
+    max_events_per_segment: int = 16,
+    canonical_counts: dict[str, int] | None = None,
+    token_ceiling: int = 10_000,
 ) -> ac.CompilationRequest:
+    resolved_counts = canonical_counts or {
+        item.event_id: item.token_count for item in events
+    }
     return ac.CompilationRequest(
         base_snapshot=None,
         base_capsules=base_capsules,
         source_events=events,
         segments=ac.segment(
             events,
-            token_counts={item.event_id: item.token_count for item in events},
+            token_counts=resolved_counts,
             config=ac.SegmenterConfig(
-                max_events_per_segment=16,
+                max_events_per_segment=max_events_per_segment,
                 max_tokens_per_segment=10_000,
             ),
         ),
         target_high_water_mark=events[-1].sequence,
-        token_ceiling=10_000,
+        token_ceiling=token_ceiling,
+        canonical_event_token_counts=resolved_counts,
+    )
+
+
+def binding(
+    provider_id: str,
+    *,
+    model_identity: str = "gpt-4o",
+    context_limit: int = 10_000,
+) -> CompactionProviderBinding:
+    return CompactionProviderBinding(
+        provider_id=provider_id,
+        model_identity=model_identity,
+        context_limit=context_limit,
+        context_limit_source=ContextLimitSource.AUTO_ASTRBOT,
     )
 
 
@@ -130,11 +199,13 @@ def backend(
     provider_id: str = "minimax-compiler",
 ) -> AstrBotExtractiveCompilerBackend:
     registry = SessionProviderRegistry(max_entries=8)
-    registry.remember(key(), provider_id)
+    registry.remember(key(), binding(provider_id))
     return AstrBotExtractiveCompilerBackend(
         generator=generator,
         providers=registry,
-        counter=LengthCounter(),
+        compatibility_counter=LengthCounter(),
+        tokenizer_router=TokenizerRouter(lambda _model: "o200k_base"),
+        counter_provider=lambda profile: ProfiledCounter(profile),
     )
 
 
@@ -269,18 +340,368 @@ def test_provider_registry_defaults_to_current_session_and_override_is_explicit(
     registry = SessionProviderRegistry(max_entries=2)
     first = key("one")
     second = key("two")
-    registry.remember(first, "conversation-model")
+    first_binding = binding("conversation-model")
+    registry.remember(first, first_binding)
 
-    assert registry.resolve(first) == "conversation-model"
+    assert registry.resolve(first) is first_binding
     with pytest.raises(CompilerBackendDeferred) as missing:
         registry.resolve(second)
     assert missing.value.code == "EXTRACTIVE_PROVIDER_UNAVAILABLE"
 
     override = SessionProviderRegistry(
-        provider_override="minimax-explicit",
+        provider_override=binding("minimax-explicit", model_identity="MiniMax-M2"),
         max_entries=2,
     )
-    assert override.resolve(second) == "minimax-explicit"
+    assert override.resolve(second).context_limit == 10_000
+    assert "minimax-explicit" not in repr(override.resolve(second))
+    assert "MiniMax-M2" not in repr(override.resolve(second))
+
+
+def test_configured_but_unavailable_override_never_falls_back_to_session_binding() -> None:
+    session = key("configured-unavailable")
+    registry = SessionProviderRegistry(
+        provider_override=None,
+        provider_override_configured=True,
+        max_entries=2,
+    )
+    registry.remember(session, binding("conversation-model"))
+
+    with pytest.raises(CompilerBackendDeferred) as caught:
+        registry.resolve(session)
+
+    assert caught.value.code == "EXTRACTIVE_PROVIDER_UNAVAILABLE"
+
+
+def test_session_unavailable_replaces_stale_binding_and_later_success_recovers() -> None:
+    session = key("refresh")
+    registry = SessionProviderRegistry(max_entries=2)
+    stale = binding("stale-provider")
+    refreshed = binding("refreshed-provider")
+    registry.remember(session, stale)
+
+    registry.remember_unavailable(session)
+
+    with pytest.raises(CompilerBackendDeferred) as caught:
+        registry.resolve(session)
+    assert caught.value.code == "EXTRACTIVE_PROVIDER_UNAVAILABLE"
+
+    registry.remember(session, refreshed)
+    assert registry.resolve(session) is refreshed
+
+
+@pytest.mark.asyncio
+async def test_provider_binding_refreshes_between_jobs_but_is_frozen_within_one_job() -> None:
+    registry = SessionProviderRegistry(max_entries=2)
+    first_binding = binding("provider-first")
+    second_binding = binding("provider-second", model_identity="MiniMax-M2")
+    registry.remember(key(), first_binding)
+    events = (event(1, "one"), event(2, "two"))
+    switched = False
+
+    def refresh_after_preflight() -> None:
+        nonlocal switched
+        if not switched:
+            switched = True
+            registry.remember(key(), second_binding)
+
+    generator = RecordingGenerator(
+        extraction_for((events[0],)),
+        extraction_for((events[1],)),
+        extraction_for((events[0],)),
+        extraction_for((events[1],)),
+        before_call=refresh_after_preflight,
+    )
+    compiler = AstrBotExtractiveCompilerBackend(
+        generator=generator,
+        providers=registry,
+        compatibility_counter=LengthCounter(),
+        tokenizer_router=TokenizerRouter(lambda _model: "o200k_base"),
+        counter_provider=lambda profile: ProfiledCounter(profile),
+    )
+
+    await compiler.compile(request(events, max_events_per_segment=1))
+    await compiler.compile(request(events, max_events_per_segment=1))
+
+    assert tuple(call[0] for call in generator.calls) == (
+        "provider-first",
+        "provider-first",
+        "provider-second",
+        "provider-second",
+    )
+
+
+@pytest.mark.asyncio
+async def test_preflight_counter_failure_replays_whole_request_before_provider_side_effect() -> None:
+    registry = SessionProviderRegistry(max_entries=2)
+    registry.remember(key(), binding("provider-primary"))
+    events = (event(1, "primary-one"), event(2, "primary-two"))
+    primary = ProfiledCounter(OPENAI_O200K, fail_on=events[1].content)
+    fallback = ProfiledCounter(BYTE_FALLBACK)
+    generator = RecordingGenerator(
+        extraction_for((events[0],)),
+        extraction_for((events[1],)),
+        before_call=lambda: pytest.fail("provider called before complete primary preflight")
+        if not primary.failed
+        else None,
+    )
+    compiler = AstrBotExtractiveCompilerBackend(
+        generator=generator,
+        providers=registry,
+        compatibility_counter=LengthCounter(),
+        tokenizer_router=TokenizerRouter(lambda _model: "o200k_base"),
+        counter_provider=lambda profile: fallback
+        if profile is BYTE_FALLBACK
+        else primary,
+    )
+
+    output = await compiler.compile(request(events, max_events_per_segment=1))
+
+    assert len(generator.calls) == 2
+    assert all(events[0].content in text or events[1].content in text for text in fallback.texts[1::2])
+    assert output.fit_provenance.tokenizer_profile_id == BYTE_FALLBACK.profile_id
+    assert output.fit_provenance.primary_result_discarded is True
+    assert output.fitted_segments == request(events, max_events_per_segment=1).segments
+
+
+@pytest.mark.asyncio
+async def test_preflight_splits_only_on_atomic_event_group_boundaries() -> None:
+    registry = SessionProviderRegistry(max_entries=2)
+    registry.remember(key(), binding("provider-atomic", context_limit=8))
+    events = (
+        event(1, "user", event_type=ac.EventType.USER_MESSAGE),
+        event(2, "tool-call", event_type=ac.EventType.TOOL_CALL),
+        event(3, "tool-result", event_type=ac.EventType.TOOL_RESULT),
+        event(4, "assistant", event_type=ac.EventType.ASSISTANT_MESSAGE),
+    )
+    generator = RecordingGenerator(
+        extraction_for((events[0],)),
+        extraction_for((events[1], events[2])),
+        extraction_for((events[3],)),
+    )
+    compiler = AstrBotExtractiveCompilerBackend(
+        generator=generator,
+        providers=registry,
+        compatibility_counter=LengthCounter(),
+        tokenizer_router=TokenizerRouter(lambda _model: "o200k_base"),
+        counter_provider=lambda profile: ProfiledCounter(profile),
+    )
+
+    output = await compiler.compile(request(events))
+
+    assert tuple(
+        tuple(item.event_type for item in segment.events)
+        for segment in output.fitted_segments
+    ) == (
+        (ac.EventType.USER_MESSAGE,),
+        (ac.EventType.TOOL_CALL, ac.EventType.TOOL_RESULT),
+        (ac.EventType.ASSISTANT_MESSAGE,),
+    )
+    assert all(
+        segment.events[-1].event_type is not ac.EventType.TOOL_CALL
+        for segment in output.fitted_segments
+    )
+
+
+@pytest.mark.asyncio
+async def test_preflight_repairs_an_existing_segment_boundary_that_splits_tool_pair() -> None:
+    registry = SessionProviderRegistry(max_entries=2)
+    registry.remember(key(), binding("provider-cross-segment", context_limit=8))
+    events = (
+        event(1, "user", event_type=ac.EventType.USER_MESSAGE),
+        event(2, "tool-call", event_type=ac.EventType.TOOL_CALL),
+        event(3, "tool-result", event_type=ac.EventType.TOOL_RESULT),
+        event(4, "assistant", event_type=ac.EventType.ASSISTANT_MESSAGE),
+    )
+    source_request = request(events, max_events_per_segment=2)
+    assert source_request.segments[0].events[-1].event_type is ac.EventType.TOOL_CALL
+    assert source_request.segments[1].events[0].event_type is ac.EventType.TOOL_RESULT
+    generator = RecordingGenerator(
+        extraction_for((events[0],)),
+        extraction_for((events[1], events[2])),
+        extraction_for((events[3],)),
+    )
+    compiler = AstrBotExtractiveCompilerBackend(
+        generator=generator,
+        providers=registry,
+        compatibility_counter=LengthCounter(),
+        tokenizer_router=TokenizerRouter(lambda _model: "o200k_base"),
+        counter_provider=lambda profile: ProfiledCounter(profile),
+    )
+
+    output = await compiler.compile(source_request)
+
+    fitted_event_groups = tuple(
+        tuple(item.event_type for item in segment.events)
+        for segment in output.fitted_segments
+    )
+    assert (ac.EventType.TOOL_CALL, ac.EventType.TOOL_RESULT) in fitted_event_groups
+    assert all(
+        segment.events[-1].event_type is not ac.EventType.TOOL_CALL
+        for segment in output.fitted_segments
+    )
+
+
+@pytest.mark.asyncio
+async def test_fitted_segment_token_cost_remains_the_canonical_lane_sum() -> None:
+    registry = SessionProviderRegistry(max_entries=2)
+    registry.remember(key(), binding("provider-canonical-cost", context_limit=8))
+    events = (
+        event(1, "user", event_type=ac.EventType.USER_MESSAGE),
+        event(2, "tool-call", event_type=ac.EventType.TOOL_CALL),
+        event(3, "tool-result", event_type=ac.EventType.TOOL_RESULT),
+        event(4, "assistant", event_type=ac.EventType.ASSISTANT_MESSAGE),
+    )
+    canonical_counts = {
+        events[0].event_id: 10,
+        events[1].event_id: 20,
+        events[2].event_id: 30,
+        events[3].event_id: 40,
+    }
+    compiler = AstrBotExtractiveCompilerBackend(
+        generator=RecordingGenerator(
+            extraction_for((events[0],)),
+            extraction_for((events[1], events[2])),
+            extraction_for((events[3],)),
+        ),
+        providers=registry,
+        compatibility_counter=LengthCounter(),
+        tokenizer_router=TokenizerRouter(lambda _model: "o200k_base"),
+        counter_provider=lambda profile: ProfiledCounter(profile),
+    )
+
+    output = await compiler.compile(
+        request(events, canonical_counts=canonical_counts)
+    )
+
+    assert tuple(segment.token_cost for segment in output.fitted_segments) == (10, 50, 40)
+
+
+@pytest.mark.asyncio
+async def test_router_tokenizer_failure_replays_the_complete_byte_preflight() -> None:
+    registry = SessionProviderRegistry(max_entries=2)
+    registry.remember(key(), binding("provider-route-fallback"))
+    events = (event(1, "route-one"), event(2, "route-two"))
+    route_failed = False
+    fallback = ProfiledCounter(BYTE_FALLBACK)
+
+    class ExplodingRouter:
+        def route(self, _model_identity: object) -> object:
+            nonlocal route_failed
+            route_failed = True
+            raise TokenizerError(TokenizerErrorCode.TOKENIZER_COUNT_FAILED)
+
+    generator = RecordingGenerator(
+        extraction_for((events[0],)),
+        extraction_for((events[1],)),
+        before_call=lambda: None
+        if route_failed
+        else pytest.fail("provider called before route fallback preflight"),
+    )
+    compiler = AstrBotExtractiveCompilerBackend(
+        generator=generator,
+        providers=registry,
+        compatibility_counter=LengthCounter(),
+        tokenizer_router=ExplodingRouter(),
+        counter_provider=lambda profile: fallback,
+    )
+
+    output = await compiler.compile(request(events, max_events_per_segment=1))
+
+    assert len(generator.calls) == 2
+    assert output.fit_provenance.tokenizer_profile_id == BYTE_FALLBACK.profile_id
+    assert output.fit_provenance.primary_result_discarded is True
+
+
+@pytest.mark.asyncio
+async def test_provider_binding_effective_cap_controls_compaction_input_limit() -> None:
+    registry = SessionProviderRegistry(max_entries=2)
+    registry.remember(key(), binding("provider-effective-cap", context_limit=8))
+    events = (event(1, "one"), event(2, "two"), event(3, "three"))
+    compiler = AstrBotExtractiveCompilerBackend(
+        generator=RecordingGenerator(
+            extraction_for((events[0], events[1])),
+            extraction_for((events[2],)),
+        ),
+        providers=registry,
+        compatibility_counter=LengthCounter(),
+        tokenizer_router=TokenizerRouter(lambda _model: "o200k_base"),
+        counter_provider=lambda profile: ProfiledCounter(profile),
+    )
+
+    output = await compiler.compile(request(events, token_ceiling=100))
+
+    assert tuple(len(segment.events) for segment in output.fitted_segments) == (2, 1)
+
+
+@pytest.mark.asyncio
+async def test_indivisible_over_budget_tool_pair_defers_before_provider_call() -> None:
+    registry = SessionProviderRegistry(max_entries=2)
+    registry.remember(key(), binding("provider-too-large", context_limit=7))
+    events = (
+        event(1, "tool-call", event_type=ac.EventType.TOOL_CALL),
+        event(2, "tool-result", event_type=ac.EventType.TOOL_RESULT),
+    )
+    generator = RecordingGenerator()
+    compiler = AstrBotExtractiveCompilerBackend(
+        generator=generator,
+        providers=registry,
+        compatibility_counter=LengthCounter(),
+        tokenizer_router=TokenizerRouter(lambda _model: "o200k_base"),
+        counter_provider=lambda profile: ProfiledCounter(profile),
+    )
+
+    with pytest.raises(CompilerBackendDeferred) as caught:
+        await compiler.compile(request(events))
+
+    assert caught.value.code == "COMPACTION_INPUT_TOO_LARGE"
+    assert generator.calls == []
+
+
+@pytest.mark.asyncio
+async def test_compiler_returns_backend_fitted_segments_and_profile_provenance() -> None:
+    registry = SessionProviderRegistry(max_entries=2)
+    registry.remember(key(), binding("provider-candidate", context_limit=8))
+    events = (
+        event(1, "user", event_type=ac.EventType.USER_MESSAGE),
+        event(2, "tool-call", event_type=ac.EventType.TOOL_CALL),
+        event(3, "tool-result", event_type=ac.EventType.TOOL_RESULT),
+        event(4, "assistant", event_type=ac.EventType.ASSISTANT_MESSAGE),
+    )
+    compiler = AstrBotExtractiveCompilerBackend(
+        generator=RecordingGenerator(
+            extraction_for((events[0],)),
+            extraction_for((events[1], events[2])),
+            extraction_for((events[3],)),
+        ),
+        providers=registry,
+        compatibility_counter=LengthCounter(),
+        tokenizer_router=TokenizerRouter(lambda _model: "o200k_base"),
+        counter_provider=lambda profile: ProfiledCounter(profile),
+    )
+
+    candidate = await ac.compile_candidate(
+        base_snapshot=None,
+        base_capsules=(),
+        source_events=events,
+        event_token_counts={item.event_id: 1 for item in events},
+        target_high_water_mark=events[-1].sequence,
+        token_ceiling=10_000,
+        backend=compiler,
+        compatibility_counter=LengthCounter(),
+        now=NOW + timedelta(minutes=1),
+        segmenter_config=ac.SegmenterConfig(max_tokens_per_segment=10_000),
+    )
+
+    assert tuple(
+        tuple(item.event_type for item in segment.events)
+        for segment in candidate.segments
+    ) == (
+        (ac.EventType.USER_MESSAGE,),
+        (ac.EventType.TOOL_CALL, ac.EventType.TOOL_RESULT),
+        (ac.EventType.ASSISTANT_MESSAGE,),
+    )
+    assert candidate.fit_provenance is not None
+    assert candidate.fit_provenance.tokenizer_profile_id == OPENAI_O200K.profile_id
 
 
 @pytest.mark.asyncio
