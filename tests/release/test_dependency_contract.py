@@ -5,7 +5,10 @@ import subprocess
 import sys
 from pathlib import Path
 
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:
+    import tomli as tomllib
 
 ROOT = Path(__file__).resolve().parents[2]
 TIKTOKEN_REQUIREMENT = "tiktoken>=0.12,<0.14"
