@@ -41,6 +41,9 @@ verified release artifact; AstrBot-market distribution is a separate maintainer 
   profile instead of mixing units.
 - Missing canonical metrics delay only background compaction; they do not block native AstrBot
   request handling or fall back to immutable compatibility byte fields.
+- OpenAI-compatible Claude thinking replay now uses a request-local COW egress projection:
+  readable reasoning stays ordered as ordinary text, tool facts and results remain intact,
+  opaque signatures and sidecars are not replayed, and persisted history is never modified.
 
 ## v0.2.0 — 2026-07-27
 
@@ -179,6 +182,9 @@ AstrBot plugin market, tagged as a stable release, or published as a GitHub Rele
 - tokenizer、资产、模型映射或计数失败时，整个请求改用同一个 BYTE 回退 profile 重跑，
   不混合不同单位。
 - 规范指标缺失只会延迟后台归约，不阻塞原生 AstrBot 请求，也不会回读不可变兼容字节字段。
+- OpenAI 兼容 Claude 的 thinking 回放改为请求局部的 COW 出站投影：可读 reasoning 依原有
+  顺序降级为普通文本，工具事实和结果保持完整；不透明签名与 sidecar 不会被回放，持久化历史
+  不会被改写。
 
 ### v0.2.0 — 2026-07-27
 

@@ -20,10 +20,10 @@ if TYPE_CHECKING or not __package__:
         AstrBotAdapterError,
         AstrBotHookBridge,
         PreparedRequest,
+        ProviderThinkingCompatibility,
         build_projection_objects,
         extract_host_session_key,
         projection_factory_from_user_message,
-        sanitize_claude_openai_contexts,
         select_projection_boundaries,
     )
     from astrcontinuum.compaction import (
@@ -86,10 +86,10 @@ else:
         AstrBotAdapterError,
         AstrBotHookBridge,
         PreparedRequest,
+        ProviderThinkingCompatibility,
         build_projection_objects,
         extract_host_session_key,
         projection_factory_from_user_message,
-        sanitize_claude_openai_contexts,
         select_projection_boundaries,
     )
     from .astrcontinuum.compaction import (
@@ -359,6 +359,7 @@ class AstrContinuumPlugin(Star):
         self._bridge: AstrBotHookBridge | None = None
         self._providers: SessionProviderRegistry | None = None
         self._worker: CompactionWorker | None = None
+        self._thinking_compatibility: ProviderThinkingCompatibility | None = None
         self._tokenizer_registry = TokenizerRegistry()
         self._tokenizer_router = TokenizerRouter()
         self._context_limit_resolver = ContextLimitResolver()
@@ -383,6 +384,44 @@ class AstrContinuumPlugin(Star):
             return ContextEngineMode(value.strip().upper())
         except ValueError:
             return ContextEngineMode.ACTIVE
+
+    def _thinking_compatibility_provider_ids(self) -> tuple[str, ...]:
+        value = self.config.get("thinking_compat_openai_provider_ids", [])
+        if not isinstance(value, (list, tuple)):
+            return ()
+        return tuple(provider_id for provider_id in value if isinstance(provider_id, str))
+
+    def _ensure_thinking_compatibility(self) -> None:
+        """Best-effort public-provider reconciliation, independent of storage health."""
+
+        if not self._enabled:
+            return
+        try:
+            compatibility = self._thinking_compatibility
+            if compatibility is None:
+                compatibility = ProviderThinkingCompatibility(
+                    openai_compatible_provider_ids=self._thinking_compatibility_provider_ids(),
+                )
+                self._thinking_compatibility = compatibility
+            compatibility.ensure(self.context)
+        except Exception:  # noqa: BLE001 - compatibility must not break the host hook
+            logger.error(
+                "AstrContinuum thinking compatibility reconcile failed code=%s",
+                "THINKING_COMPATIBILITY_RECONCILE_FAILED",
+            )
+
+    def _terminate_thinking_compatibility(self) -> None:
+        compatibility = self._thinking_compatibility
+        self._thinking_compatibility = None
+        if compatibility is None:
+            return
+        try:
+            compatibility.terminate()
+        except Exception:  # noqa: BLE001 - teardown must not leak host internals
+            logger.error(
+                "AstrContinuum thinking compatibility restore failed code=%s",
+                "THINKING_COMPATIBILITY_RESTORE_FAILED",
+            )
 
     @staticmethod
     def _key_source_label(source: KeySource) -> str:
@@ -838,11 +877,14 @@ class AstrContinuumPlugin(Star):
 
         async with self._initialize_lock:
             if self._initialized:
+                self._ensure_thinking_compatibility()
                 return
             if not self._enabled:
                 self._storage_status = self._initial_storage_status()
                 self._initialized = True
                 return
+
+            self._ensure_thinking_compatibility()
 
             worker: CompactionWorker | None = None
             key_source = self._configured_key_source_label()
@@ -988,6 +1030,7 @@ class AstrContinuumPlugin(Star):
         """Release request composition state idempotently."""
 
         async with self._initialize_lock:
+            self._terminate_thinking_compatibility()
             worker = self._worker
             self._bridge = None
             self._providers = None
@@ -1058,6 +1101,7 @@ class AstrContinuumPlugin(Star):
     async def on_llm_request(self, event: AstrMessageEvent, req: Any) -> None:
         """Capture user input and prepare one immutable request view."""
 
+        self._ensure_thinking_compatibility()
         state = _RequestState(request=req)
         if not self._store_state(event, state):
             return
@@ -1095,11 +1139,6 @@ class AstrContinuumPlugin(Star):
                 return
             state.prepared = prepared
             self._invalidate_current_provider_binding(event, req)
-            sanitize_claude_openai_contexts(
-                req,
-                provider_type=metadata.provider_type,
-                model_identity=metadata.model_identity,
-            )
             await self._remember_current_provider(event, state)
         except StorageSecurityError as error:
             await self._enter_storage_locked(error)

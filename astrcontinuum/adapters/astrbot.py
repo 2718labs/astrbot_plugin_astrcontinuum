@@ -6,13 +6,12 @@ import asyncio
 import hashlib
 import json
 import math
-import re
 from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import NoReturn, Protocol, cast
+from typing import NoReturn, cast
 
 from ..context_graph import (
     ContextEngineMode,
@@ -61,9 +60,6 @@ _MAX_VALUE_DEPTH = 4
 _MAX_COLLECTION_ITEMS = 16
 _MAX_STRING_CHARACTERS = 512
 _MIN_METADATA_BYTES = 128
-_CLAUDE_MODEL_PATTERN = re.compile(r"(?<![a-z0-9])claude(?:[0-9]+)?(?![a-z0-9])", re.IGNORECASE)
-_THINKING_PART_TYPES = frozenset({"think", "thinking", "redacted_thinking"})
-_ASSISTANT_REASONING_PLACEHOLDER = "[assistant reasoning omitted]"
 _MAX_CONTEXT_TRACE_SESSIONS = 256
 
 
@@ -162,83 +158,6 @@ class ProjectionBuild:
 
     objects: tuple[object, ...] = field(repr=False)
     fault: AdapterFault | None
-
-
-class _MutableContextsRequest(Protocol):
-    """The one host-owned request field this compatibility boundary may replace."""
-
-    contexts: list[object]
-
-
-def sanitize_claude_openai_contexts(
-    request: object,
-    *,
-    provider_type: object,
-    model_identity: object,
-) -> bool:
-    """Copy-on-write remove incompatible assistant reasoning blocks.
-
-    AstrBot's OpenAI adapter discards ``ThinkPart.encrypted`` while retaining
-    reasoning text.  Claude-compatible OpenAI endpoints reject that malformed
-    replay because a thinking block requires its original signature.  This
-    public ProviderRequest boundary removes the whole incompatible block before
-    the provider receives it, without changing persisted/native history.
-    """
-
-    if (
-        provider_type != "openai_chat_completion"
-        or not isinstance(model_identity, str)
-        or not _CLAUDE_MODEL_PATTERN.search(model_identity)
-    ):
-        return False
-    contexts = _safe_attribute(request, "contexts")
-    if not isinstance(contexts, list):
-        return False
-    changed = False
-    sanitized: list[object] = []
-    for message in contexts:
-        if not isinstance(message, Mapping) or message.get("role") != "assistant":
-            sanitized.append(message)
-            continue
-        content = message.get("content")
-        retained = content
-        removed_thinking = False
-        if isinstance(content, list):
-            retained = [
-                part
-                for part in content
-                if not (
-                    isinstance(part, Mapping)
-                    and isinstance(part.get("type"), str)
-                    and part["type"] in _THINKING_PART_TYPES
-                )
-            ]
-            removed_thinking = len(retained) != len(content)
-        has_reasoning = "reasoning_content" in message or "reasoning" in message
-        if not removed_thinking and not has_reasoning:
-            sanitized.append(message)
-            continue
-        changed = True
-        replacement = dict(message)
-        replacement.pop("reasoning_content", None)
-        replacement.pop("reasoning", None)
-        if removed_thinking:
-            if retained:
-                replacement["content"] = retained
-            elif replacement.get("tool_calls"):
-                replacement["content"] = None
-            else:
-                replacement["content"] = [
-                    {"type": "text", "text": _ASSISTANT_REASONING_PLACEHOLDER}
-                ]
-        sanitized.append(replacement)
-    if not changed:
-        return False
-    try:
-        cast(_MutableContextsRequest, request).contexts = sanitized
-    except Exception:  # noqa: BLE001 - host request remains usable without enhancement
-        return False
-    return True
 
 
 @dataclass(frozen=True, slots=True, repr=False)

@@ -6,6 +6,13 @@
     "type": "bool",
     "default": true
   },
+  "thinking_compat_openai_provider_ids": {
+    "description": "额外 OpenAI 兼容 Provider ID（高级）",
+    "hint": "仅填写已确认使用 OpenAI Chat Completions 协议的第三方 Provider ID。仅当实际模型名为 Claude 时，AstrContinuum 才会为本次出站调用构造临时兼容副本，不会改写历史；原生 Anthropic/Gemini Provider 不适用。",
+    "obvious_hint": true,
+    "type": "list",
+    "default": []
+  },
   "context_engine_mode": {
     "description": "上下文引擎运行方式",
     "hint": "主动模式只会在结果通过完整校验后替换确定性回退结果；影子模式会计算并记录无内容指标，但实际仍发送确定性回退结果；关闭模式完全不运行图引擎，只使用确定性路径。管理员可用 /context_status 查看当前模式和最近结果，用 /context_inspect 查看当前会话的无内容归约证据。",

@@ -208,6 +208,7 @@ def fake_context_trace(
 class FakeContext:
     def __init__(self, *, provider: object = None) -> None:
         self.provider = provider
+        self.providers = [provider] if provider is not None else []
         self.provider_requests: list[str] = []
         self.provider_by_id_requests: list[str] = []
         self.using_provider_requests: list[str] = []
@@ -225,6 +226,9 @@ class FakeContext:
     def get_provider_by_id(self, provider_id: str) -> object:
         self.provider_by_id_requests.append(provider_id)
         return self.provider
+
+    def get_all_providers(self) -> list[object]:
+        return self.providers
 
     async def llm_generate(self, **kwargs: object) -> SimpleNamespace:
         self.generate_calls.append(kwargs)
@@ -253,6 +257,41 @@ class FakeContext:
             "anchors": [],
         }
         return SimpleNamespace(completion_text=json.dumps(response, ensure_ascii=False))
+
+
+class ThinkingCompatibilityProvider:
+    def __init__(self, provider_id: str) -> None:
+        self._provider_id = provider_id
+        self.calls: list[list[object] | None] = []
+
+    def meta(self) -> SimpleNamespace:
+        return SimpleNamespace(type="openai_chat_completion", id=self._provider_id)
+
+    def get_model(self) -> str:
+        return "claude-opus-4-6"
+
+    async def text_chat(
+        self,
+        *,
+        contexts: list[object] | None = None,
+        model: str | None = None,
+    ) -> SimpleNamespace:
+        del model
+        self.calls.append(contexts)
+        return SimpleNamespace(completion_text="ok")
+
+    def text_chat_stream(
+        self,
+        *,
+        contexts: list[object] | None = None,
+        model: str | None = None,
+    ):
+        del contexts, model
+
+        async def stream():
+            yield SimpleNamespace(completion_text="ok")
+
+        return stream()
 
 
 class FakeConversationManager:
@@ -516,7 +555,54 @@ async def test_lifecycle_command_and_llm_response_are_idempotent_and_observation
 
 
 @pytest.mark.asyncio
-async def test_unstable_tool_preflight_has_no_provider_or_sanitizer_side_effects(
+async def test_thinking_compatibility_survives_storage_lock_and_reconciles_before_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path, master_key=None)
+    initial = ThinkingCompatibilityProvider("initial")
+    context = FakeContext(provider=initial)
+    plugin = module.AstrContinuumPlugin(
+        context,
+        {"enabled": True, "encryption_key_source": "environment"},
+    )
+
+    await plugin.initialize()
+
+    assert plugin._bridge is None
+    assert "text_chat" in initial.__dict__
+    original_contexts: list[object] = [
+        {
+            "role": "assistant",
+            "content": [{"type": "think", "think": "readable reasoning"}],
+        }
+    ]
+    await initial.text_chat(contexts=original_contexts)
+    assert initial.calls[-1] is not original_contexts
+    assert initial.calls[-1] == [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "[assistant reasoning]\nreadable reasoning",
+                }
+            ],
+        }
+    ]
+
+    replacement = ThinkingCompatibilityProvider("replacement")
+    context.providers = [replacement]
+    await plugin.on_llm_request(FakeEvent(message_id="locked-reconcile"), fake_request())
+    assert "text_chat" in replacement.__dict__
+    assert "text_chat" not in initial.__dict__
+
+    await plugin.terminate()
+    assert "text_chat" not in replacement.__dict__
+
+
+@pytest.mark.asyncio
+async def test_unstable_tool_preflight_has_no_provider_side_effects(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -535,13 +621,7 @@ async def test_unstable_tool_preflight_has_no_provider_or_sanitizer_side_effects
         SimpleNamespace(name="weather"),
         {"city": "杭州"},
     )
-    sanitizer_calls: list[object] = []
     binding_calls: list[object] = []
-    monkeypatch.setattr(
-        module,
-        "sanitize_claude_openai_contexts",
-        lambda *args, **kwargs: sanitizer_calls.append((args, kwargs)) or False,
-    )
     original_invalidate = plugin._invalidate_current_provider_binding
 
     def record_invalidation(*args: object) -> None:
@@ -557,7 +637,6 @@ async def test_unstable_tool_preflight_has_no_provider_or_sanitizer_side_effects
     blocked_state = plugin._state(blocked)
     assert blocked_state is not None
     assert blocked_state.prepared is None
-    assert sanitizer_calls == []
     assert binding_calls == []
     assert providers.resolve(opening_state.prepared.turn.session_key) == original_binding
     bridge = plugin._bridge
@@ -589,12 +668,6 @@ async def test_metadata_failure_preserves_binding_when_durable_tool_loop_is_nons
         SimpleNamespace(name="weather"),
         {"city": "杭州"},
     )
-    sanitizer_calls: list[object] = []
-    monkeypatch.setattr(
-        module,
-        "sanitize_claude_openai_contexts",
-        lambda *args, **kwargs: sanitizer_calls.append((args, kwargs)) or False,
-    )
 
     def fail_metadata(*_args: object, **_kwargs: object) -> object:
         raise RuntimeError("private metadata failure")
@@ -607,7 +680,6 @@ async def test_metadata_failure_preserves_binding_when_durable_tool_loop_is_nons
     )
 
     assert providers.resolve(session_key) == original_binding
-    assert sanitizer_calls == []
     bridge = plugin._bridge
     assert bridge is not None
     with bridge.repository.factory.connection(read_only=True) as connection:
@@ -632,12 +704,6 @@ async def test_metadata_failure_preserves_binding_when_stability_guard_fails(
     assert providers is not None
     session_key = opening_state.prepared.turn.session_key
     original_binding = providers.resolve(session_key)
-    sanitizer_calls: list[object] = []
-    monkeypatch.setattr(
-        module,
-        "sanitize_claude_openai_contexts",
-        lambda *args, **kwargs: sanitizer_calls.append((args, kwargs)) or False,
-    )
 
     def fail_metadata(*_args: object, **_kwargs: object) -> object:
         raise RuntimeError("private metadata failure")
@@ -656,7 +722,6 @@ async def test_metadata_failure_preserves_binding_when_stability_guard_fails(
     )
 
     assert providers.resolve(session_key) == original_binding
-    assert sanitizer_calls == []
     with bridge.repository.factory.connection(read_only=True) as connection:
         assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0] == 0
