@@ -192,8 +192,8 @@ K=D+\varepsilon I+\sum_{r\in\mathcal R}A_r^{\mathsf T}k_rA_r.
 ```
 
 其中 $e_i\in\mathbb R^n$ 是第 $i$ 个坐标基向量，
-$D=\mathrm{diag}(\delta_1,\ldots,\delta_n)$、$\delta_i\ge0$，且
-$\varepsilon>0$。当前构图器取 $\delta_i=1$、$\varepsilon=10^{-9}$。稀疏矩阵聚合并不
+$D=\mathrm{diag}(\delta_1,\ldots,\delta_n)$、$`\delta_i\ge0`$，且
+$\varepsilon>0$。当前构图器取 $\delta_i=1$、$`\varepsilon=10^{-9}`$。稀疏矩阵聚合并不
 只是实现细节：对任意非零向量 $y$，
 
 ```math
@@ -219,7 +219,7 @@ q_i=
 \end{cases}
 ```
 
-其中 $u$ 是当前输入，$b_i$ 是第 $i$ 个候选块文本。以后可以独立替换请求
+其中 $u$ 是当前输入，$`b_i`$ 是第 $i$ 个候选块文本。以后可以独立替换请求
 激活器，而矩阵求解和验证契约不需要跟着改变。
 
 ### 2. 限定仿射可行集
@@ -273,8 +273,8 @@ d
 \end{bmatrix}.
 ```
 
-编译器会拒绝互相矛盾的约束。对一致的已编译系统，$K\succ0$ 且 $C$ 满行秩，
-因而原状态解唯一。求解使用紧凑基 $C$；$C_{\mathrm{cert}}$ 则保留全部原始受支持
+编译器会拒绝互相矛盾的约束。对一致的已编译系统，$`K\succ0`$ 且 $C$ 满行秩，
+因而原状态解唯一。求解使用紧凑基 $C$；$`C_{\mathrm{cert}}`$ 则保留全部原始受支持
 约束，用于后面的独立约束证书。
 
 ### 3. 约束感知的状态归约与全量重建
@@ -305,8 +305,8 @@ E=\mathcal I\setminus R_0.
 $R_{\mathrm{in}}=R_{\mathrm{required}}\cup\{i\in\mathcal I\mid q_i>0\}$。
 
 约束支撑坐标绝不允许进入 $E$，因此坐标重排后必有 $C=[\,C_R\;\;0\,]$。记
-$r=\lvert R_0\rvert$、$e=\lvert E\rvert$、$r+e=n$、
-$C_R\in\mathbb R^{m\times r}$、$T\in\mathbb R^{e\times r}$，完整的约束系统会被
+$r=\lvert R_0\rvert$、$`e=\lvert E\rvert`$、$`r+e=n`$、
+$C_R\in\mathbb R^{m\times r}$、$`T\in\mathbb R^{e\times r}`$，完整的约束系统会被
 明确分块为
 
 ```math
@@ -422,7 +422,7 @@ K_{E,:}x-q_E,\,
 ```
 
 当 $E=\varnothing$ 时取 $\eta_{\mathrm{rec}}=0$。令
-$S_\theta=\{i\in\mathcal I\mid x_i\ge\theta\}$、$\theta=0.5$。只有当
+$S_\theta=\{i\in\mathcal I\mid x_i\ge\theta\}$、$`\theta=0.5`$。只有当
 
 ```math
 \max(\eta_{\mathrm{stat}},\eta_{\mathrm{con}},\eta_{\mathrm{rec}})\le\tau
@@ -439,7 +439,7 @@ R_{\mathrm{retry}}=\mathcal I.
 
 只有第一次归约尝试报告 `REDUCTION_*` 或 `SOLVE_*` 且
 $R_0\ne\mathcal I$ 时才会触发。最多只重试一次。重试只扩大保留状态，绝不会放松
-$C$、$\tau$、来源、依赖闭包或预算检查。因此，证书失败、闭包失败和装配失败仍然是
+$C$、$`\tau`$、来源、依赖闭包或预算检查。因此，证书失败、闭包失败和装配失败仍然是
 失败，不会被另一次求解掩盖。
 
 所以图结果只是候选，不是权威。容量越界、约束矛盾、求解不稳定、非有限数值、证书
