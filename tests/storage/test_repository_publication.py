@@ -8,6 +8,14 @@ from typing import Any
 import pytest
 
 import astrcontinuum as ac
+from astrcontinuum.storage import (
+    ArtifactKind,
+    CanonicalMetricObservation,
+    TokenMetric,
+    TokenMetricConflict,
+    TokenMetricStore,
+)
+from astrcontinuum.tokenization import CANONICAL_O200K
 from tests.storage.security_testkit import secure_repository, storage_test_codec
 
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
@@ -44,6 +52,7 @@ def capture(
         content=f"message {sequence}",
         idempotency_key=f"request-{sequence}",
         token_count=2,
+        canonical=CanonicalMetricObservation(CANONICAL_O200K.profile_id, None),
         created_at=NOW,
     )
 
@@ -201,16 +210,60 @@ def publish(
     members: tuple[ac.SnapshotCapsuleMembership, ...],
     *,
     owner: str = "worker-1",
+    canonical_metrics: tuple[TokenMetric, ...] | None = None,
 ) -> Any:
+    selected_metrics = (
+        canonical_metrics
+        if canonical_metrics is not None
+        else (
+            *(
+                TokenMetric(
+                    ArtifactKind.CAPSULE,
+                    membership.capsule_id,
+                    CANONICAL_O200K.profile_id,
+                    membership.capsule.token_cost + 100,
+                )
+                for membership in members
+            ),
+            TokenMetric(
+                ArtifactKind.SNAPSHOT,
+                snapshot.snapshot_id,
+                CANONICAL_O200K.profile_id,
+                snapshot.token_cost + 200,
+            ),
+        )
+    )
     return store.publish_snapshot(
         job_id=job.job_id,
         owner=owner,
         lease_epoch=job.lease_epoch,
         candidate_snapshot=snapshot,
         memberships=members,
+        canonical_metrics=selected_metrics,
         token_ceiling=1_000,
         now=NOW + timedelta(minutes=1),
     )
+
+
+def read_metric(
+    store: ac.SQLiteRepository,
+    *,
+    artifact_kind: ArtifactKind,
+    artifact_id: str,
+) -> TokenMetric | None:
+    metric_store = TokenMetricStore(storage_test_codec())
+    with store.factory.connection(read_only=True) as connection:
+        connection.execute("BEGIN")
+        try:
+            metric = metric_store.get_in_transaction(
+                connection,
+                artifact_kind=artifact_kind,
+                artifact_id=artifact_id,
+                tokenizer_profile_id=CANONICAL_O200K.profile_id,
+            )
+        finally:
+            connection.rollback()
+    return metric
 
 
 def test_bootstrap_publish_commits_candidate_pointer_and_job_atomically(
@@ -250,6 +303,92 @@ def test_bootstrap_publish_commits_candidate_pointer_and_job_atomically(
         assert connection.execute("SELECT count(*) FROM snapshots").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM snapshot_capsules").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM active_snapshots").fetchone()[0] == 1
+
+
+def test_publication_commits_canonical_metrics_without_changing_compatibility_identity(
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    capture(store, 1)
+    item = capsule(1)
+    members = memberships(item)
+    snapshot = candidate_snapshot("compatibility-snapshot-id", members, target=1)
+    job = ready_job(
+        store,
+        target=1,
+        candidate_snapshot_id=snapshot.snapshot_id,
+        job_id="job-metrics",
+    )
+    metrics = (
+        TokenMetric(
+            ArtifactKind.CAPSULE,
+            item.capsule_id,
+            CANONICAL_O200K.profile_id,
+            3,
+        ),
+        TokenMetric(
+            ArtifactKind.SNAPSHOT,
+            snapshot.snapshot_id,
+            CANONICAL_O200K.profile_id,
+            4,
+        ),
+    )
+    with store.factory.transaction(immediate=True) as connection:
+        connection.executemany(
+            """
+            INSERT INTO token_metric_backfill_intents (
+                session_key_hash,
+                artifact_kind,
+                artifact_id,
+                tokenizer_profile_id,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            """,
+            (
+                (
+                    session_key().session_key_hash,
+                    metric.artifact_kind.value,
+                    metric.artifact_id,
+                    metric.tokenizer_profile_id,
+                    "2026-07-26T12:00:00.000000Z",
+                )
+                for metric in metrics
+            ),
+        )
+
+    result = publish(store, job, snapshot, members, canonical_metrics=metrics)
+
+    assert result.winner.snapshot_id == "compatibility-snapshot-id"
+    assert result.winner.token_cost == snapshot.token_cost == 10
+    assert result.winner.capsule_ids == (item.capsule_id,)
+    assert result.winner.capsule_ids[0] == item.capsule_id
+    assert (
+        read_metric(
+            store,
+            artifact_kind=ArtifactKind.CAPSULE,
+            artifact_id=item.capsule_id,
+        )
+        == metrics[0]
+    )
+    assert (
+        read_metric(
+            store,
+            artifact_kind=ArtifactKind.SNAPSHOT,
+            artifact_id=snapshot.snapshot_id,
+        )
+        == metrics[1]
+    )
+    with store.factory.connection(read_only=True) as connection:
+        assert (
+            connection.execute(
+                """
+                SELECT count(*)
+                FROM token_metric_backfill_intents
+                WHERE artifact_kind IN ('CAPSULE', 'SNAPSHOT')
+                """
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def test_existing_pointer_publish_reuses_base_capsule_and_advances_version(
@@ -301,6 +440,119 @@ def test_existing_pointer_publish_reuses_base_capsule_and_advances_version(
             """
         ).fetchall()
         assert [row[0] for row in rows] == ["capsule-1", "capsule-2"]
+
+
+def test_existing_capsule_rejects_a_different_logical_canonical_metric(
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    capture(store, 1)
+    first_capsule = capsule(1)
+    first_members = memberships(first_capsule)
+    first_snapshot = candidate_snapshot("snapshot-1", first_members, target=1)
+    first_job = ready_job(
+        store,
+        target=1,
+        candidate_snapshot_id=first_snapshot.snapshot_id,
+        job_id="job-1",
+    )
+    publish(
+        store,
+        first_job,
+        first_snapshot,
+        first_members,
+        canonical_metrics=(
+            TokenMetric(
+                ArtifactKind.CAPSULE,
+                first_capsule.capsule_id,
+                CANONICAL_O200K.profile_id,
+                3,
+            ),
+            TokenMetric(
+                ArtifactKind.SNAPSHOT,
+                first_snapshot.snapshot_id,
+                CANONICAL_O200K.profile_id,
+                4,
+            ),
+        ),
+    )
+    capture(store, 2)
+    second_capsule = capsule(2)
+    second_members = memberships(first_capsule, second_capsule)
+    second_snapshot = candidate_snapshot(
+        "snapshot-2",
+        second_members,
+        base_snapshot_id=first_snapshot.snapshot_id,
+        target=2,
+    )
+    second_job = ready_job(
+        store,
+        target=2,
+        candidate_snapshot_id=second_snapshot.snapshot_id,
+        job_id="job-2",
+    )
+
+    with pytest.raises(TokenMetricConflict):
+        publish(
+            store,
+            second_job,
+            second_snapshot,
+            second_members,
+            canonical_metrics=(
+                TokenMetric(
+                    ArtifactKind.CAPSULE,
+                    first_capsule.capsule_id,
+                    CANONICAL_O200K.profile_id,
+                    99,
+                ),
+                TokenMetric(
+                    ArtifactKind.CAPSULE,
+                    second_capsule.capsule_id,
+                    CANONICAL_O200K.profile_id,
+                    5,
+                ),
+                TokenMetric(
+                    ArtifactKind.SNAPSHOT,
+                    second_snapshot.snapshot_id,
+                    CANONICAL_O200K.profile_id,
+                    6,
+                ),
+            ),
+        )
+
+    assert read_metric(
+        store,
+        artifact_kind=ArtifactKind.CAPSULE,
+        artifact_id=first_capsule.capsule_id,
+    ) == TokenMetric(
+        ArtifactKind.CAPSULE,
+        first_capsule.capsule_id,
+        CANONICAL_O200K.profile_id,
+        3,
+    )
+    assert (
+        read_metric(
+            store,
+            artifact_kind=ArtifactKind.CAPSULE,
+            artifact_id=second_capsule.capsule_id,
+        )
+        is None
+    )
+    with store.factory.connection(read_only=True) as connection:
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM capsules WHERE capsule_id = ?",
+                (second_capsule.capsule_id,),
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                "SELECT state FROM compaction_jobs WHERE job_id = ?",
+                (second_job.job_id,),
+            ).fetchone()[0]
+            == "READY_TO_COMMIT"
+        )
 
 
 def test_permanent_validation_rejects_cross_session_candidate_without_writes(
@@ -370,7 +622,7 @@ def seed_winning_snapshot(store: ac.SQLiteRepository) -> ac.SnapshotEnvelope:
                 covered_event_start,
                 covered_event_end,
                 canonical_capsule_json,
-                token_cost,
+                token_cost_envelope,
                 source_coverage,
                 created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -387,7 +639,12 @@ def seed_winning_snapshot(store: ac.SQLiteRepository) -> ac.SnapshotEnvelope:
                     item.capsule_id,
                     canonical_json(item),
                 ),
-                item.token_cost,
+                codec.encrypt_non_negative_int(
+                    "capsules",
+                    "token_cost",
+                    item.capsule_id,
+                    item.token_cost,
+                ),
                 item.quality.source_coverage,
                 timestamp,
             ),
@@ -402,7 +659,7 @@ def seed_winning_snapshot(store: ac.SQLiteRepository) -> ac.SnapshotEnvelope:
                 source_high_water_mark,
                 exact_anchor_ids_json,
                 rendered_context,
-                token_cost,
+                token_cost_envelope,
                 audit_outcome,
                 lifecycle_state,
                 created_at,
@@ -424,7 +681,12 @@ def seed_winning_snapshot(store: ac.SQLiteRepository) -> ac.SnapshotEnvelope:
                     committed.snapshot_id,
                     committed.rendered_context,
                 ),
-                committed.token_cost,
+                codec.encrypt_non_negative_int(
+                    "snapshots",
+                    "token_cost",
+                    committed.snapshot_id,
+                    committed.token_cost,
+                ),
                 codec.encrypt_object_json(
                     "snapshots",
                     "audit_outcome",
@@ -498,6 +760,22 @@ def test_same_prefix_conflict_rolls_back_candidates_then_supersedes_job(
             ).fetchone()[0]
             == 0
         )
+    assert (
+        read_metric(
+            store,
+            artifact_kind=ArtifactKind.CAPSULE,
+            artifact_id=item.capsule_id,
+        )
+        is None
+    )
+    assert (
+        read_metric(
+            store,
+            artifact_kind=ArtifactKind.SNAPSHOT,
+            artifact_id=candidate.snapshot_id,
+        )
+        is None
+    )
 
 
 def test_stale_fence_rejects_whole_publish_without_superseding(tmp_path: Path) -> None:
@@ -642,6 +920,22 @@ def test_pointer_cas_loss_rolls_back_candidate_and_uses_winner_for_follow_up(
             """
         ).fetchone()
         assert tuple(follow_up) == ("PENDING", 2, "snapshot-1", 2)
+    assert (
+        read_metric(
+            store,
+            artifact_kind=ArtifactKind.CAPSULE,
+            artifact_id=second_capsule.capsule_id,
+        )
+        is None
+    )
+    assert (
+        read_metric(
+            store,
+            artifact_kind=ArtifactKind.SNAPSHOT,
+            artifact_id=second_snapshot.snapshot_id,
+        )
+        is None
+    )
 
 
 def test_dangling_source_is_rejected_by_permanent_gate_without_writes(

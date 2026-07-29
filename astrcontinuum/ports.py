@@ -4,11 +4,7 @@ from collections.abc import Sequence
 from typing import Protocol
 
 from .models import AuditReport, ContextCapsule, ContextEvent, Snapshot
-
-
-class TokenCounter(Protocol):
-    def count_text(self, text: str) -> int: ...
-    def count_events(self, events: Sequence[ContextEvent]) -> int: ...
+from .runtime.types import TokenCounter as TokenCounter  # noqa: PLC0414
 
 
 class EventStore(Protocol):

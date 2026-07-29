@@ -10,6 +10,13 @@ from typing import Any
 import pytest
 
 import astrcontinuum as ac
+from astrcontinuum.storage import (
+    ArtifactKind,
+    CanonicalMetricObservation,
+    TokenMetric,
+    TokenMetricConflict,
+    TokenMetricStore,
+)
 from tests.storage.security_testkit import (
     activate_test_storage,
     secure_repository,
@@ -17,6 +24,7 @@ from tests.storage.security_testkit import (
 )
 
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
+CANONICAL_PROFILE_ID = "canonical-o200k-v1"
 
 
 def session_key(**overrides: object) -> ac.SessionKey:
@@ -53,6 +61,15 @@ def migrated_repository(
     )
 
 
+def canonical_observation(
+    token_count: int | None = 17,
+) -> Any:
+    return CanonicalMetricObservation(
+        tokenizer_profile_id=CANONICAL_PROFILE_ID,
+        token_count=token_count,
+    )
+
+
 def capture_user(
     repository: Any,
     *,
@@ -60,6 +77,7 @@ def capture_user(
     key: ac.SessionKey | None = None,
     content: str = "hello",
     idempotency_key: str = "request-1",
+    canonical_count: int | None = 17,
     created_at: datetime = NOW,
 ) -> ac.EventEnvelope:
     return repository.capture_user_event(
@@ -68,8 +86,136 @@ def capture_user(
         content=content,
         idempotency_key=idempotency_key,
         token_count=2,
+        canonical=canonical_observation(canonical_count),
         created_at=created_at,
     )
+
+
+def test_capture_commits_event_and_canonical_metric_atomically(tmp_path: Path) -> None:
+    repository = migrated_repository(tmp_path)
+    canonical = canonical_observation()
+
+    event = repository.capture_user_event(
+        event_id="event-metric",
+        session_key=session_key(),
+        content="hello",
+        idempotency_key="request-metric",
+        token_count=5,
+        canonical=canonical,
+        created_at=NOW,
+    )
+
+    assert event.token_count == 5
+    with repository.factory.connection(read_only=True) as connection:
+        metric = TokenMetricStore(storage_test_codec()).get_in_transaction(
+            connection,
+            artifact_kind=ArtifactKind.EVENT,
+            artifact_id=event.event_id,
+            tokenizer_profile_id=canonical.tokenizer_profile_id,
+        )
+        assert metric == TokenMetric(
+            artifact_kind=ArtifactKind.EVENT,
+            artifact_id=event.event_id,
+            tokenizer_profile_id=canonical.tokenizer_profile_id,
+            token_count=17,
+        )
+        assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM token_metrics").fetchone()[0] == 1
+        assert (
+            connection.execute("SELECT count(*) FROM token_metric_backfill_intents").fetchone()[0]
+            == 0
+        )
+
+
+def test_missing_canonical_count_commits_event_and_one_backfill_intent(
+    tmp_path: Path,
+) -> None:
+    repository = migrated_repository(tmp_path)
+
+    event = capture_user(repository, event_id="event-missing", canonical_count=None)
+
+    assert event.token_count == 2
+    with repository.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM token_metrics").fetchone()[0] == 0
+        intent = connection.execute(
+            """
+            SELECT session_key_hash, artifact_kind, artifact_id,
+                   tokenizer_profile_id, created_at
+            FROM token_metric_backfill_intents
+            """
+        ).fetchone()
+        assert tuple(intent) == (
+            event.session_key.session_key_hash,
+            "EVENT",
+            event.event_id,
+            CANONICAL_PROFILE_ID,
+            "2026-07-26T12:00:00.000000Z",
+        )
+
+
+def test_exact_replay_verifies_or_fills_the_same_logical_metric(tmp_path: Path) -> None:
+    repository = migrated_repository(tmp_path)
+
+    first = capture_user(repository, canonical_count=None)
+    filled = capture_user(repository, canonical_count=17)
+    duplicate = capture_user(repository, canonical_count=17)
+
+    assert filled == first
+    assert duplicate == first
+    with repository.factory.connection(read_only=True) as connection:
+        metric = TokenMetricStore(storage_test_codec()).get_in_transaction(
+            connection,
+            artifact_kind=ArtifactKind.EVENT,
+            artifact_id=first.event_id,
+            tokenizer_profile_id=CANONICAL_PROFILE_ID,
+        )
+        assert metric is not None
+        assert metric.token_count == 17
+        assert connection.execute("SELECT count(*) FROM token_metrics").fetchone()[0] == 1
+        assert (
+            connection.execute("SELECT count(*) FROM token_metric_backfill_intents").fetchone()[0]
+            == 0
+        )
+
+
+def test_replay_with_different_canonical_value_raises_stable_conflict(
+    tmp_path: Path,
+) -> None:
+    repository = migrated_repository(tmp_path)
+    capture_user(repository, canonical_count=17)
+
+    with pytest.raises(TokenMetricConflict) as caught:
+        capture_user(repository, canonical_count=18)
+
+    assert caught.value.code == "TOKEN_METRIC_CONFLICT"
+    with repository.factory.connection(read_only=True) as connection:
+        metric = TokenMetricStore(storage_test_codec()).get_in_transaction(
+            connection,
+            artifact_kind=ArtifactKind.EVENT,
+            artifact_id="event-1",
+            tokenizer_profile_id=CANONICAL_PROFILE_ID,
+        )
+        assert metric is not None
+        assert metric.token_count == 17
+        assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 1
+
+
+def test_replay_without_count_does_not_create_intent_for_existing_metric(
+    tmp_path: Path,
+) -> None:
+    repository = migrated_repository(tmp_path)
+    first = capture_user(repository, canonical_count=17)
+
+    duplicate = capture_user(repository, canonical_count=None)
+
+    assert duplicate == first
+    with repository.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM token_metrics").fetchone()[0] == 1
+        assert (
+            connection.execute("SELECT count(*) FROM token_metric_backfill_intents").fetchone()[0]
+            == 0
+        )
 
 
 def test_capture_transactions_round_trip_all_authoritative_mappings(tmp_path: Path) -> None:
@@ -83,6 +229,7 @@ def test_capture_transactions_round_trip_all_authoritative_mappings(tmp_path: Pa
         content="hi",
         idempotency_key="done-1",
         token_count=1,
+        canonical=canonical_observation(11),
         created_at=NOW,
     )
     tool_call = repository.capture_tool_event(
@@ -92,6 +239,7 @@ def test_capture_transactions_round_trip_all_authoritative_mappings(tmp_path: Pa
         content='{"name":"status"}',
         idempotency_key="tool-call-1",
         token_count=3,
+        canonical=canonical_observation(12),
         created_at=NOW,
     )
     tool_result = repository.capture_tool_event(
@@ -101,6 +249,7 @@ def test_capture_transactions_round_trip_all_authoritative_mappings(tmp_path: Pa
         content='{"ok":true}',
         idempotency_key="tool-result-1",
         token_count=2,
+        canonical=canonical_observation(13),
         created_at=NOW,
     )
 
@@ -293,6 +442,7 @@ def test_capture_rejects_invalid_tool_type_and_naive_time_without_writes(
             content="invalid",
             idempotency_key="invalid-tool",
             token_count=1,
+            canonical=canonical_observation(),
             created_at=NOW,
         )
     with pytest.raises(ValueError):

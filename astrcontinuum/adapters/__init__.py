@@ -12,16 +12,17 @@ from .astrbot import (
     LiveContextTrace,
     PreparedRequest,
     ProjectionBuild,
-    ProjectionCapability,
+    ProjectionFactory,
     build_projection_objects,
     canonical_tool_metadata,
     deterministic_event_identity,
     estimate_opaque_token_cost,
     extract_host_session_key,
     extract_host_turn_identity,
-    probe_projection_capability,
+    projection_factory_from_user_message,
     select_projection_boundaries,
 )
+from .provider_thinking import ProviderThinkingCompatibility, ThinkingCompatibilityBlockedError
 from .sylanne import SylanneAdapter
 
 __all__ = [
@@ -36,14 +37,16 @@ __all__ = [
     "LiveContextTrace",
     "PreparedRequest",
     "ProjectionBuild",
-    "ProjectionCapability",
+    "ProjectionFactory",
+    "ProviderThinkingCompatibility",
     "SylanneAdapter",
+    "ThinkingCompatibilityBlockedError",
     "build_projection_objects",
     "canonical_tool_metadata",
     "deterministic_event_identity",
     "estimate_opaque_token_cost",
     "extract_host_session_key",
     "extract_host_turn_identity",
-    "probe_projection_capability",
+    "projection_factory_from_user_message",
     "select_projection_boundaries",
 ]

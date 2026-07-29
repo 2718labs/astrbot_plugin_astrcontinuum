@@ -2,7 +2,7 @@
 
 [English](./ARCHITECTURE.md) | 简体中文
 
-本文描述仓库版本 `v0.1.0` 的真实架构、保证安全性的核心不变量，以及“核心已经实现”
+本文描述仓库版本 `v0.2.1` 的真实架构、保证安全性的核心不变量，以及“核心已经实现”
 与“AstrBot 插件生命周期已经自动启用”之间的边界。
 
 ## 1. 范围与成熟度
@@ -17,11 +17,10 @@ AstrContinuum 是通过一个 `Star` 组合入口嵌入 AstrBot 的持久化上�
 - 在宿主持久化前恢复 AstrBot 原生消息对象图；
 - 在后台通道编译并原子发布结构化、经过审计的 Snapshot。
 
-在 `v0.1.0` 中，以上六项都已接入 AstrBot 生命周期。`Star` 会启动唯一持久 worker，
+在 `v0.2.1` 中，以上六项都已接入 AstrBot 生命周期。`Star` 会启动唯一持久 worker，
 绑定 AstrBot 提供的精确引文式编译后端，在慢模型调用期间续租，并在终止时取消和等待
-受跟踪任务。数据库静态加密与 Provider 语义审计适配器仍不属于本预览版。
-
-因此本仓库仍是技术预览版，暂未提交 AstrBot 插件市场。
+受跟踪任务。认证静态加密、离线模型文本计数、AstrBot 上下文窗口自动解析、规范 token
+指标 sidecar 与有界补齐已经启用；Provider 语义审计适配器不属于 `v0.2.1`。
 
 ## 2. 架构目标
 
@@ -45,6 +44,10 @@ AstrContinuum 是通过一个 `Star` 组合入口嵌入 AstrBot 的持久化上�
 
 进程内锁、队列和任务归属只能作为优化。
 
+token 记账明确分为三套坐标：规范指标是不可变 artifact 的持久 profile-keyed sidecar；
+实时指标只属于一个不可变的请求局部 profile；后台归约只消费完整规范指标。兼容字节
+计数继续服务 wire identity 与旧校验器，其逻辑值不变，也不会被解释成当前模型 token。
+
 ### 2.3 压缩必须可审计、可追溯
 
 Snapshot 不是一段自由文本摘要。它是某个连续 Journal 前缀的不可变结构化表示。
@@ -61,14 +64,13 @@ AstrBot 原生消息历史。所有注入内容必须标记为临时，并在之
 对宿主请求而言，AstrContinuum 是可选增强。兼容性或投影失败不能演变成 AstrBot
 停服；但系统也绝不会为了可用性接受持久化损坏、虚假覆盖或部分发布的 Snapshot。
 
-## 3. `v0.1.0` 明确不包含的能力
+## 3. `v0.2.1` 明确不包含的能力
 
-- 不在 AstrBot 插件市场发布；
+- 不提供由仓库管理的 AstrBot 市场分发工作流；
 - 不提供用户可见的回滚或时间旅行指令；
 - 不提供 WebUI 管理页面；
 - 不提供 Provider 驱动的语义审计适配器；
-- Journal 与 Snapshot 尚未实现静态加密；
-- 不宣称 UTF-8 字节计数等价于 Provider tokenizer；
+- 不宣称一个 tokenizer profile 对所有 Provider 模型都精确；
 - 不实现平台适配器特定行为，也不声明具体适配器支持；
 - 不把外部 Sylanne 记忆正文导入 AstrContinuum 持久记录。
 
@@ -321,8 +323,11 @@ B_ac = max(0, B_input - opaque_host_history - B_required)
 ### 12.1 压力策略
 
 压力以可用容量（模型窗口减去输出/工具预留）计算。优先使用正数的 Provider usage；
-拿不到时才保守估算完整原生输入。后台归约和 Provider View 的默认阈值分别为 `0.75`
-与 `0.80`，与对话轮数无关。
+拿不到时用本请求冻结的 profile 计算完整原生输入。`model_context_limit=0` 通过 AstrBot
+公开 `get_using_provider()` 解析当前 Provider，并只接受模型一致且为正数的
+`max_context_tokens`；元数据缺失或不一致时使用不含正文的
+`AUTO_SAFE_FALLBACK=128000`，正整数配置则是 `MANUAL`。后台归约和 Provider View 的
+默认阈值分别为 `0.75` 与 `0.80`，与对话轮数无关。
 
 ### 12.2 普通装配
 
@@ -340,10 +345,21 @@ B_ac = max(0, B_input - opaque_host_history - B_required)
 
 装配 trace 记录 id、slot、cost、score、reason、coverage 与总量，但不记录消息正文。
 
-### 12.4 计数限制
+### 12.4 token 坐标
 
-插件当前使用 `Utf8ByteTokenCounter`，每个 UTF-8 字节计一个单位。它确定、保守，但
-不等于 Provider tokenizer 的精确 Token 数。
+请求路径会在持久写入或装配前解析并冻结一个 `TokenizerProfile`。已知 OpenAI 模型映射
+选择随包发布的 `cl100k_base` 或 `o200k_base`；未知映射使用保守的
+`reference-o200k-v1`，以整数 `11000/10000` 乘数计费。两份资产按大小与 SHA-256
+固定，离线加载，不依赖可变下载缓存。
+
+宿主文本、当前输入、候选块和最终 Provider 投影都必须使用同一个请求 profile 计数。
+工具调用与对应结果是不可拆分的选择单元。tokenizer 构造或计数失败时，所有主路径部分
+结果都会被丢弃，整次请求从源数据以 `utf8-byte-v1` 重放；一次请求绝不混用 BPE 与
+字节单位。
+
+规范轨道以 `canonical-o200k-v1` 为不可变 Event、Capsule 和 Snapshot 保存 sidecar。
+新 artifact 在自身持久事务或发布事务中原子提交指标；旧 artifact 以有界、可重试批次
+补齐。必要规范指标不可用时，后台归约用稳定码延期，不会借用实时或兼容计数。
 
 ## 13. 投影所有权与恢复
 
@@ -390,6 +406,8 @@ Provider 执行后，`restore()` 重建精确原生图，只保留 Provider 新�
 | `snapshot_capsules` | 权威有序成员关系 |
 | `active_snapshots` | 每 session 至多一个 active pointer |
 | `compaction_jobs` | 持久意图与带 fencing 的状态机 |
+| `token_metrics` | 以 artifact、id 与 profile 为键的加密不可变计数 |
+| `token_metric_backfill_intents` | 为缺失规范指标保存有界、可重试任务 |
 
 每个字段和约束见 [DATABASE_SCHEMA.md](./DATABASE_SCHEMA.md)。
 
@@ -410,7 +428,7 @@ Provider 执行后，`restore()` 重建精确原生图，只保留 Provider 新�
 5. 执行 bootstrap-create 或 existing-pointer CAS；
 6. 标记 job committed。
 
-如果 Snapshot 前缀唯一约束或 pointer CAS 输掉竞争，内层 savepoint 回滚，不能留下
+如果 Snapshot 前缀唯一约束或 pointer CAS 遇到并发冲突，内层 savepoint 回滚，不能留下
 任何候选 Capsule、membership 或 Snapshot。带 fence 的外层事务记录 `SUPERSEDED`，
 并把更高的持久意图保留为后续任务。
 
@@ -486,7 +504,7 @@ sequence 冲突。
 
 ### 16.3 并发发布
 
-两个 worker 可能基于同一 base 竞争。只有一个能推进 active pointer。失败者进入
+两个 worker 可能基于同一 base 发生并发冲突。只有一个能推进 active pointer。失败者进入
 `SUPERSEDED`，不能留下孤儿候选内容；如果持久意图仍高于胜者覆盖，还必须创建后续
 任务。
 
@@ -496,13 +514,16 @@ sequence 冲突。
 | --- | --- |
 | event extra API 缺失 | 本轮跳过 AstrContinuum 状态 |
 | 初始化/存储失败 | 记录脱敏 `INITIALIZE_FAILED`，宿主请求继续 |
+| AstrBot 上下文限制无效或不可用 | 使用 `AUTO_SAFE_FALLBACK=128000` |
+| tokenizer 构造/计数失败 | 丢弃部分计数，以 BYTE 模式重算整次请求 |
+| 规范指标不可用 | 延期后台归约并保留可重试补齐任务 |
 | 硬压力以下投影能力缺失 | 不修改 Provider 消息列表 |
 | 硬压力下装配/投影不可用 | 用空 Provider View 移除原生历史 |
 | 投影边界非法 | 记录不含正文的适配错误，跳过投影 |
 | 必需输入超过预算 | 保留有界近期后缀，持久数据不变 |
 | 恢复/校验失败 | 记录脱敏不变量码，不宣称原生恢复通过 |
 | compiler/auditor worker 失败 | 持久化 stage/code/脱敏 message，重试或终止该 job |
-| 发布竞争 | 回滚候选 savepoint，持久化 `SUPERSEDED` |
+| 发布冲突 | 回滚候选 savepoint，持久化 `SUPERSEDED` |
 | 存储写失败 | 不伪造 Journal 成功或 Snapshot 覆盖 |
 
 降级通过稳定错误码和持久状态可观测，而不是把消息正文写进日志。
@@ -510,8 +531,8 @@ sequence 冲突。
 ## 18. 隐私与信任边界
 
 AstrContinuum 会存储完整用户与助手内容，因为这些记录构成本地权威 Journal。运维者
-必须相应保护插件数据目录。
-`v0.1.0` 的 SQLite 数据库没有静态加密；这是明确的预览限制，不是安全承诺。
+必须相应保护插件数据目录。会话派生 SQLite 值与规范 token 指标使用 AES-256-GCM
+认证信封；插件数据目录、备份以及外部/环境密钥仍需由运维者保护。
 
 工具元数据会限制：
 
@@ -521,6 +542,8 @@ AstrContinuum 会存储完整用户与助手内容，因为这些记录构成本
 - 总 UTF-8 字节数。
 
 系统不会持久化任意对象 `repr`。过大值会变为类型化或截断元数据。
+tokenizer 只离线运行；诊断不会输出模型身份、tokenizer 资产路径、消息正文或动态异常
+细节。
 
 外部 Sylanne 记忆未来可以提供临时检索信号，但其正文不能成为 Journal event、
 Capsule 来源或稳定哈希输入。
@@ -530,17 +553,15 @@ Capsule 来源或稳定哈希输入。
 绝大多数接入只使用 `astrbot.api.*`。唯一内部例外是 Provider 消息投影，它被封装在
 能力探测和 fail-open 行为之后。
 
-同一个已提交归档已通过以下真实 `PluginManager` 生命周期探针：
+发布归档通过真实公开 AstrBot Provider 与 ProviderRequest 对象探针：
 
 - AstrBot `4.24.0`；
-- AstrBot `4.24.2`；
 - AstrBot `4.26.7`；
 - Python `3.12.13`。
 
 探针验证
-`data.plugins.astrbot_plugin_astrcontinuum.main` 模块加载、handler 优先级、初始化、
-两轮对话、工具调用/结果、Provider-only 投影、精确原生身份恢复、Journal 顺序与
-终止。
+`data.plugins.astrbot_plugin_astrcontinuum.main` 模块加载、全部八个 handler、公开
+`get_using_provider()` 元数据解析、随包离线计数，以及零次 LLM 请求。
 
 AstrBot `4.24.0` 会产生上游 `StarMetadata.pages` 回退警告，但插件生命周期和行为
 仍通过。

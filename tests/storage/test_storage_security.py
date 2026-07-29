@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import hashlib
 import json
 import sqlite3
 from datetime import datetime, timedelta, timezone
@@ -8,6 +9,10 @@ from pathlib import Path
 import pytest
 
 import astrcontinuum as ac
+from tests.storage.security_testkit import (
+    install_v020_storage_fixture,
+    v020_fixture_keys,
+)
 
 NOW = datetime(2026, 7, 27, 8, 0, tzinfo=timezone.utc)
 ACTIVE_KEY = bytes(range(32))
@@ -387,17 +392,30 @@ def _ciphertext_envelopes(
             ):
                 if row[column] is not None:
                     result[("sessions", record, column)] = str(row[column])
-        for row in connection.execute("SELECT event_id, content FROM journal_events"):
+        event_columns = {
+            str(row["name"]) for row in connection.execute("PRAGMA table_info(journal_events)")
+        }
+        for row in connection.execute("SELECT * FROM journal_events"):
             record = str(row["event_id"])
             result[("journal_events", record, "content")] = str(row["content"])
-        for row in connection.execute("SELECT capsule_id, canonical_capsule_json FROM capsules"):
+            if "token_count_envelope" in event_columns:
+                result[("journal_events", record, "token_count")] = str(row["token_count_envelope"])
+        capsule_columns = {
+            str(row["name"]) for row in connection.execute("PRAGMA table_info(capsules)")
+        }
+        for row in connection.execute("SELECT * FROM capsules"):
             record = str(row["capsule_id"])
             result[("capsules", record, "canonical_capsule_json")] = _sentinel_envelope(
                 str(row["canonical_capsule_json"])
             )
+            if "token_cost_envelope" in capsule_columns:
+                result[("capsules", record, "token_cost")] = str(row["token_cost_envelope"])
+        snapshot_columns = {
+            str(row["name"]) for row in connection.execute("PRAGMA table_info(snapshots)")
+        }
         for row in connection.execute(
             """
-            SELECT snapshot_id, exact_anchor_ids_json, rendered_context, audit_outcome
+            SELECT *
             FROM snapshots
             """
         ):
@@ -409,11 +427,124 @@ def _ciphertext_envelopes(
             result[("snapshots", record, "audit_outcome")] = _sentinel_envelope(
                 str(row["audit_outcome"])
             )
+            if "token_cost_envelope" in snapshot_columns:
+                result[("snapshots", record, "token_cost")] = str(row["token_cost_envelope"])
         security = connection.execute(
             "SELECT key_verifier FROM storage_security WHERE singleton_id = 1"
         ).fetchone()
         result[("storage_security", "1", "key_verifier")] = str(security["key_verifier"])
     return result
+
+
+def _index_contract(
+    connection: sqlite3.Connection,
+    tables: tuple[str, ...],
+) -> dict[str, tuple[tuple[object, ...], ...]]:
+    contract: dict[str, tuple[tuple[object, ...], ...]] = {}
+    for table in tables:
+        indices = []
+        for row in connection.execute(f"PRAGMA index_list({table})"):
+            columns = tuple(
+                str(column["name"])
+                for column in connection.execute(f"PRAGMA index_info({row['name']})")
+            )
+            indices.append(
+                (
+                    str(row["name"]),
+                    int(row["unique"]),
+                    str(row["origin"]),
+                    int(row["partial"]),
+                    columns,
+                )
+            )
+        contract[table] = tuple(sorted(indices))
+    return contract
+
+
+def _foreign_key_contract(
+    connection: sqlite3.Connection,
+    tables: tuple[str, ...],
+) -> dict[str, tuple[tuple[object, ...], ...]]:
+    return {
+        table: tuple(
+            sorted(
+                (
+                    str(row["table"]),
+                    str(row["from"]),
+                    str(row["to"]),
+                    str(row["on_update"]),
+                    str(row["on_delete"]),
+                    str(row["match"]),
+                )
+                for row in connection.execute(f"PRAGMA foreign_key_list({table})")
+            )
+        )
+        for table in tables
+    }
+
+
+def _normalized_trigger_sql(
+    connection: sqlite3.Connection,
+    names: tuple[str, ...],
+) -> dict[str, str]:
+    rows = connection.execute(
+        f"""
+        SELECT name, sql
+        FROM sqlite_master
+        WHERE type = 'trigger'
+          AND name IN ({",".join("?" for _ in names)})
+        """,
+        names,
+    )
+    return {str(row["name"]): " ".join(str(row["sql"]).split()) for row in rows}
+
+
+def _normalized_schema_sql(connection: sqlite3.Connection, name: str) -> str:
+    row = connection.execute(
+        "SELECT sql FROM sqlite_master WHERE name = ?",
+        (name,),
+    ).fetchone()
+    assert row is not None
+    return " ".join(str(row["sql"]).split())
+
+
+def _normalized_expected_sql(sql: str) -> str:
+    return " ".join(sql.split())
+
+
+def _database_snapshot_digest(factory: ac.SQLiteConnectionFactory) -> str:
+    with factory.connection(read_only=True) as connection:
+        schema = [
+            tuple(row)
+            for row in connection.execute(
+                """
+                SELECT type, name, tbl_name, sql
+                FROM sqlite_master
+                WHERE name NOT LIKE 'sqlite_%'
+                ORDER BY type, name
+                """
+            )
+        ]
+        tables = [
+            str(row["name"])
+            for row in connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'table' AND name NOT LIKE 'sqlite_%'
+                ORDER BY name
+                """
+            )
+        ]
+        rows = {
+            table: [
+                tuple(row) for row in connection.execute(f'SELECT * FROM "{table}" ORDER BY rowid')
+            ]
+            for table in tables
+        }
+        user_version = int(connection.execute("PRAGMA user_version").fetchone()[0])
+    payload = repr((schema, rows, user_version)).encode("utf-8")
+    return hashlib.sha256(payload).hexdigest()
 
 
 def _assert_code(
@@ -450,11 +581,480 @@ def test_fresh_database_activates_secure_schema_and_verifier(tmp_path: Path) -> 
             FROM storage_security
             """
         ).fetchone()
-        assert tuple(row[:3]) == (1, result.key_id, "ACTIVE")
+        assert tuple(row[:3]) == (2, result.key_id, "ACTIVE")
         assert str(row["key_verifier"]).startswith(f"acenc:v1:{result.key_id}:")
         assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 2
+
+
+def test_real_v020_fixture_upgrades_to_format_two_without_changing_logical_artifacts(
+    tmp_path: Path,
+) -> None:
+    factory = ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000)
+    install_v020_storage_fixture(factory)
+    artifact_tables = ("journal_events", "capsules", "snapshots")
+    immutable_triggers = (
+        "journal_events_immutable_update",
+        "journal_events_immutable_delete",
+        "capsules_immutable_update",
+        "capsules_immutable_delete",
+        "snapshots_immutable_update",
+        "snapshots_immutable_delete",
+    )
+    with factory.connection(read_only=True) as connection:
+        v1_ledger = tuple(
+            connection.execute(
+                """
+                SELECT version, name, checksum, applied_at
+                FROM schema_migrations
+                WHERE version = 1
+                """
+            ).fetchone()
+        )
+        before_event = tuple(
+            connection.execute(
+                """
+                SELECT event_id, session_key_hash, sequence, token_count
+                FROM journal_events
+                """
+            ).fetchone()
+        )
+        before_capsule = tuple(
+            connection.execute(
+                """
+                SELECT capsule_id, session_key_hash, covered_event_start,
+                       covered_event_end, token_cost, source_coverage
+                FROM capsules
+                """
+            ).fetchone()
+        )
+        before_snapshot = tuple(
+            connection.execute(
+                """
+                SELECT snapshot_id, session_key_hash, base_snapshot_id,
+                       covered_event_end, source_high_water_mark, token_cost
+                FROM snapshots
+                """
+            ).fetchone()
+        )
+        before_membership = tuple(
+            connection.execute(
+                "SELECT snapshot_id, ordinal, capsule_id, slot FROM snapshot_capsules"
+            ).fetchone()
+        )
+        before_active = tuple(
+            connection.execute(
+                """
+                SELECT session_key_hash, snapshot_id, pointer_version
+                FROM active_snapshots
+                """
+            ).fetchone()
+        )
+        old_index_contract = _index_contract(connection, artifact_tables)
+        old_foreign_key_contract = _foreign_key_contract(connection, artifact_tables)
+        old_immutable_sql = _normalized_trigger_sql(connection, immutable_triggers)
+
+    activation = ac.activate_storage_security(factory, v020_fixture_keys())
+
+    assert activation.state is ac.StorageMaintenanceState.ACTIVE
+    assert activation.migrated is True
+    assert activation.rekeyed is False
+    assert activation.scrubbed is True
+    with factory.connection(read_only=True) as connection:
+        ledger = [
+            tuple(row)
+            for row in connection.execute(
+                """
+                SELECT version, name, checksum, applied_at
+                FROM schema_migrations
+                ORDER BY version
+                """
+            )
+        ]
+        metadata = tuple(
+            connection.execute(
+                "SELECT format_version, active_key_id, state FROM storage_security"
+            ).fetchone()
+        )
+        event = connection.execute("SELECT * FROM journal_events").fetchone()
+        capsule = connection.execute("SELECT * FROM capsules").fetchone()
+        snapshot = connection.execute("SELECT * FROM snapshots").fetchone()
+        event_columns = {
+            str(row["name"]) for row in connection.execute("PRAGMA table_info(journal_events)")
+        }
+        capsule_columns = {
+            str(row["name"]) for row in connection.execute("PRAGMA table_info(capsules)")
+        }
+        snapshot_columns = {
+            str(row["name"]) for row in connection.execute("PRAGMA table_info(snapshots)")
+        }
+        indices = {
+            str(row["name"])
+            for row in connection.execute(
+                """
+                SELECT name FROM sqlite_master
+                WHERE type = 'index' AND name NOT LIKE 'sqlite_%'
+                """
+            )
+        }
+        triggers = {
+            str(row["name"])
+            for row in connection.execute("SELECT name FROM sqlite_master WHERE type = 'trigger'")
+        }
+        index_contract = _index_contract(connection, artifact_tables)
+        foreign_key_contract = _foreign_key_contract(connection, artifact_tables)
+        immutable_sql = _normalized_trigger_sql(connection, immutable_triggers)
+        journal_sql = _normalized_schema_sql(connection, "journal_events")
+        capsule_sql = _normalized_schema_sql(connection, "capsules")
+        snapshot_sql = _normalized_schema_sql(connection, "snapshots")
+        metric_sql = _normalized_schema_sql(connection, "token_metrics")
+        intent_sql = _normalized_schema_sql(connection, "token_metric_backfill_intents")
+        backfill_index_sql = _normalized_schema_sql(
+            connection,
+            "idx_token_metric_backfill_session",
+        )
+
+        assert ledger[0] == v1_ledger
+        assert ledger[1][0:2] == (2, "encrypted_token_metrics")
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert metadata == (
+            2,
+            activation.key_id,
+            ac.StorageMaintenanceState.ACTIVE.value,
+        )
+        assert "token_count" not in event_columns
+        assert "token_cost" not in capsule_columns
+        assert "token_cost" not in snapshot_columns
+        assert "token_count_envelope" in event_columns
+        assert "token_cost_envelope" in capsule_columns
+        assert "token_cost_envelope" in snapshot_columns
+        assert (
+            "token_count_envelope TEXT NOT NULL "
+            "CHECK (substr(token_count_envelope, 1, 9) = 'acenc:v1:')"
+        ) in journal_sql
+        assert (
+            "token_cost_envelope TEXT NOT NULL "
+            "CHECK (substr(token_cost_envelope, 1, 9) = 'acenc:v1:')"
+        ) in capsule_sql
+        assert (
+            "token_cost_envelope TEXT NOT NULL "
+            "CHECK (substr(token_cost_envelope, 1, 9) = 'acenc:v1:')"
+        ) in snapshot_sql
+        assert (
+            activation.codec.decrypt_non_negative_int(
+                "journal_events",
+                "token_count",
+                str(event["event_id"]),
+                event["token_count_envelope"],
+            )
+            == before_event[3]
+        )
+        assert (
+            activation.codec.decrypt_non_negative_int(
+                "capsules",
+                "token_cost",
+                str(capsule["capsule_id"]),
+                capsule["token_cost_envelope"],
+            )
+            == before_capsule[4]
+        )
+        assert (
+            activation.codec.decrypt_non_negative_int(
+                "snapshots",
+                "token_cost",
+                str(snapshot["snapshot_id"]),
+                snapshot["token_cost_envelope"],
+            )
+            == before_snapshot[5]
+        )
+        assert (
+            event["event_id"],
+            event["session_key_hash"],
+            event["sequence"],
+        ) == before_event[:3]
+        assert (
+            capsule["capsule_id"],
+            capsule["session_key_hash"],
+            capsule["covered_event_start"],
+            capsule["covered_event_end"],
+            capsule["source_coverage"],
+        ) == (*before_capsule[:4], before_capsule[5])
+        assert (
+            snapshot["snapshot_id"],
+            snapshot["session_key_hash"],
+            snapshot["base_snapshot_id"],
+            snapshot["covered_event_end"],
+            snapshot["source_high_water_mark"],
+        ) == before_snapshot[:5]
+        assert (
+            tuple(
+                connection.execute(
+                    "SELECT snapshot_id, ordinal, capsule_id, slot FROM snapshot_capsules"
+                ).fetchone()
+            )
+            == before_membership
+        )
+        assert (
+            tuple(
+                connection.execute(
+                    """
+                SELECT session_key_hash, snapshot_id, pointer_version
+                FROM active_snapshots
+                """
+                ).fetchone()
+            )
+            == before_active
+        )
+        assert index_contract == old_index_contract
+        assert foreign_key_contract == old_foreign_key_contract
+        assert immutable_sql == old_immutable_sql
+        assert set(immutable_triggers) <= triggers
+        assert {
+            "journal_events_secure_insert",
+            "capsules_secure_insert",
+        } <= triggers
+        assert connection.execute("PRAGMA foreign_key_check").fetchall() == []
+        assert connection.execute("SELECT count(*) FROM token_metrics").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT count(*) FROM token_metric_backfill_intents").fetchone()[0]
+            == 0
+        )
+        assert "idx_token_metric_backfill_session" in indices
+        assert metric_sql == _normalized_expected_sql(
+            """
+            CREATE TABLE token_metrics (
+                artifact_kind TEXT NOT NULL
+                    CHECK (artifact_kind IN ('EVENT', 'CAPSULE', 'SNAPSHOT')),
+                artifact_id TEXT NOT NULL CHECK (length(trim(artifact_id)) > 0),
+                tokenizer_profile_id TEXT NOT NULL
+                    CHECK (length(trim(tokenizer_profile_id)) > 0),
+                metric_envelope TEXT NOT NULL
+                    CHECK (substr(metric_envelope, 1, 9) = 'acenc:v1:'),
+                created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0),
+                PRIMARY KEY (artifact_kind, artifact_id, tokenizer_profile_id)
+            )
+            """
+        )
+        assert intent_sql == _normalized_expected_sql(
+            """
+            CREATE TABLE token_metric_backfill_intents (
+                session_key_hash TEXT NOT NULL,
+                artifact_kind TEXT NOT NULL
+                    CHECK (artifact_kind IN ('EVENT', 'CAPSULE', 'SNAPSHOT')),
+                artifact_id TEXT NOT NULL CHECK (length(trim(artifact_id)) > 0),
+                tokenizer_profile_id TEXT NOT NULL
+                    CHECK (length(trim(tokenizer_profile_id)) > 0),
+                created_at TEXT NOT NULL CHECK (length(trim(created_at)) > 0),
+                PRIMARY KEY (artifact_kind, artifact_id, tokenizer_profile_id),
+                FOREIGN KEY (session_key_hash) REFERENCES sessions(session_key_hash)
+            )
+            """
+        )
+        assert backfill_index_sql == _normalized_expected_sql(
+            """
+            CREATE INDEX idx_token_metric_backfill_session
+            ON token_metric_backfill_intents
+                (session_key_hash, created_at, artifact_kind, artifact_id)
+            """
+        )
+
+    with (
+        pytest.raises(sqlite3.IntegrityError, match="journal_events rows are immutable"),
+        factory.transaction(immediate=True) as connection,
+    ):
+        connection.execute(
+            """
+            UPDATE journal_events
+            SET token_count_envelope = token_count_envelope
+            WHERE event_id = 'event-1'
+            """
+        )
+
+    with (
+        pytest.raises(sqlite3.IntegrityError),
+        factory.transaction(immediate=True) as connection,
+    ):
+        connection.execute(
+            """
+            INSERT INTO journal_events (
+                event_id, session_key_hash, sequence, event_type, role, content,
+                source_hook, idempotency_key, token_count_envelope, created_at
+            )
+            SELECT
+                'plaintext-count-event', session_key_hash, sequence + 100,
+                event_type, role, content, source_hook, 'plaintext-count-request',
+                '17', created_at
+            FROM journal_events
+            WHERE event_id = 'event-1'
+            """
+        )
+
+
+@pytest.mark.parametrize(
+    "stage",
+    [
+        "security_v2.after_journal_copy",
+        "security_v2.after_capsule_copy",
+        "security_v2.after_snapshot_copy",
+        "security_v2.after_verify",
+    ],
+)
+def test_format_two_precommit_faults_roll_back_schema_rows_and_ledger(
+    tmp_path: Path,
+    stage: str,
+) -> None:
+    factory = ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000)
+    install_v020_storage_fixture(factory)
+    before = _database_snapshot_digest(factory)
+
+    def fail_at_boundary(boundary: str) -> None:
+        if boundary == stage:
+            raise RuntimeError(PLAINTEXT_MARKER)
+
+    with pytest.raises(ac.StorageSecurityError) as raised:
+        ac.activate_storage_security(
+            factory,
+            v020_fixture_keys(),
+            fault_injector=fail_at_boundary,
+        )
+
+    _assert_code(raised, ac.SecurityErrorCode.STORAGE_MIGRATION_FAILED)
+    assert _database_snapshot_digest(factory) == before
+    with factory.connection(read_only=True) as connection:
         assert connection.execute("PRAGMA user_version").fetchone()[0] == 1
-        assert connection.execute("SELECT count(*) FROM schema_migrations").fetchone()[0] == 1
+        assert tuple(
+            connection.execute("SELECT format_version, state FROM storage_security").fetchone()
+        ) == (1, ac.StorageMaintenanceState.ACTIVE.value)
+        assert (
+            connection.execute(
+                """
+            SELECT 1
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'token_metrics'
+            """
+            ).fetchone()
+            is None
+        )
+
+
+def test_format_one_needs_scrub_recovers_before_format_two_upgrade(
+    tmp_path: Path,
+) -> None:
+    factory = ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000)
+    install_v020_storage_fixture(factory)
+    with factory.transaction(immediate=True) as connection:
+        connection.execute(
+            "UPDATE storage_security SET state = 'NEEDS_SCRUB' WHERE singleton_id = 1"
+        )
+    stages: list[str] = []
+
+    activation = ac.activate_storage_security(
+        factory,
+        v020_fixture_keys(),
+        fault_injector=stages.append,
+    )
+
+    assert activation.state is ac.StorageMaintenanceState.ACTIVE
+    assert activation.migrated is True
+    assert stages.index("security.after_vacuum") < stages.index("security_v2.after_journal_copy")
+    with factory.connection(read_only=True) as connection:
+        assert tuple(
+            connection.execute("SELECT format_version, state FROM storage_security").fetchone()
+        ) == (2, ac.StorageMaintenanceState.ACTIVE.value)
+
+
+def test_format_two_upgrade_and_key_rotation_use_only_the_target_key(
+    tmp_path: Path,
+) -> None:
+    factory = ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000)
+    install_v020_storage_fixture(factory)
+
+    activation = ac.activate_storage_security(
+        factory,
+        _keys(NEW_KEY, previous=ACTIVE_KEY),
+    )
+
+    assert activation.migrated is True
+    assert activation.rekeyed is True
+    assert activation.state is ac.StorageMaintenanceState.ACTIVE
+    assert activation.key_id == ac.key_id_for(NEW_KEY)
+    encrypted = _ciphertext_envelopes(factory)
+    assert {
+        ("journal_events", "event-1", "token_count"),
+        ("capsules", "capsule-1", "token_cost"),
+        ("snapshots", "snapshot-1", "token_cost"),
+    } <= encrypted.keys()
+    assert all(
+        envelope.startswith(f"acenc:v1:{activation.key_id}:") for envelope in encrypted.values()
+    )
+
+
+def test_format_two_postcommit_failure_stays_needs_scrub_and_restarts(
+    tmp_path: Path,
+) -> None:
+    factory = ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000)
+    install_v020_storage_fixture(factory)
+
+    def fail_after_commit(stage: str) -> None:
+        if stage == "security_v2.after_commit":
+            raise RuntimeError(PLAINTEXT_MARKER)
+
+    with pytest.raises(ac.StorageSecurityError) as raised:
+        ac.activate_storage_security(
+            factory,
+            v020_fixture_keys(),
+            fault_injector=fail_after_commit,
+        )
+
+    _assert_code(raised, ac.SecurityErrorCode.STORAGE_SCRUB_FAILED)
+    with factory.connection(read_only=True) as connection:
+        assert tuple(
+            connection.execute("SELECT format_version, state FROM storage_security").fetchone()
+        ) == (2, ac.StorageMaintenanceState.NEEDS_SCRUB.value)
+        assert connection.execute("PRAGMA user_version").fetchone()[0] == 2
+        assert (
+            connection.execute(
+                "SELECT count(*) FROM schema_migrations WHERE version = 2"
+            ).fetchone()[0]
+            == 1
+        )
+
+    resumed = ac.activate_storage_security(factory, v020_fixture_keys())
+    assert resumed.state is ac.StorageMaintenanceState.ACTIVE
+    assert resumed.migrated is False
+    assert resumed.rekeyed is False
+    assert resumed.scrubbed is True
+
+
+def test_format_two_postcommit_cancellation_stays_needs_scrub_and_restarts(
+    tmp_path: Path,
+) -> None:
+    factory = ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000)
+    install_v020_storage_fixture(factory)
+
+    class SimulatedCancellation(BaseException):
+        pass
+
+    def cancel_after_commit(stage: str) -> None:
+        if stage == "security_v2.after_commit":
+            raise SimulatedCancellation
+
+    with pytest.raises(SimulatedCancellation):
+        ac.activate_storage_security(
+            factory,
+            v020_fixture_keys(),
+            fault_injector=cancel_after_commit,
+        )
+
+    with factory.connection(read_only=True) as connection:
+        assert tuple(
+            connection.execute("SELECT format_version, state FROM storage_security").fetchone()
+        ) == (2, ac.StorageMaintenanceState.NEEDS_SCRUB.value)
+
+    resumed = ac.activate_storage_security(factory, v020_fixture_keys())
+    assert resumed.state is ac.StorageMaintenanceState.ACTIVE
+    assert resumed.scrubbed is True
 
 
 def test_populated_v01_database_is_atomically_encrypted_and_scrubbed(
@@ -607,7 +1207,7 @@ def test_secure_schema_rejects_new_plaintext_event_and_capsule_rows(
                 content,
                 source_hook,
                 idempotency_key,
-                token_count,
+                token_count_envelope,
                 created_at
             ) VALUES (?, ?, 2, 'USER_MESSAGE', 'USER', ?, 'ON_LLM_REQUEST', ?, 1, ?)
             """,
@@ -630,7 +1230,7 @@ def test_secure_schema_rejects_new_plaintext_event_and_capsule_rows(
                 covered_event_start,
                 covered_event_end,
                 canonical_capsule_json,
-                token_cost,
+                token_cost_envelope,
                 source_coverage,
                 created_at
             ) VALUES (?, ?, 'micro', 1, 1, '{}', 1, 1.0, ?)
@@ -803,7 +1403,7 @@ def test_legacy_precommit_failure_rolls_back_to_v01_readable_rows(
     assert snapshot_row["rendered_context"] == f"{PLAINTEXT_MARKER}-rendered"
 
 
-def test_postcommit_interruption_resumes_needs_scrub_without_retransform(
+def test_postcommit_interruption_resumes_format_one_scrub_then_upgrades(
     tmp_path: Path,
 ) -> None:
     factory, *_ = _seed_legacy_database(tmp_path)
@@ -824,7 +1424,7 @@ def test_postcommit_interruption_resumes_needs_scrub_without_retransform(
     assert after_commit["storage_security"][0][1] == "NEEDS_SCRUB"
     resumed = ac.activate_storage_security(factory, _keys())
     assert resumed.state is ac.StorageMaintenanceState.ACTIVE
-    assert resumed.migrated is False
+    assert resumed.migrated is True
     assert resumed.scrubbed is True
 
 

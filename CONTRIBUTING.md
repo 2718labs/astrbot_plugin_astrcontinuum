@@ -18,12 +18,13 @@ looks local can therefore affect durable history or AstrBot's native request gra
 
 ## Development setup
 
-AstrContinuum supports Python `>=3.10`; maintainers currently verify Python 3.10 and 3.12.
+AstrContinuum supports Python `>=3.10`; CI verifies Python 3.10 through 3.13 on Linux and
+Python 3.12 on Windows.
 
 ```bash
 git clone https://github.com/2718labs/astrbot_plugin_astrcontinuum
 cd astrbot_plugin_astrcontinuum
-uv sync --extra dev
+uv sync --frozen --extra dev
 ```
 
 Run the complete local gate:
@@ -87,6 +88,9 @@ database outcome. Assert the rows, pointer, coverage, and state transition.
 Runtime dependencies belong in both `requirements.txt` (AstrBot installation) and
 `pyproject.toml` (local/project installation). Development-only tools belong in the `dev` extra.
 Regenerate `uv.lock`, explain why the dependency is needed, and keep version bounds intentional.
+Tokenizer changes must preserve the shared `tiktoken>=0.12,<0.14` contract and the pinned
+offline-asset size/SHA-256 records in `THIRD_PARTY_NOTICES.md`; runtime downloads and mutable
+tokenizer caches are not accepted.
 
 ## Documentation
 
@@ -95,16 +99,20 @@ README or architecture claims, update the linked Simplified Chinese mirror in th
 request. Code symbols, field names, states, and invariant identifiers must remain exact in both
 languages.
 
-## Repository-stage release policy
+## Release contract
 
-`v0.1.0` is intentionally repository-only while compatibility evidence accumulates. Do not:
+`v0.2.1` has a deterministic AstrBot package contract. Before a release decision:
 
-- submit the repository to the AstrBot plugin market;
-- create a stable tag or GitHub Release;
-- add metadata-driven automatic release workflows;
-- describe the background compaction worker as active before it is wired and verified.
+- run the frozen quality gate and the dedicated release tests;
+- run the vendored 2718lab validator on the tracked tree and unpacked archive;
+- probe the public AstrBot Provider/ProviderRequest path on `4.24.0` and `4.26.7`;
+- build with `scripts/build_plugin_archive.py` and verify with
+  `scripts/verify_plugin_archive.py`;
+- confirm that the archive has one `astrbot_plugin_astrcontinuum/` top-level directory, only
+  allowlisted files, pinned tokenizer assets, and a size below 16 MiB.
 
-Those actions require an explicit maintainer decision after the stabilization gate is met.
+AstrBot-market distribution is a separate maintainer process. The CI archive job does not submit
+to the market, create tags, or publish remote releases.
 
 ## 简体中文
 
@@ -117,7 +125,7 @@ Those actions require an explicit maintainer decision after the stabilization ga
 ```bash
 git clone https://github.com/2718labs/astrbot_plugin_astrcontinuum
 cd astrbot_plugin_astrcontinuum
-uv sync --extra dev
+uv sync --frozen --extra dev
 uv run ruff check .
 uv run ruff format --check .
 uv run mypy astrcontinuum main.py
@@ -137,14 +145,15 @@ AstrBot `PluginManager` 加载验证。
 1. 影响了[测试矩阵](./docs/TEST_MATRIX.md)中的哪些 `INV-*`；
 2. 旧数据的迁移、回滚和恢复策略；
 3. 异常与进程崩溃边界下的持久结果；
-4. 重复回调、竞争发布、过期租约等并发证据；
+4. 重复回调、并发发布冲突、过期租约等并发证据；
 5. 验证过的真实 AstrBot 版本和适配器；
 6. 同步更新的架构、数据流、数据库、ADR、配置和 Changelog 文档。
 
 只看日志或返回值不算持久化正确性证据；必须断言数据库行、活动指针、覆盖范围和状态迁移。
 
-### 仓库阶段发布规则
+### 发布规则
 
-`v0.1.0` 目前只进入仓库稳定化阶段。在维护者明确决定前，不提交 AstrBot 市场、不创建稳定
-标签或 GitHub Release、不增加元数据触发的自动发布流程，也不能把尚未接入的后台压缩 worker
-写成已启用能力。
+`v0.2.1` 具有确定性的 AstrBot 安装包契约。发布决策前必须通过
+冻结依赖的完整质量门、发布契约测试、2718lab 校验器、AstrBot `4.24.0`/`4.26.7` 公共
+Provider 探针，以及归档 allowlist、固定 tokenizer 资产和 `<16 MiB` 门禁。市场提交、稳定
+标签或 GitHub Release 由维护者决定；AstrBot 市场分发是独立流程，CI 不会自动执行这些动作。

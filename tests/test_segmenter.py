@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from collections.abc import Sequence
 from dataclasses import FrozenInstanceError, is_dataclass
 from datetime import datetime, timezone
@@ -90,6 +91,10 @@ def segment_ranges(segments: tuple[Any, ...]) -> tuple[tuple[int, int], ...]:
     return tuple((item.start_sequence, item.end_sequence) for item in segments)
 
 
+def compatibility_counts(events: Sequence[ac.EventEnvelope]) -> dict[str, int]:
+    return {item.event_id: item.token_count for item in events}
+
+
 def test_segmenter_is_exported_on_both_canonical_surfaces() -> None:
     root_values = surface()
     compaction = importlib.import_module("astrcontinuum.compaction")
@@ -152,7 +157,7 @@ def test_segment_rejects_empty_input() -> None:
     _, config_type, _, segment_function = surface()
 
     with pytest.raises(ValueError, match="^SEGMENTER_EMPTY_EVENTS$"):
-        segment_function((), config=config_type())
+        segment_function((), token_counts={}, config=config_type())
 
 
 def test_segment_rejects_mixed_session_keys() -> None:
@@ -163,7 +168,7 @@ def test_segment_rejects_mixed_session_keys() -> None:
     )
 
     with pytest.raises(ValueError, match="^SEGMENTER_SESSION_MISMATCH$"):
-        segment_function(events, config=config_type())
+        segment_function(events, token_counts=compatibility_counts(events), config=config_type())
 
 
 @pytest.mark.parametrize(
@@ -181,7 +186,7 @@ def test_segment_rejects_noncontiguous_or_reordered_sequences(
     events = tuple(event(sequence) for sequence in sequences)
 
     with pytest.raises(ValueError, match="^SEGMENTER_NONCONTIGUOUS_EVENTS$"):
-        segment_function(events, config=config_type())
+        segment_function(events, token_counts=compatibility_counts(events), config=config_type())
 
 
 def test_segment_preserves_every_event_once_in_original_order() -> None:
@@ -190,6 +195,7 @@ def test_segment_preserves_every_event_once_in_original_order() -> None:
 
     segments = segment_function(
         events,
+        token_counts=compatibility_counts(events),
         config=config_type(max_events_per_segment=2, max_tokens_per_segment=100),
         preferred_end_sequences=(8, 10),
     )
@@ -213,6 +219,7 @@ def test_preferred_boundaries_are_deduplicated_sorted_and_out_of_range_values_ar
 
     segments = segment_function(
         events,
+        token_counts=compatibility_counts(events),
         config=config_type(max_events_per_segment=20, max_tokens_per_segment=100),
         preferred_end_sequences=preferred,
     )
@@ -226,6 +233,7 @@ def test_preferred_boundaries_are_bounded_after_normalization() -> None:
 
     segments = segment_function(
         events,
+        token_counts=compatibility_counts(events),
         config=config_type(
             max_events_per_segment=20,
             max_tokens_per_segment=100,
@@ -244,6 +252,7 @@ def test_preferred_boundary_item_reads_are_bounded_before_normalization() -> Non
 
     segments = segment_function(
         events,
+        token_counts=compatibility_counts(events),
         config=config_type(
             max_events_per_segment=20,
             max_tokens_per_segment=100,
@@ -263,6 +272,7 @@ def test_zero_preferred_boundary_limit_is_valid_and_reads_no_items() -> None:
 
     segments = segment_function(
         events,
+        token_counts=compatibility_counts(events),
         config=config_type(
             max_events_per_segment=20,
             max_tokens_per_segment=100,
@@ -279,36 +289,97 @@ def test_soft_boundary_keeps_adjacent_tool_call_and_result_together() -> None:
     _, config_type, _, segment_function = surface()
     events = (
         event(1),
-        event(2, event_type=ac.EventType.TOOL_CALL),
-        event(3, event_type=ac.EventType.TOOL_RESULT),
+        event(
+            2,
+            event_type=ac.EventType.TOOL_CALL,
+            content='{"kind":"call","tool":"weather","arguments":{}}',
+        ),
+        event(
+            3,
+            event_type=ac.EventType.TOOL_RESULT,
+            content='{"kind":"result","tool":"weather","arguments":{},"result":"ok"}',
+        ),
         event(4, event_type=ac.EventType.ASSISTANT_MESSAGE),
     )
 
     segments = segment_function(
         events,
+        token_counts=compatibility_counts(events),
         config=config_type(max_events_per_segment=10, max_tokens_per_segment=100),
         preferred_end_sequences=(2,),
     )
 
-    assert segment_ranges(segments) == ((1, 3), (4, 4))
-    assert segments[0].events[-2:] == events[1:3]
+    assert segment_ranges(segments) == ((1, 4),)
+    assert segments[0].events[-3:] == events[1:]
 
 
-def test_hard_event_limit_may_split_a_tool_pair() -> None:
-    reason_type, config_type, _, segment_function = surface()
+def test_parallel_tool_continuation_is_not_split_at_preferred_or_hard_boundaries() -> None:
+    _, config_type, _, segment_function = surface()
+
+    def tool_payload(kind: str, tool: str, arguments: dict[str, object], **extra: object) -> str:
+        return json.dumps(
+            {"kind": kind, "tool": tool, "arguments": arguments, **extra},
+            separators=(",", ":"),
+        )
+
     events = (
-        event(1, event_type=ac.EventType.TOOL_CALL),
-        event(2, event_type=ac.EventType.TOOL_RESULT),
+        event(1),
+        event(
+            2, event_type=ac.EventType.TOOL_CALL, content=tool_payload("call", "search", {"q": "a"})
+        ),
+        event(
+            3, event_type=ac.EventType.TOOL_CALL, content=tool_payload("call", "lookup", {"id": 7})
+        ),
+        event(
+            4,
+            event_type=ac.EventType.TOOL_RESULT,
+            content=tool_payload("result", "lookup", {"id": 7}, result="found"),
+        ),
+        event(
+            5,
+            event_type=ac.EventType.TOOL_RESULT,
+            content=tool_payload("result", "search", {"q": "a"}, result="ok"),
+        ),
+        event(6, event_type=ac.EventType.ASSISTANT_MESSAGE),
+        event(7),
     )
 
     segments = segment_function(
         events,
+        token_counts=compatibility_counts(events),
+        config=config_type(max_events_per_segment=2, max_tokens_per_segment=100),
+        preferred_end_sequences=(3, 5),
+    )
+
+    assert segment_ranges(segments) == ((1, 1), (2, 6), (7, 7))
+    assert tuple(item.sequence for item in segments[1].events) == (2, 3, 4, 5, 6)
+
+
+def test_hard_event_limit_keeps_a_closed_tool_continuation_atomic() -> None:
+    reason_type, config_type, _, segment_function = surface()
+    events = (
+        event(
+            1,
+            event_type=ac.EventType.TOOL_CALL,
+            content='{"kind":"call","tool":"weather","arguments":{}}',
+        ),
+        event(
+            2,
+            event_type=ac.EventType.TOOL_RESULT,
+            content='{"kind":"result","tool":"weather","arguments":{},"result":"ok"}',
+        ),
+        event(3, event_type=ac.EventType.ASSISTANT_MESSAGE),
+    )
+
+    segments = segment_function(
+        events,
+        token_counts=compatibility_counts(events),
         config=config_type(max_events_per_segment=1, max_tokens_per_segment=100),
         preferred_end_sequences=(1,),
     )
 
-    assert segment_ranges(segments) == ((1, 1), (2, 2))
-    assert segments[0].boundary_reason is reason_type.MAX_EVENTS
+    assert segment_ranges(segments) == ((1, 3),)
+    assert segments[0].boundary_reason is reason_type.OVERSIZED_EVENT
 
 
 def test_hard_event_limit_bounds_each_segment() -> None:
@@ -317,6 +388,7 @@ def test_hard_event_limit_bounds_each_segment() -> None:
 
     segments = segment_function(
         events,
+        token_counts=compatibility_counts(events),
         config=config_type(max_events_per_segment=2, max_tokens_per_segment=100),
     )
 
@@ -338,6 +410,7 @@ def test_hard_token_limit_uses_event_token_count_not_content_length() -> None:
 
     segments = segment_function(
         events,
+        token_counts=compatibility_counts(events),
         config=config_type(max_events_per_segment=10, max_tokens_per_segment=5),
     )
 
@@ -354,6 +427,7 @@ def test_single_oversized_event_is_isolated_and_preserved_verbatim() -> None:
 
     segments = segment_function(
         events,
+        token_counts=compatibility_counts(events),
         config=config_type(max_events_per_segment=10, max_tokens_per_segment=5),
     )
 
@@ -379,6 +453,7 @@ def test_config_result_and_mutable_inputs_remain_immutable() -> None:
 
     segments = segment_function(
         events,
+        token_counts=compatibility_counts(events),
         config=config,
         preferred_end_sequences=preferred,
     )
@@ -405,7 +480,58 @@ def test_segment_is_deterministic_for_identical_inputs() -> None:
     )
     preferred = (10, 5, 7, 5)
 
-    first = segment_function(events, config=config, preferred_end_sequences=preferred)
-    second = segment_function(events, config=config, preferred_end_sequences=preferred)
+    first = segment_function(
+        events,
+        token_counts=compatibility_counts(events),
+        config=config,
+        preferred_end_sequences=preferred,
+    )
+    second = segment_function(
+        events,
+        token_counts=compatibility_counts(events),
+        config=config,
+        preferred_end_sequences=preferred,
+    )
 
     assert first == second
+
+
+def test_segment_requires_one_exact_metric_for_every_event() -> None:
+    _, config_type, _, segment_function = surface()
+    events = (event(1), event(2))
+
+    with pytest.raises(ValueError, match="^TOKEN_METRIC_MISSING$"):
+        segment_function(
+            events,
+            token_counts={events[0].event_id: 1},
+            config=config_type(),
+        )
+
+    with pytest.raises(ValueError, match="^TOKEN_METRIC_MISSING$"):
+        segment_function(
+            events,
+            token_counts={
+                events[0].event_id: 1,
+                events[1].event_id: 1,
+                "unrelated-event": 1,
+            },
+            config=config_type(),
+        )
+
+
+def test_segment_boundaries_use_explicit_canonical_metrics_not_compatibility_counts() -> None:
+    _, config_type, _, segment_function = surface()
+    events = (
+        event(1, token_count=100),
+        event(2, token_count=100),
+        event(3, token_count=100),
+    )
+
+    segments = segment_function(
+        events,
+        token_counts={item.event_id: count for item, count in zip(events, (2, 3, 4), strict=True)},
+        config=config_type(max_events_per_segment=10, max_tokens_per_segment=5),
+    )
+
+    assert segment_ranges(segments) == ((1, 2), (3, 3))
+    assert tuple(item.token_cost for item in segments) == (5, 4)

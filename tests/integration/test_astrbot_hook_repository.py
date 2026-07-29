@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+from collections.abc import Callable
 from enum import Enum
 from pathlib import Path
 from types import SimpleNamespace
@@ -12,6 +13,7 @@ from astrcontinuum.adapters import (
     AstrBotAdapterError,
     AstrBotHookBridge,
 )
+from astrcontinuum.runtime import TokenCounter
 from astrcontinuum.storage import (
     KeyMaterial,
     KeySource,
@@ -20,6 +22,13 @@ from astrcontinuum.storage import (
     SQLiteConnectionFactory,
     SQLiteRepository,
     activate_storage_security,
+)
+from astrcontinuum.tokenization import (
+    BYTE_FALLBACK,
+    CANONICAL_O200K,
+    ContextLimitSource,
+    RequestBudgetProfile,
+    TokenizerProfile,
 )
 
 TEST_KEY = bytes(range(32))
@@ -68,7 +77,29 @@ def _request() -> SimpleNamespace:
     )
 
 
-def _bridge(tmp_path: Path) -> tuple[AstrBotHookBridge, SecureCodec]:
+def _budget_profile() -> RequestBudgetProfile:
+    return RequestBudgetProfile(
+        model_identity=None,
+        context_limit=128_000,
+        context_limit_source=ContextLimitSource.AUTO_SAFE_FALLBACK,
+        tokenizer_profile=BYTE_FALLBACK,
+        target_input_budget=100_000,
+        hard_input_ceiling=110_000,
+    )
+
+
+class DistinctCanonicalCounter:
+    profile = CANONICAL_O200K
+
+    def count_text(self, text: str) -> int:
+        return len(text.encode("utf-8")) + 1_000
+
+
+def _bridge(
+    tmp_path: Path,
+    *,
+    counter_provider: Callable[[TokenizerProfile], TokenCounter] | None = None,
+) -> tuple[AstrBotHookBridge, SecureCodec]:
     factory = SQLiteConnectionFactory(tmp_path, busy_timeout_ms=5_000)
     activation = activate_storage_security(
         factory,
@@ -80,7 +111,10 @@ def _bridge(tmp_path: Path) -> tuple[AstrBotHookBridge, SecureCodec]:
         ),
     )
     return (
-        AstrBotHookBridge(SQLiteRepository(factory, codec=activation.codec)),
+        AstrBotHookBridge(
+            SQLiteRepository(factory, codec=activation.codec),
+            counter_provider=counter_provider or (lambda _profile: DistinctCanonicalCounter()),
+        ),
         activation.codec,
     )
 
@@ -95,8 +129,17 @@ async def test_authoritative_hooks_are_idempotent_and_allocate_contiguous_rows(
     contexts = request.contexts
     contexts_before = tuple(contexts)
 
-    first_prepare = await bridge.prepare_request(event, request)
-    replay_prepare = await bridge.prepare_request(event, request)
+    profile = _budget_profile()
+    first_prepare = await bridge.prepare_request(
+        event,
+        request,
+        budget_profile=profile,
+    )
+    replay_prepare = await bridge.prepare_request(
+        event,
+        request,
+        budget_profile=profile,
+    )
     tool = SimpleNamespace(name="weather")
     first_call = await bridge.capture_tool_call(
         first_prepare,
@@ -136,6 +179,16 @@ async def test_authoritative_hooks_are_idempotent_and_allocate_contiguous_rows(
     )
 
     assert first_prepare.user_event == replay_prepare.user_event
+    assert first_prepare.budget_profile is profile
+    assert first_prepare.user_event.token_count == len(request.prompt.encode("utf-8"))
+    assert bridge.repository.read_event_token_counts(
+        first_prepare.turn.session_key,
+        (first_prepare.user_event.event_id,),
+        profile_id=CANONICAL_O200K.profile_id,
+    ) == {first_prepare.user_event.event_id: DistinctCanonicalCounter().count_text(request.prompt)}
+    assert first_prepare.user_event.token_count != DistinctCanonicalCounter().count_text(
+        request.prompt
+    )
     assert first_call == replay_call
     assert first_result == replay_result
     assert first_assistant == replay_assistant
@@ -176,6 +229,11 @@ async def test_authoritative_hooks_are_idempotent_and_allocate_contiguous_rows(
         assert json.loads(contents[2])["kind"] == "result"
         assert contents[3] == "done"
         assert connection.execute("SELECT next_event_sequence FROM sessions").fetchone()[0] == 5
+        assert (
+            connection.execute("SELECT count(*) FROM token_metric_backfill_intents").fetchone()[0]
+            == 0
+        )
+        assert connection.execute("SELECT count(*) FROM token_metrics").fetchone()[0] == 4
         job_rows = connection.execute(
             """
             SELECT state, target_high_water_mark, intent_target_high_water_mark
@@ -192,7 +250,11 @@ async def test_missing_stable_identity_skips_every_durable_write(tmp_path: Path)
     contexts_before = tuple(request.contexts)
 
     with pytest.raises(AstrBotAdapterError) as caught:
-        await bridge.prepare_request(FakeEvent(sender_id=""), request)
+        await bridge.prepare_request(
+            FakeEvent(sender_id=""),
+            request,
+            budget_profile=_budget_profile(),
+        )
 
     assert caught.value.code == AdapterErrorCode.HOST_IDENTITY_MISSING.value
     assert tuple(request.contexts) == contexts_before
@@ -200,3 +262,195 @@ async def test_missing_stable_identity_skips_every_durable_write(tmp_path: Path)
         assert connection.execute("SELECT count(*) FROM sessions").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_unfinished_durable_tool_loop_blocks_request_before_a_user_write(
+    tmp_path: Path,
+) -> None:
+    bridge, _ = _bridge(tmp_path)
+    initial_request = _request()
+    initial = await bridge.prepare_request(
+        FakeEvent(message_id="opening-request"),
+        initial_request,
+        budget_profile=_budget_profile(),
+    )
+    assert initial is not None
+    await bridge.capture_tool_call(
+        initial,
+        SimpleNamespace(name="weather"),
+        {"city": "杭州"},
+        ordinal=0,
+    )
+    blocked_request = _request()
+    original_contexts = blocked_request.contexts
+    original_messages = tuple(blocked_request.contexts)
+
+    blocked = await bridge.prepare_request(
+        FakeEvent(message_id="blocked-request"),
+        blocked_request,
+        budget_profile=_budget_profile(),
+    )
+
+    assert blocked is None
+    assert blocked_request.contexts is original_contexts
+    assert tuple(blocked_request.contexts) == original_messages
+    assessment = await bridge.read_tool_loop_state(initial.turn.session_key)
+    assert assessment.state.value == "awaiting_results"
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 2
+        assert connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
+async def test_canonical_asset_failure_keeps_byte_event_and_one_backfill_intent(
+    tmp_path: Path,
+) -> None:
+    def fail_counter(_profile: TokenizerProfile) -> TokenCounter:
+        raise RuntimeError("private tokenizer asset path")
+
+    bridge, _ = _bridge(tmp_path, counter_provider=fail_counter)
+    request = _request()
+
+    prepared = await bridge.prepare_request(
+        FakeEvent(),
+        request,
+        budget_profile=_budget_profile(),
+    )
+
+    assert prepared.user_event.token_count == len(request.prompt.encode("utf-8"))
+    assert (
+        bridge.repository.read_event_token_counts(
+            prepared.turn.session_key,
+            (prepared.user_event.event_id,),
+            profile_id=CANONICAL_O200K.profile_id,
+        )
+        == {}
+    )
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        assert (
+            connection.execute(
+                """
+                SELECT count(*)
+                FROM token_metric_backfill_intents
+                WHERE artifact_kind = 'EVENT'
+                  AND artifact_id = ?
+                  AND tokenizer_profile_id = ?
+                """,
+                (
+                    prepared.user_event.event_id,
+                    CANONICAL_O200K.profile_id,
+                ),
+            ).fetchone()[0]
+            == 1
+        )
+
+
+@pytest.mark.asyncio
+async def test_mismatched_canonical_counter_profile_creates_one_backfill_intent(
+    tmp_path: Path,
+) -> None:
+    class WrongProfileCounter:
+        profile = BYTE_FALLBACK
+
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_text(self, _text: str) -> int:
+            self.calls += 1
+            return 1
+
+    wrong = WrongProfileCounter()
+    bridge, _ = _bridge(
+        tmp_path,
+        counter_provider=lambda _profile: wrong,
+    )
+    request = _request()
+
+    prepared = await bridge.prepare_request(
+        FakeEvent(),
+        request,
+        budget_profile=_budget_profile(),
+    )
+
+    assert prepared.user_event.token_count == len(request.prompt.encode("utf-8"))
+    assert wrong.calls == 0
+    assert (
+        bridge.repository.read_event_token_counts(
+            prepared.turn.session_key,
+            (prepared.user_event.event_id,),
+            profile_id=CANONICAL_O200K.profile_id,
+        )
+        == {}
+    )
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        assert (
+            connection.execute(
+                """
+                SELECT count(*)
+                FROM token_metric_backfill_intents
+                WHERE artifact_kind = 'EVENT'
+                  AND artifact_id = ?
+                  AND tokenizer_profile_id = ?
+                """,
+                (
+                    prepared.user_event.event_id,
+                    CANONICAL_O200K.profile_id,
+                ),
+            ).fetchone()[0]
+            == 1
+        )
+
+
+@pytest.mark.asyncio
+async def test_unprofiled_canonical_counter_creates_one_backfill_intent(
+    tmp_path: Path,
+) -> None:
+    class UnprofiledByteCounter:
+        def __init__(self) -> None:
+            self.calls = 0
+
+        def count_text(self, text: str) -> int:
+            self.calls += 1
+            return len(text.encode("utf-8"))
+
+    unprofiled = UnprofiledByteCounter()
+    bridge, _ = _bridge(
+        tmp_path,
+        counter_provider=lambda _profile: unprofiled,
+    )
+    request = _request()
+
+    prepared = await bridge.prepare_request(
+        FakeEvent(),
+        request,
+        budget_profile=_budget_profile(),
+    )
+
+    assert prepared.user_event.token_count == len(request.prompt.encode("utf-8"))
+    assert unprofiled.calls == 0
+    assert (
+        bridge.repository.read_event_token_counts(
+            prepared.turn.session_key,
+            (prepared.user_event.event_id,),
+            profile_id=CANONICAL_O200K.profile_id,
+        )
+        == {}
+    )
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        assert (
+            connection.execute(
+                """
+                SELECT count(*)
+                FROM token_metric_backfill_intents
+                WHERE artifact_kind = 'EVENT'
+                  AND artifact_id = ?
+                  AND tokenizer_profile_id = ?
+                """,
+                (
+                    prepared.user_event.event_id,
+                    CANONICAL_O200K.profile_id,
+                ),
+            ).fetchone()[0]
+            == 1
+        )

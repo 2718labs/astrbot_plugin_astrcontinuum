@@ -72,10 +72,30 @@ class FakeStar:
 
 class FakeTextPart:
     def __init__(self, *, text: str) -> None:
+        self.type = "text"
         self.text = text
         self._no_save = False
 
     def mark_as_temp(self) -> FakeTextPart:
+        self._no_save = True
+        return self
+
+
+class FakeThinkingPart:
+    def __init__(
+        self,
+        *,
+        text: str,
+        signature: object = None,
+        encrypted_content: object = None,
+    ) -> None:
+        self.type = "thinking"
+        self.text = text
+        self.signature = signature
+        self.encrypted_content = encrypted_content
+        self._no_save = False
+
+    def mark_as_temp(self) -> FakeThinkingPart:
         self._no_save = True
         return self
 
@@ -137,8 +157,6 @@ def _request(prompt: str, *, token_usage: int = 0) -> SimpleNamespace:
 def _load_main(
     monkeypatch: pytest.MonkeyPatch,
     data_dir: Path,
-    *,
-    projection_capability: bool = True,
 ) -> tuple[ModuleType, FakeLogger]:
     monkeypatch.setenv("ASTRCONTINUUM_MASTER_KEY", TEST_MASTER_KEY)
     monkeypatch.delenv("ASTRCONTINUUM_PREVIOUS_KEY", raising=False)
@@ -166,22 +184,11 @@ def _load_main(
     star.StarTools = FakeStarTools
     star.register = lambda *_args, **_kwargs: lambda plugin_type: plugin_type
 
-    core = ModuleType("astrbot.core")
-    core.__path__ = []
-    agent = ModuleType("astrbot.core.agent")
-    agent.__path__ = []
-    message = ModuleType("astrbot.core.agent.message")
-    message.Message = FakeMessage
-    message.TextPart = FakeTextPart if projection_capability else object
-
     for name, module in {
         "astrbot": astrbot,
         "astrbot.api": api,
         "astrbot.api.event": event,
         "astrbot.api.star": star,
-        "astrbot.core": core,
-        "astrbot.core.agent": agent,
-        "astrbot.core.agent.message": message,
     }.items():
         monkeypatch.setitem(sys.modules, name, module)
     monkeypatch.delitem(sys.modules, "main", raising=False)
@@ -217,22 +224,22 @@ async def test_projection_restores_native_history_and_never_persists_projection(
     tmp_path: Path,
 ) -> None:
     read_count = 0
-    live_assembly_count = 0
+    request_budget_count = 0
     original_read_request_view = astrbot_adapter.read_request_view
-    original_assemble_live_context = astrbot_adapter.assemble_live_context
+    original_run_request_budget = astrbot_adapter.run_request_budget
 
     def counted_read_request_view(*args: object, **kwargs: object) -> object:
         nonlocal read_count
         read_count += 1
         return original_read_request_view(*args, **kwargs)  # type: ignore[arg-type]
 
-    def counted_assemble_live_context(
+    def counted_run_request_budget(
         *args: object,
         **kwargs: object,
-    ) -> tuple[object, object]:
-        nonlocal live_assembly_count
-        live_assembly_count += 1
-        return original_assemble_live_context(*args, **kwargs)  # type: ignore[arg-type, return-value]
+    ) -> object:
+        nonlocal request_budget_count
+        request_budget_count += 1
+        return original_run_request_budget(*args, **kwargs)  # type: ignore[arg-type, return-value]
 
     monkeypatch.setattr(
         astrbot_adapter,
@@ -241,8 +248,8 @@ async def test_projection_restores_native_history_and_never_persists_projection(
     )
     monkeypatch.setattr(
         astrbot_adapter,
-        "assemble_live_context",
-        counted_assemble_live_context,
+        "run_request_budget",
+        counted_run_request_budget,
     )
     module, _logger = _load_main(monkeypatch, tmp_path)
     plugin = module.AstrContinuumPlugin(
@@ -270,34 +277,82 @@ async def test_projection_restores_native_history_and_never_persists_projection(
     await plugin.on_llm_request(event, request)
     reads_before_projection = read_count
 
-    system = FakeMessage(role="system", content="system prompt")
+    system_part = FakeTextPart(text="system prompt")
+    system_content = [system_part]
+    system = FakeMessage(role="system", content=system_content)
     history_user = FakeMessage(role="user", content="old user")
-    history_assistant = FakeMessage(role="assistant", content="old assistant")
-    current = FakeMessage(role="user", content="fresh user")
+    assistant_signature = object()
+    assistant_encrypted_content = object()
+    assistant_thinking_part = FakeThinkingPart(
+        text="old assistant reasoning",
+        signature=assistant_signature,
+        encrypted_content=assistant_encrypted_content,
+    )
+    assistant_content = [assistant_thinking_part]
+    history_assistant = FakeMessage(role="assistant", content=assistant_content)
+    current_signature = object()
+    current_encrypted_content = object()
+    current_thinking_part = FakeThinkingPart(
+        text="current signed reasoning",
+        signature=current_signature,
+        encrypted_content=current_encrypted_content,
+    )
+    current_text_part = FakeTextPart(text="fresh user")
+    current_content = [current_thinking_part, current_text_part]
+    current = FakeMessage(role="user", content=current_content)
     messages = [system, history_user, history_assistant, current]
+    message_list = messages
     native_before = _dump_messages(messages)
     run_context = SimpleNamespace(messages=messages)
 
     await plugin.on_agent_begin_guard(event, run_context)
-    opaque = FakeMessage(role="user", content=[FakeTextPart(text="foreign projection")])
+    opaque_part = FakeTextPart(text="foreign projection")
+    opaque_content = [opaque_part]
+    opaque = FakeMessage(role="user", content=opaque_content)
     messages.insert(1, opaque)
     await plugin.on_agent_begin_project(event, run_context)
 
-    assert live_assembly_count == 1
+    assert request_budget_count == 1
     assert read_count == reads_before_projection
     assert request.contexts is request_contexts
     assert _dump_messages(request.contexts) == request_context_bytes
+    assert messages is message_list
     assert messages[0] is system
     assert messages[1] is opaque
     assert messages[-1] is current
+    assert system.content is system_content
+    assert system_content[0] is system_part
+    assert opaque.content is opaque_content
+    assert opaque_content[0] is opaque_part
+    assert current.content is current_content
+    assert current_content[0] is current_thinking_part
+    assert current_content[1] is current_text_part
+    assert current_thinking_part.signature is current_signature
+    assert current_thinking_part.encrypted_content is current_encrypted_content
     assert history_user not in messages
     assert history_assistant not in messages
     projection_message = messages[-2]
     assert projection_message._no_save is True
+    assert len(projection_message.content) == 1
+    assert isinstance(projection_message.content[0], FakeTextPart)
+    assert projection_message.content[0].type == "text"
+    assert not hasattr(projection_message.content[0], "signature")
+    assert not hasattr(projection_message.content[0], "thinking")
+    assert not hasattr(projection_message.content[0], "think")
+    assert not hasattr(projection_message.content[0], "encrypted_content")
     assert projection_message.content[0]._no_save is True
     projected_text = projection_message.content[0].text
 
-    assistant_delta = FakeMessage(role="assistant", content="fresh assistant")
+    delta_signature = object()
+    delta_encrypted_content = object()
+    delta_thinking_part = FakeThinkingPart(
+        text="fresh assistant reasoning",
+        signature=delta_signature,
+        encrypted_content=delta_encrypted_content,
+    )
+    delta_text_part = FakeTextPart(text="fresh assistant")
+    delta_content = [delta_thinking_part, delta_text_part]
+    assistant_delta = FakeMessage(role="assistant", content=delta_content)
     messages.append(assistant_delta)
     await plugin.on_agent_done_restore(
         event,
@@ -312,6 +367,31 @@ async def test_projection_restores_native_history_and_never_persists_projection(
         current,
         assistant_delta,
     ]
+    assert messages is message_list
+    assert messages[0] is system
+    assert messages[1] is opaque
+    assert messages[2] is history_user
+    assert messages[3] is history_assistant
+    assert messages[4] is current
+    assert messages[5] is assistant_delta
+    assert system.content is system_content
+    assert system_content[0] is system_part
+    assert opaque.content is opaque_content
+    assert opaque_content[0] is opaque_part
+    assert history_assistant.content is assistant_content
+    assert assistant_content[0] is assistant_thinking_part
+    assert assistant_thinking_part.signature is assistant_signature
+    assert assistant_thinking_part.encrypted_content is assistant_encrypted_content
+    assert current.content is current_content
+    assert current_content[0] is current_thinking_part
+    assert current_content[1] is current_text_part
+    assert current_thinking_part.signature is current_signature
+    assert current_thinking_part.encrypted_content is current_encrypted_content
+    assert assistant_delta.content is delta_content
+    assert delta_content[0] is delta_thinking_part
+    assert delta_content[1] is delta_text_part
+    assert delta_thinking_part.signature is delta_signature
+    assert delta_thinking_part.encrypted_content is delta_encrypted_content
 
     messages.remove(opaque)
     await plugin.on_agent_done_finalize(
@@ -321,6 +401,11 @@ async def test_projection_restores_native_history_and_never_persists_projection(
     )
     assert _dump_messages(messages[:-1]) == native_before
     assert messages[-1] is assistant_delta
+    assert assistant_delta.content is delta_content
+    assert delta_content[0] is delta_thinking_part
+    assert delta_content[1] is delta_text_part
+    assert delta_thinking_part.signature is delta_signature
+    assert delta_thinking_part.encrypted_content is delta_encrypted_content
     assert projected_text not in _dump_messages(messages).decode("utf-8")
 
     bridge = plugin._bridge
@@ -366,17 +451,22 @@ async def test_projection_restores_native_history_and_never_persists_projection(
         )
 
 
+@pytest.mark.parametrize(
+    ("part_type", "expected_code"),
+    [
+        ("text", "PROJECTION_BUILD_FAILED"),
+        ("thinking", "PROJECTION_API_UNAVAILABLE"),
+    ],
+)
 @pytest.mark.asyncio
-async def test_missing_projection_capability_fails_open_after_user_capture(
+async def test_unsupported_hook_projection_surface_fails_open_after_user_capture(
     monkeypatch: pytest.MonkeyPatch,
     plugin_cleanup: list[TerminablePlugin],
     tmp_path: Path,
+    part_type: str,
+    expected_code: str,
 ) -> None:
-    module, _logger = _load_main(
-        monkeypatch,
-        tmp_path,
-        projection_capability=False,
-    )
+    module, _logger = _load_main(monkeypatch, tmp_path)
     plugin = module.AstrContinuumPlugin(
         object(),
         {
@@ -396,22 +486,40 @@ async def test_missing_projection_capability_fails_open_after_user_capture(
 
     event = FakeEvent("message-current")
     request = _request("fresh user", token_usage=60_000)
+    original_conversation = request.conversation
     await plugin.on_llm_request(event, request)
     state = next(iter(event._extras.values()))
-    messages = [
-        FakeMessage(role="system", content="system"),
-        FakeMessage(role="user", content="old user"),
-        FakeMessage(role="assistant", content="old assistant"),
-        FakeMessage(role="user", content="fresh user"),
-    ]
+    signature = object()
+
+    class UnsupportedTextPart:
+        def __init__(self, *, text: str) -> None:
+            self.type = part_type
+            self.text = text
+            self.signature = signature
+
+    system = FakeMessage(role="system", content="system")
+    history_user = FakeMessage(role="user", content="old user")
+    history_assistant = FakeMessage(role="assistant", content="old assistant")
+    current_part = UnsupportedTextPart(text="fresh user")
+    current_content = [current_part]
+    current = FakeMessage(role="user", content=current_content)
+    messages = [system, history_user, history_assistant, current]
+    message_list = messages
+    original_objects = tuple(messages)
     run_context = SimpleNamespace(messages=messages)
 
     await plugin.on_agent_begin_guard(event, run_context)
     await plugin.on_agent_begin_project(event, run_context)
 
-    assert messages == [messages[0], messages[-1]]
-    assert state.projected is not None
-    assert state.faults[-1].code == "PROJECTION_API_UNAVAILABLE"
+    assert messages is message_list
+    assert tuple(messages) == original_objects
+    assert all(actual is expected for actual, expected in zip(messages, original_objects))
+    assert current.content is current_content
+    assert current_content[0] is current_part
+    assert current_part.signature is signature
+    assert request.conversation is original_conversation
+    assert state.projected is None
+    assert state.faults[-1].code == expected_code
     bridge = plugin._bridge
     assert bridge is not None
     with bridge.repository.factory.connection(read_only=True) as connection:

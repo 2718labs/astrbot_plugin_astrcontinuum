@@ -4,17 +4,27 @@ import asyncio
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
+from typing import Protocol
 
 from ..context_graph.candidate_verification import (
     CandidateVerificationError,
     verify_candidate,
 )
-from ..domain import CompactionJobEnvelope, CompactionJobState
+from ..domain import CompactionJobEnvelope, CompactionJobState, SessionKey
 from ..runtime.types import TokenCounter
-from ..storage import SQLiteRepository, StaleLeaseError, StorageSecurityError
+from ..storage import (
+    ArtifactKind,
+    SQLiteRepository,
+    StaleLeaseError,
+    StorageSecurityError,
+    TokenMetric,
+)
 from .auditor import audit_semantic
 from .compiler import compile_candidate
+from .rendering import render_capsule
 from .types import (
+    AuditedCandidate,
+    CompactionProviderBinding,
     CompilerBackend,
     CompilerBackendDeferred,
     CompilerInvariantError,
@@ -25,6 +35,11 @@ from .types import (
 
 Clock = Callable[[], datetime]
 FatalStorageCallback = Callable[[StorageSecurityError], Awaitable[None]]
+_MIN_SQLITE_LEASE_HORIZON_SECONDS = 1.0
+
+
+class ProviderBindingSource(Protocol):
+    def resolve(self, session_key: SessionKey) -> CompactionProviderBinding: ...
 
 
 def _utc_now() -> datetime:
@@ -40,6 +55,7 @@ class CompactionWorkerConfig:
     retry_max_seconds: float = 300.0
     max_attempts: int = 3
     strict_audit: bool = False
+    metric_backfill_limit: int = 32
     segmenter_config: SegmenterConfig = field(default_factory=SegmenterConfig)
 
     def __post_init__(self) -> None:
@@ -70,6 +86,12 @@ class CompactionWorkerConfig:
             raise ValueError("max_attempts must be a positive integer")
         if type(self.strict_audit) is not bool:
             raise ValueError("strict_audit must be a boolean")
+        if (
+            isinstance(self.metric_backfill_limit, bool)
+            or not isinstance(self.metric_backfill_limit, int)
+            or not 1 <= self.metric_backfill_limit <= 1024
+        ):
+            raise ValueError("metric_backfill_limit must be between 1 and 1024")
 
 
 class CompactionWorker:
@@ -80,23 +102,39 @@ class CompactionWorker:
         *,
         repository: SQLiteRepository,
         backend: CompilerBackend,
-        counter: TokenCounter,
+        canonical_counter: TokenCounter | None,
+        canonical_profile_id: str,
         worker_id: str,
         config: CompactionWorkerConfig,
         semantic_backend: SemanticAuditBackend | None = None,
         clock: Clock = _utc_now,
         fatal_storage_callback: FatalStorageCallback | None = None,
+        compatibility_counter: TokenCounter | None = None,
+        counter: TokenCounter | None = None,
+        provider_bindings: ProviderBindingSource | None = None,
     ) -> None:
         if not worker_id.strip():
             raise ValueError("worker_id must be non-empty")
+        if not isinstance(canonical_profile_id, str) or not canonical_profile_id.strip():
+            raise ValueError("canonical_profile_id must be non-empty")
+        if compatibility_counter is not None and counter is not None:
+            raise TypeError("provide only compatibility_counter")
+        resolved_compatibility_counter = (
+            compatibility_counter if compatibility_counter is not None else counter
+        )
+        if resolved_compatibility_counter is None:
+            raise TypeError("compatibility_counter must be provided")
         self._repository = repository
         self._backend = backend
-        self._counter = counter
+        self._compatibility_counter = resolved_compatibility_counter
+        self._canonical_counter = canonical_counter
+        self._canonical_profile_id = canonical_profile_id
         self._worker_id = worker_id
         self._config = config
         self._semantic_backend = semantic_backend
         self._clock = clock
         self._fatal_storage_callback = fatal_storage_callback
+        self._provider_bindings = provider_bindings
         self._wake_event = asyncio.Event()
         self._task: asyncio.Task[None] | None = None
         self._closed = False
@@ -133,12 +171,8 @@ class CompactionWorker:
             self._task = None
 
     async def run_iteration(self) -> bool:
-        now = self._clock()
         leased = await asyncio.to_thread(
-            self._repository.claim_job,
-            worker_id=self._worker_id,
-            now=now,
-            lease_expires_at=now + timedelta(seconds=self._config.lease_seconds),
+            self._claim_job,
         )
         if leased is None:
             return False
@@ -148,10 +182,20 @@ class CompactionWorker:
             name=f"astrcontinuum-lease:{leased.job_id}",
         )
         stage = "LEASED"
+        provider_binding: CompactionProviderBinding | None = None
+        provider_binding_captured = self._provider_bindings is not None
         primary_exception_escaping = False
         try:
             try:
+                if self._provider_bindings is not None:
+                    # No await has occurred since claim returned: freeze before yielding.
+                    try:
+                        provider_binding = self._provider_bindings.resolve(leased.session_key)
+                    except CompilerBackendDeferred as error:
+                        if error.code != "EXTRACTIVE_PROVIDER_UNAVAILABLE":
+                            raise
                 stage = "COMPILING"
+                await self._backfill_metrics(leased.session_key)
                 compiling = await asyncio.to_thread(
                     self._repository.transition_job,
                     job_id=leased.job_id,
@@ -167,14 +211,25 @@ class CompactionWorker:
                     lease_epoch=compiling.lease_epoch,
                     now=self._clock(),
                 )
+                event_token_counts = await asyncio.to_thread(
+                    self._repository.read_event_token_counts,
+                    view.session_key,
+                    tuple(event.event_id for event in view.delta),
+                    profile_id=self._canonical_profile_id,
+                )
+                if set(event_token_counts) != {event.event_id for event in view.delta}:
+                    raise CompilerBackendDeferred("TOKEN_METRIC_MISSING")
                 candidate = await compile_candidate(
                     base_snapshot=view.snapshot,
                     base_capsules=view.capsules,
                     source_events=view.delta,
+                    event_token_counts=event_token_counts,
                     target_high_water_mark=compiling.target_high_water_mark,
                     token_ceiling=self._config.token_ceiling,
                     backend=self._backend,
-                    counter=self._counter,
+                    compatibility_counter=self._compatibility_counter,
+                    provider_binding=provider_binding,
+                    provider_binding_captured=provider_binding_captured,
                     now=self._clock(),
                     segmenter_config=self._config.segmenter_config,
                 )
@@ -197,6 +252,10 @@ class CompactionWorker:
 
                 stage = "VERIFYING"
                 await asyncio.to_thread(verify_candidate, audited)
+                canonical_metrics = await asyncio.to_thread(
+                    self._candidate_canonical_metrics,
+                    audited,
+                )
 
                 stage = "READY_TO_COMMIT"
                 ready = await asyncio.to_thread(
@@ -216,6 +275,7 @@ class CompactionWorker:
                     lease_epoch=ready.lease_epoch,
                     candidate_snapshot=audited.snapshot,
                     memberships=audited.memberships,
+                    canonical_metrics=canonical_metrics,
                     token_ceiling=self._config.token_ceiling,
                     now=self._clock(),
                 )
@@ -259,23 +319,113 @@ class CompactionWorker:
                 error_code=error.code,
                 error_message=error.code,
                 retry_at=self._clock() + timedelta(seconds=self._config.retry_base_seconds),
+                preserve_attempt=error.code
+                in {
+                    "EXTRACTIVE_PROVIDER_UNAVAILABLE",
+                    "TOKEN_METRIC_MISSING",
+                    "TOKEN_METRIC_UNAVAILABLE",
+                },
             )
         except StaleLeaseError:
             return
 
+    async def _backfill_metrics(self, session_key: SessionKey) -> None:
+        if self._canonical_counter is None:
+            raise CompilerBackendDeferred("TOKEN_METRIC_UNAVAILABLE")
+        batch = await asyncio.to_thread(
+            self._repository.read_metric_backfill_batch,
+            session_key,
+            profile_id=self._canonical_profile_id,
+            limit=self._config.metric_backfill_limit,
+        )
+        metrics = tuple(
+            TokenMetric(
+                artifact_kind=artifact.artifact_kind,
+                artifact_id=artifact.artifact_id,
+                tokenizer_profile_id=self._canonical_profile_id,
+                token_count=self._count_canonical(artifact.text),
+            )
+            for artifact in batch
+        )
+        if metrics:
+            await asyncio.to_thread(
+                self._repository.write_metric_backfill_batch,
+                session_key,
+                metrics,
+                now=self._clock(),
+            )
+
+    def _candidate_canonical_metrics(
+        self,
+        candidate: AuditedCandidate,
+    ) -> tuple[TokenMetric, ...]:
+        memberships = candidate.memberships
+        snapshot = candidate.snapshot
+        return (
+            *(
+                TokenMetric(
+                    artifact_kind=ArtifactKind.CAPSULE,
+                    artifact_id=membership.capsule_id,
+                    tokenizer_profile_id=self._canonical_profile_id,
+                    token_count=self._count_canonical(render_capsule(membership.capsule)),
+                )
+                for membership in memberships
+            ),
+            TokenMetric(
+                artifact_kind=ArtifactKind.SNAPSHOT,
+                artifact_id=snapshot.snapshot_id,
+                tokenizer_profile_id=self._canonical_profile_id,
+                token_count=self._count_canonical(snapshot.rendered_context),
+            ),
+        )
+
+    def _count_canonical(self, text: str) -> int:
+        counter = self._canonical_counter
+        if counter is None:
+            raise CompilerBackendDeferred("TOKEN_METRIC_UNAVAILABLE")
+        try:
+            count = counter.count_text(text)
+        except Exception:  # noqa: BLE001 - stable deferral hides adapter details
+            raise CompilerBackendDeferred("TOKEN_METRIC_UNAVAILABLE") from None
+        if isinstance(count, bool) or not isinstance(count, int) or count < 0:
+            raise CompilerBackendDeferred("TOKEN_METRIC_UNAVAILABLE")
+        return count
+
     async def _renew_lease(self, leased: CompactionJobEnvelope) -> None:
         interval = max(self._config.lease_seconds / 3.0, 0.01)
         while True:
-            await asyncio.sleep(interval)
-            now = self._clock()
             await asyncio.to_thread(
-                self._repository.renew_job_lease,
-                job_id=leased.job_id,
-                owner=self._worker_id,
-                lease_epoch=leased.lease_epoch,
-                now=now,
-                lease_expires_at=now + timedelta(seconds=self._config.lease_seconds),
+                self._renew_job_lease,
+                leased,
             )
+            await asyncio.sleep(interval)
+
+    def _claim_job(self) -> CompactionJobEnvelope | None:
+        now = self._clock()
+        return self._repository.claim_job(
+            worker_id=self._worker_id,
+            now=now,
+            lease_expires_at=now + timedelta(seconds=self._lease_horizon_seconds()),
+        )
+
+    def _renew_job_lease(self, leased: CompactionJobEnvelope) -> None:
+        now = self._clock()
+        self._repository.renew_job_lease(
+            job_id=leased.job_id,
+            owner=self._worker_id,
+            lease_epoch=leased.lease_epoch,
+            now=now,
+            lease_expires_at=now + timedelta(seconds=self._lease_horizon_seconds()),
+        )
+
+    def _lease_horizon_seconds(self) -> float:
+        # Sub-second absolute expiries can elapse while an IMMEDIATE SQLite
+        # transaction waits for its write lock. Keep production-sized leases
+        # unchanged while giving deliberately tiny leases a bounded horizon.
+        return max(
+            self._config.lease_seconds,
+            _MIN_SQLITE_LEASE_HORIZON_SECONDS,
+        )
 
     async def _persist_failure(
         self,

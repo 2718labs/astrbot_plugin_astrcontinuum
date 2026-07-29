@@ -4,7 +4,6 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
-from ..domain import EventType
 from ..runtime.types import CandidateBlock, CandidateKind
 
 
@@ -17,16 +16,6 @@ class DependencyClosure:
     blocks: tuple[CandidateBlock, ...]
 
 
-def _tool_coordinate(block: CandidateBlock) -> tuple[EventType, str] | None:
-    if (
-        block.kind is not CandidateKind.RAW_EVENT
-        or block.event_type not in {EventType.TOOL_CALL, EventType.TOOL_RESULT}
-        or block.tool_name is None
-    ):
-        return None
-    return block.event_type, block.tool_name
-
-
 def _companions(left: CandidateBlock, right: CandidateBlock) -> bool:
     dependency_pair = (
         left.kind is CandidateKind.DEPENDENCY or right.kind is CandidateKind.DEPENDENCY
@@ -36,16 +25,46 @@ def _companions(left: CandidateBlock, right: CandidateBlock) -> bool:
             return True
         if set(left.source_event_ids) & set(right.source_event_ids):
             return True
-    left_tool = _tool_coordinate(left)
-    right_tool = _tool_coordinate(right)
-    if left_tool is None or right_tool is None or left_tool[1] != right_tool[1]:
-        return False
-    call, result = (left, right) if left_tool[0] is EventType.TOOL_CALL else (right, left)
-    return (
-        call.event_type is EventType.TOOL_CALL
-        and result.event_type is EventType.TOOL_RESULT
-        and call.event_sequence is not None
-        and result.event_sequence == call.event_sequence + 1
+    return False
+
+
+def dependency_groups(
+    candidates: tuple[CandidateBlock, ...],
+) -> tuple[tuple[CandidateBlock, ...], ...]:
+    """Return deterministic structural connected components."""
+
+    if not isinstance(candidates, tuple) or any(
+        not isinstance(item, CandidateBlock) for item in candidates
+    ):
+        raise TypeError("candidates must be a tuple of CandidateBlock values")
+    if len({item.block_id for item in candidates}) != len(candidates):
+        raise ClosureError("DEPENDENCY_GROUP_DUPLICATE_BLOCK")
+
+    groups: list[tuple[CandidateBlock, ...]] = []
+    remaining = set(range(len(candidates)))
+    while remaining:
+        pending = [min(remaining)]
+        component_indexes: set[int] = set()
+        while pending:
+            index = pending.pop()
+            if index in component_indexes:
+                continue
+            component_indexes.add(index)
+            remaining.discard(index)
+            for other in tuple(remaining):
+                if _companions(candidates[index], candidates[other]):
+                    pending.append(other)
+        groups.append(tuple(candidates[index] for index in sorted(component_indexes)))
+    return tuple(groups)
+
+
+def removable_dependency_groups(
+    candidates: tuple[CandidateBlock, ...],
+) -> tuple[tuple[CandidateBlock, ...], ...]:
+    """Return all-optional structural components that can be removed atomically."""
+
+    return tuple(
+        group for group in dependency_groups(candidates) if not any(item.required for item in group)
     )
 
 

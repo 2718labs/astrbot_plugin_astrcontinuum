@@ -1,7 +1,9 @@
 from __future__ import annotations
 
-from dataclasses import dataclass
+from collections.abc import Mapping
+from dataclasses import dataclass, field
 from enum import Enum
+from types import MappingProxyType
 from typing import Protocol
 
 from ..domain.capsules import ContextCapsuleEnvelope
@@ -9,6 +11,7 @@ from ..domain.events import EventEnvelope
 from ..domain.snapshots import SnapshotEnvelope
 from ..domain.validation import PermanentValidationReport
 from ..storage.repository import SnapshotCapsuleMembership
+from ..tokenization import ContextLimitSource, TokenizerMode
 
 
 class SegmentBoundaryReason(str, Enum):
@@ -88,6 +91,52 @@ class CompilerBackendDeferred(RuntimeError):
         super().__init__(self.code)
 
 
+@dataclass(frozen=True, slots=True, repr=False)
+class CompactionProviderBinding:
+    """One content-hidden Provider snapshot used by a single compaction run."""
+
+    provider_id: str = field(repr=False)
+    model_identity: str | None = field(repr=False)
+    context_limit: int
+    context_limit_source: ContextLimitSource
+
+    def __post_init__(self) -> None:
+        if not isinstance(self.provider_id, str) or not self.provider_id.strip():
+            raise ValueError("provider_id must be non-empty")
+        if self.model_identity is not None and not isinstance(self.model_identity, str):
+            raise TypeError("model_identity must be a string or None")
+        if (
+            isinstance(self.context_limit, bool)
+            or not isinstance(self.context_limit, int)
+            or self.context_limit < 1
+        ):
+            raise ValueError("context_limit must be a positive integer")
+        if not isinstance(self.context_limit_source, ContextLimitSource):
+            raise TypeError("context_limit_source must be a ContextLimitSource")
+
+
+@dataclass(frozen=True, slots=True)
+class CompactionFitProvenance:
+    """Content-free provenance for the all-segment preflight decision."""
+
+    tokenizer_profile_id: str
+    tokenizer_mode: str
+    fallback_code: str
+    primary_result_discarded: bool
+
+    def __post_init__(self) -> None:
+        for name in ("tokenizer_profile_id", "tokenizer_mode", "fallback_code"):
+            value = getattr(self, name)
+            if not isinstance(value, str) or not value:
+                raise ValueError(f"{name} must be non-empty")
+        try:
+            TokenizerMode(self.tokenizer_mode)
+        except ValueError:
+            raise ValueError("tokenizer_mode must be a stable TokenizerMode value") from None
+        if type(self.primary_result_discarded) is not bool:
+            raise TypeError("primary_result_discarded must be a boolean")
+
+
 @dataclass(frozen=True, slots=True)
 class CompilationRequest:
     base_snapshot: SnapshotEnvelope | None
@@ -96,12 +145,47 @@ class CompilationRequest:
     segments: tuple[EventSegment, ...]
     target_high_water_mark: int
     token_ceiling: int
+    canonical_event_token_counts: Mapping[str, int] = field(
+        default_factory=dict,
+        repr=False,
+    )
+    provider_binding: CompactionProviderBinding | None = field(
+        default=None,
+        repr=False,
+    )
+    provider_binding_captured: bool = False
+
+    def __post_init__(self) -> None:
+        counts = dict(self.canonical_event_token_counts)
+        if any(
+            not isinstance(event_id, str)
+            or not event_id
+            or isinstance(count, bool)
+            or not isinstance(count, int)
+            or count < 0
+            for event_id, count in counts.items()
+        ):
+            raise ValueError("canonical_event_token_counts must contain non-negative integers")
+        object.__setattr__(
+            self,
+            "canonical_event_token_counts",
+            MappingProxyType(counts),
+        )
+        if self.provider_binding is not None and not isinstance(
+            self.provider_binding,
+            CompactionProviderBinding,
+        ):
+            raise TypeError("provider_binding must be a CompactionProviderBinding or None")
+        if type(self.provider_binding_captured) is not bool:
+            raise TypeError("provider_binding_captured must be a boolean")
 
 
 @dataclass(frozen=True, slots=True)
 class CompilerOutput:
     capsules: tuple[ContextCapsuleEnvelope, ...]
     rendered_context: str
+    fitted_segments: tuple[EventSegment, ...] | None = None
+    fit_provenance: CompactionFitProvenance | None = None
 
 
 class CompilerBackend(Protocol):
@@ -114,6 +198,7 @@ class CompilationCandidate:
     memberships: tuple[SnapshotCapsuleMembership, ...]
     segments: tuple[EventSegment, ...]
     permanent_report: PermanentValidationReport
+    fit_provenance: CompactionFitProvenance | None = None
 
 
 @dataclass(frozen=True, slots=True)

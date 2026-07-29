@@ -3,7 +3,7 @@
 English | [简体中文](./ASTRBOT_INTEGRATION.zh-CN.md)
 
 This document defines the boundary between AstrContinuum and AstrBot at repository version
-`v0.1.0`. It is a runtime contract, not a list of intended APIs. Any change to hook ownership,
+`v0.2.1`. It is a runtime contract, not a list of intended APIs. Any change to hook ownership,
 priority, message projection, request identity, or plugin lifecycle must update this document
 and include a real `PluginManager` compatibility probe.
 
@@ -15,6 +15,7 @@ and include a real `PluginManager` compatibility probe.
 - idempotent SQLite migration and repository construction;
 - the AstrBot hook bridge;
 - request-scoped state stored on the event object;
+- public Provider metadata resolution and one immutable request-local tokenizer profile;
 - bounded request assembly and temporary projection;
 - final restoration verification and compaction-intent persistence;
 - current-provider affinity and the AstrBot extractive generator adapter;
@@ -35,9 +36,8 @@ The committed plugin archive has been loaded through official AstrBot distributi
 
 | AstrBot | Python | Verification |
 | --- | --- | --- |
-| `4.24.0` | `3.12.13` | PluginManager lifecycle, registry priorities, projection, restoration, Journal ordering, termination |
-| `4.24.2` | `3.12.13` | Same full probe |
-| `4.26.7` | `3.12.13` | Same full probe |
+| `4.24.0` | `3.12.13` | Star load, eight hooks, real Provider/ProviderRequest metadata, offline count, zero LLM calls |
+| `4.26.7` | `3.12.13` | Same release probe |
 
 AstrBot `4.24.0` emits an upstream fallback warning for missing `StarMetadata.pages`; this does
 not change AstrContinuum loading or runtime behavior. Compatibility through a sample version is
@@ -59,6 +59,8 @@ Only four hook/event triples may append durable Journal rows:
 
 Deterministic idempotency keys plus SQLite uniqueness constraints make duplicate or concurrent
 callback delivery converge on one event row without consuming another sequence number.
+Although tool callbacks remain separately authoritative, request assembly treats a tool call
+and its corresponding result as one indivisible selection unit.
 
 ## 4. Hook order and ownership
 
@@ -84,6 +86,7 @@ references required only for the active request:
 
 - the original request object;
 - prepared immutable read view;
+- resolved context-limit source and immutable tokenizer/budget profile;
 - projection guard identities;
 - projected/restored views;
 - pressure decision and request-local Conversation copy;
@@ -93,6 +96,12 @@ references required only for the active request:
 
 This state is not a durable source of truth and must not escape into SQLite or logs. A missing
 state causes bounded fail-open behavior.
+
+`on_llm_request` uses the public synchronous `Context.get_using_provider(umo=...)` API and
+public Provider fields to read the active model and positive `max_context_tokens`.
+`model_context_limit=0` accepts matching metadata as `AUTO_ASTRBOT`; missing, invalid, or
+mismatched metadata becomes `AUTO_SAFE_FALLBACK=128000`. A positive configured value is
+`MANUAL`. No Provider call is made to obtain these values.
 
 ## 6. Session identity extraction
 
@@ -141,12 +150,21 @@ Restoration is identity-based:
 Value equality is insufficient. Rebuilding equivalent dictionaries would still violate host
 ownership and can corrupt downstream persistence.
 
+Before projection, the complete source workload is counted under the frozen request profile.
+After assembly, the final complete Provider projection is counted again under the same profile.
+If tokenizer construction or any count fails, AstrContinuum discards all partial counts and
+replays the complete request in `utf8-byte-v1`; it never combines BPE and BYTE units.
+Bundled `cl100k_base` and `o200k_base` assets are loaded offline and do not use a mutable
+download cache.
+
 ## 8. Failure and logging behavior
 
 Compatibility or invariant failure produces a bounded `AdapterFault` containing codes and
 counts, never message content or object representations. The live request remains usable:
 
 - identity extraction failure → no capture or projection for that request;
+- Provider context metadata failure → content-free `AUTO_SAFE_FALLBACK=128000`;
+- tokenizer failure → discard partial results and recount the complete request in BYTE mode;
 - missing projection capability below hard pressure → durable capture continues with native
   context;
 - assembly/projection-object failure at hard pressure → bounded empty Provider View;
@@ -161,8 +179,8 @@ then starts one tracked worker. The finalizer raises and wakes durable compactio
 when pressure requires it. Termination cancels and awaits the worker before clearing services.
 
 The remaining integration limitation is the optional provider-backed semantic-audit adapter.
-Mandatory exact-span validation, mechanical validation, fencing, and atomic publication are
-active.
+Mandatory exact-span validation, mechanical validation, fencing, atomic publication, offline
+token profiles, and canonical metric sidecars are active.
 
 ## 10. Change checklist
 
@@ -171,9 +189,9 @@ For every integration change:
 1. inspect the target AstrBot source/signatures rather than relying on remembered APIs;
 2. update adapter capability probes before using a private host field;
 3. run unit and SQLite integration tests;
-4. load the committed archive through a real AstrBot `PluginManager`;
-5. assert handler count, hook names, priorities, initialization, request behavior, and
-   termination;
+4. run `scripts/probe_astrbot.py` against AstrBot `4.24.0` and `4.26.7`;
+5. assert the eight handlers, public Provider/ProviderRequest metadata path, offline counting,
+   and zero LLM requests;
 6. exercise at least the declared lower bound and newest verified sample for compatibility
    claims;
 7. update both language versions of this document and the test matrix.

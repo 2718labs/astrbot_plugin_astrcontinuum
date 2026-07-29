@@ -5,9 +5,12 @@ from .astrbot_backend import (
 )
 from .auditor import audit_semantic
 from .compiler import compile_candidate
+from .rendering import render_capsule
 from .segmenter import segment
 from .types import (
     AuditedCandidate,
+    CompactionFitProvenance,
+    CompactionProviderBinding,
     CompilationCandidate,
     CompilationRequest,
     CompilerBackend,
@@ -30,6 +33,8 @@ from .worker import CompactionWorker, CompactionWorkerConfig
 __all__ = [
     "AstrBotExtractiveCompilerBackend",
     "AuditedCandidate",
+    "CompactionFitProvenance",
+    "CompactionProviderBinding",
     "CompactionWorker",
     "CompactionWorkerConfig",
     "CompilationCandidate",
@@ -51,6 +56,7 @@ __all__ = [
     "SessionProviderRegistry",
     "audit_semantic",
     "compile_candidate",
+    "render_capsule",
     "segment",
     "validate_candidate",
 ]

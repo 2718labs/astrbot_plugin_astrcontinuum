@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 
 import astrcontinuum as ac
+from astrcontinuum.storage import migrations as migrations_module
 
 SESSION_HASH = "a" * 64
 NOW = "2026-07-26T00:00:00Z"
@@ -344,6 +345,111 @@ def test_initial_migration_creates_complete_versioned_schema(tmp_path: Path) -> 
     assert user_version == 1
 
 
+def test_packaged_format_two_migration_is_keyed_and_ordinary_runner_stops_at_v1(
+    tmp_path: Path,
+) -> None:
+    migrations, _, _, migrator_type = _migration_api()
+    factory = ac.SQLiteConnectionFactory(tmp_path)
+
+    assert [(migration.version, migration.name) for migration in migrations] == [
+        (1, "initial_schema"),
+        (2, "encrypted_token_metrics"),
+    ]
+    assert [migration.requires_codec for migration in migrations] == [False, True]
+    assert migrations[1].sql == migrations_module.SECURE_FORMAT_V2_CONTRACT_SQL
+    assert "CREATE TABLE token_metrics" in migrations[1].sql
+    assert "CREATE TABLE token_metric_backfill_intents" in migrations[1].sql
+    assert "CREATE INDEX idx_token_metric_backfill_session" in migrations[1].sql
+
+    assert migrator_type(factory).migrate() == 1
+    with factory.connection(read_only=True) as connection:
+        ledger = [
+            tuple(row)
+            for row in connection.execute(
+                "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
+            )
+        ]
+        user_version = connection.execute("PRAGMA user_version").fetchone()[0]
+        sidecars = connection.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table'
+              AND name IN ('token_metrics', 'token_metric_backfill_intents')
+            """
+        ).fetchall()
+
+    assert ledger == [(1, "initial_schema", migrations[0].checksum)]
+    assert user_version == 1
+    assert sidecars == []
+
+
+def test_ordinary_runner_validates_an_already_durable_keyed_ledger(
+    tmp_path: Path,
+) -> None:
+    migrations, _, _, migrator_type = _migration_api()
+    factory = _migrated_factory(tmp_path)
+    with factory.transaction(immediate=True) as connection:
+        connection.execute(
+            """
+            INSERT INTO schema_migrations (version, name, checksum, applied_at)
+            VALUES (?, ?, ?, ?)
+            """,
+            (2, migrations[1].name, migrations[1].checksum, NOW),
+        )
+        connection.execute("PRAGMA user_version = 2")
+
+    assert migrator_type(factory).migrate() == 2
+
+
+def test_exact_v020_migration_name_alias_is_accepted_without_rewriting_history(
+    tmp_path: Path,
+) -> None:
+    migrations, _, _, migrator_type = _migration_api()
+    factory = _migrated_factory(tmp_path)
+    with factory.transaction(immediate=True) as connection:
+        connection.execute("DROP TRIGGER schema_migrations_immutable_update")
+        connection.execute(
+            "UPDATE schema_migrations SET name = 'initial_v1_schema' WHERE version = 1"
+        )
+
+    assert migrator_type(factory).migrate() == 1
+    with factory.connection(read_only=True) as connection:
+        row = connection.execute(
+            "SELECT name, checksum FROM schema_migrations WHERE version = 1"
+        ).fetchone()
+    assert tuple(row) == ("initial_v1_schema", migrations[0].checksum)
+
+
+@pytest.mark.parametrize(
+    ("legacy_name", "checksum"),
+    [
+        ("initial_v1_schema", "0" * 64),
+        ("initial_schema_alias", None),
+    ],
+)
+def test_v1_migration_alias_rejects_wrong_checksum_or_other_names(
+    tmp_path: Path,
+    legacy_name: str,
+    checksum: str | None,
+) -> None:
+    migrations, _, checksum_error, migrator_type = _migration_api()
+    factory = _migrated_factory(tmp_path)
+    with factory.transaction(immediate=True) as connection:
+        connection.execute("DROP TRIGGER schema_migrations_immutable_update")
+        connection.execute(
+            """
+            UPDATE schema_migrations
+            SET name = ?, checksum = ?
+            WHERE version = 1
+            """,
+            (legacy_name, migrations[0].checksum if checksum is None else checksum),
+        )
+
+    with pytest.raises(checksum_error):
+        migrator_type(factory).migrate()
+
+
 def test_text_primary_identity_columns_are_explicitly_not_null(tmp_path: Path) -> None:
     factory = _migrated_factory(tmp_path)
     identity_columns = {
@@ -621,7 +727,7 @@ def test_failed_migration_rolls_back_its_ddl_and_ledger_entry(tmp_path: Path) ->
     )
 
     with pytest.raises(ac.MigrationError, match="migration 2"):
-        migrator_type(factory, migrations=(*migrations, broken)).migrate()
+        migrator_type(factory, migrations=(migrations[0], broken)).migrate()
 
     with factory.connection(read_only=True) as connection:
         versions = [
@@ -664,7 +770,7 @@ def test_sql_splitter_preserves_semicolons_and_trailing_comments(tmp_path: Path)
         """,
     )
 
-    assert migrator_type(factory, migrations=(*migrations, syntax_edges)).migrate() == 2
+    assert migrator_type(factory, migrations=(migrations[0], syntax_edges)).migrate() == 2
 
     with factory.connection(read_only=True) as connection:
         values = [

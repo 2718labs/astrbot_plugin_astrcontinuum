@@ -2,7 +2,7 @@ name: astrbot_plugin_astrcontinuum
 display_name: AstrContinuum
 desc: "Pressure-triggered encrypted context runtime for AstrBot with verified fallback."
 short_desc: "Encrypted Journal, verified request-local context, and reversible Provider View."
-version: v0.2.0
+version: v0.2.1
 author: Ayleovelle
 license: AGPL-3.0-or-later
 repo: https://github.com/2718labs/astrbot_plugin_astrcontinuum

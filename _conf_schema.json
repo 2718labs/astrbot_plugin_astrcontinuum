@@ -6,6 +6,13 @@
     "type": "bool",
     "default": true
   },
+  "thinking_compat_openai_provider_ids": {
+    "description": "额外 OpenAI 兼容 Provider ID（高级）",
+    "hint": "仅填写已确认使用 OpenAI Chat Completions 协议的第三方 Provider ID。仅当实际模型名为 Claude 时，AstrContinuum 才会为本次出站调用构造临时兼容副本，不会改写历史；原生 Anthropic/Gemini Provider 不适用。",
+    "obvious_hint": true,
+    "type": "list",
+    "default": []
+  },
   "context_engine_mode": {
     "description": "上下文引擎运行方式",
     "hint": "主动模式只会在结果通过完整校验后替换确定性回退结果；影子模式会计算并记录无内容指标，但实际仍发送确定性回退结果；关闭模式完全不运行图引擎，只使用确定性路径。管理员可用 /context_status 查看当前模式和最近结果，用 /context_inspect 查看当前会话的无内容归约证据。",
@@ -24,58 +31,64 @@
     "default": "active"
   },
   "encryption_key_source": {
-    "description": "数据库加密密钥的保存位置",
-    "hint": "选择插件启动时从哪里读取数据库加密密钥。默认“环境变量”要求在启动 AstrBot 前设置 ASTRCONTINUUM_MASTER_KEY；未设置时 AstrContinuum 会保持锁定，不读写数据库，AstrBot 原生聊天仍可继续。不要把密钥粘贴到 WebUI、聊天、日志或命令行参数。只有个人试玩且能接受密钥与数据库处于同一目录边界时，才选择“本机便捷模式”。",
+    "description": "数据库加密密钥管理方式",
+    "hint": "新安装默认由服务器在 AstrBot 持久 data 卷的插件数据目录中自动生成并复用密钥，不需要在 WebUI 中配置密钥正文。这样能防止单独泄漏数据库文件后被直接解密，但整个 data 卷泄漏不受此模式保护。需要让密钥与 data 卷高隔离时，可通过外部密钥管理系统注入 ASTRCONTINUUM_MASTER_KEY 环境变量，也可填写外部密钥文件绝对路径。不要把密钥粘贴到 WebUI、聊天、日志或命令行参数。",
     "obvious_hint": true,
     "type": "string",
     "options": [
-      "environment",
+      "local",
       "file",
-      "local"
+      "environment"
     ],
     "labels": [
-      "环境变量（推荐）",
-      "外部密钥文件",
-      "本机便捷模式（较弱）"
+      "自动管理（推荐）",
+      "服务器密钥文件（高级）",
+      "环境变量（高级）"
     ],
-    "default": "environment"
+    "default": "local"
   },
   "encryption_key_file": {
-    "description": "当前加密密钥文件（仅外部文件模式）",
-    "hint": "这里只选择服务器上已经准备好的密钥文件，不要粘贴密钥内容。请先停止 AstrBot，再运行 python -m astrcontinuum.keyctl generate --output <外部密钥文件>；文件必须位于插件数据目录之外。使用环境变量或本机便捷模式时保持为空。",
+    "description": "当前加密密钥文件的绝对路径（仅外部文件模式）",
+    "hint": "填写服务器内可读的当前密钥文件绝对路径，不要粘贴密钥内容。请先停止 AstrBot，再运行 python -m astrcontinuum.keyctl generate --output <外部密钥文件绝对路径>；文件必须位于插件数据目录之外。使用环境变量或自动管理模式时保持为空。",
     "obvious_hint": true,
-    "type": "file",
+    "type": "string",
+    "condition": {
+      "encryption_key_source": "file"
+    },
     "default": ""
   },
   "encryption_previous_key_file": {
-    "description": "旧加密密钥文件（仅换钥时）",
-    "hint": "换钥时先停止 AstrBot：把新密钥设为当前密钥，把仍能解锁数据库的旧密钥文件选在这里，然后启动或重载。确认 /context_status 显示数据保护为 ACTIVE、新密钥标识已生效且维护完成后，清空旧密钥文件并再次重载。环境变量模式对应 ASTRCONTINUUM_PREVIOUS_KEY。不要在 WebUI、聊天、日志或命令参数中粘贴任何密钥。",
+    "description": "旧加密密钥文件的绝对路径（仅换钥时）",
+    "hint": "换钥时先停止 AstrBot：把新密钥设为当前密钥，并在这里填写服务器内可读、仍能解锁数据库的旧密钥文件绝对路径，然后启动或重载。确认 /context_status 显示数据保护为 ACTIVE、新密钥标识已生效且维护完成后，清空旧密钥文件路径并再次重载。环境变量模式对应 ASTRCONTINUUM_PREVIOUS_KEY。不要在 WebUI、聊天、日志或命令参数中粘贴任何密钥。",
     "obvious_hint": true,
-    "type": "file",
+    "type": "string",
+    "condition": {
+      "encryption_key_source": "file"
+    },
     "default": ""
   },
   "model_context_limit": {
-    "description": "主模型的上下文窗口",
-    "hint": "填写模型标称的最大上下文 Token。拿不到 Provider usage 时，插件会用 UTF-8 字节保守估算，因此中文会更早触发保护。",
+    "description": "主模型上下文窗口（0 为自动）",
+    "hint": "保持 0 即可通过 AstrBot 公共模型元数据自动识别；信息不可用时保守使用上限 128000 Token。通常无需修改，可用 /context_status 查看实际窗口与来源。",
     "obvious_hint": true,
     "type": "int",
-    "default": 200000
+    "default": 0
   },
   "target_input_budget": {
     "description": "归约后希望保留的输入量",
-    "hint": "Checkpoint、近期原文和精确证据会优先装进这个预算。通常保持默认即可。",
+    "hint": "Checkpoint、近期原文和精确证据会优先装进这个预算。通常无需修改。",
     "type": "int",
     "default": 130000
   },
   "hard_input_ceiling": {
     "description": "归约后输入的安全上限",
-    "hint": "受控请求视图不会主动超过这个值；必须小于主模型上下文窗口，并为回复和工具调用留出空间。",
+    "hint": "受控请求视图不会主动超过这个值，并会为回复和工具留出空间。通常无需修改。",
     "type": "int",
     "default": 150000
   },
   "compaction_start_ratio": {
     "description": "提前生成 Checkpoint 的时机",
-    "hint": "上下文预计占满可用窗口的 75% 时，在后台开始归约。聊天不会等待后台任务。",
+    "hint": "上下文预计占满可用窗口的 75% 时，在后台开始归约。聊天不会等待，通常无需修改。",
     "type": "float",
     "default": 0.75,
     "slider": {
@@ -86,7 +99,7 @@
   },
   "provider_view_switch_ratio": {
     "description": "切换到受控请求视图的时机",
-    "hint": "上下文预计占满可用窗口的 80% 时，改用 Checkpoint + 近期原文 + 精确证据发送请求。应略高于“提前生成 Checkpoint”的比例。",
+    "hint": "上下文预计占满可用窗口的 80% 时，改用受控请求视图。通常无需修改。",
     "type": "float",
     "default": 0.8,
     "slider": {
@@ -97,7 +110,7 @@
   },
   "compaction_provider_id": {
     "description": "后台归约模型（留空则跟随当前对话模型）",
-    "hint": "可选择 MiniMax 等小模型。归约模型只能返回原文事件编号和逐字引文，不能自由转述。若选择与对话不同的 Provider，对话片段会发送给该 Provider；请确认其数据与隐私策略。",
+    "hint": "留空会自动跟随当前对话模型。想节省成本时，再选择 MiniMax 等小模型；选择其他模型会发送归约内容，请先确认其数据与隐私策略。",
     "obvious_hint": true,
     "type": "string",
     "default": "",

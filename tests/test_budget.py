@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 import inspect
-from dataclasses import FrozenInstanceError
+from dataclasses import FrozenInstanceError, replace
 from typing import Any
 
 import pytest
@@ -251,12 +251,29 @@ def test_normal_mode_uses_frozen_priority_deduplicates_and_is_deterministic() ->
     )
 
 
+def test_duplicate_rejection_uses_the_rejected_texts_own_token_cost() -> None:
+    retained = block(
+        "duplicate",
+        runtime.RuntimeSlot.ACTIVE_TASK,
+        "a",
+    )
+    rejected = replace(retained, text="long duplicate")
+
+    result = call_assemble((rejected, retained))
+
+    assert result.projected_text == "a"
+    duplicate_rejection = next(
+        item for item in result.trace.rejections if item.reason == "DUPLICATE_BLOCK_ID"
+    )
+    assert duplicate_rejection.token_cost == len(rejected.text)
+
+
 def test_emergency_uses_latest_raw_suffix_before_later_slots() -> None:
     canonical_surface()
     config = runtime.BudgetConfig(
-        target_input_budget=18,
-        hard_input_ceiling=18,
-        model_context_limit=18,
+        target_input_budget=22,
+        hard_input_ceiling=22,
+        model_context_limit=22,
         reserved_output_and_tools=0,
         safety_margin=0,
     )
@@ -265,22 +282,19 @@ def test_emergency_uses_latest_raw_suffix_before_later_slots() -> None:
         block(
             "raw-1",
             runtime.RuntimeSlot.RAW_DELTA,
-            "1111",
-            required=True,
+            "11111111",
             event_sequence=1,
         ),
         block(
             "raw-2",
             runtime.RuntimeSlot.RAW_DELTA,
             "2222",
-            required=True,
             event_sequence=2,
         ),
         block(
             "raw-3",
             runtime.RuntimeSlot.RAW_DELTA,
             "3333",
-            required=True,
             event_sequence=3,
         ),
         block("anchor", runtime.RuntimeSlot.EXACT_ANCHOR, "AAAA", required=True),
@@ -294,97 +308,69 @@ def test_emergency_uses_latest_raw_suffix_before_later_slots() -> None:
         "goal",
         "raw-2",
         "raw-3",
+        "anchor",
     )
-    assert result.projected_text == "GGGG\n\n2222\n\n3333"
-    assert result.trace.ac_selected_cost == 16
+    assert result.projected_text == "GGGG\n\n2222\n\n3333\n\nAAAA"
+    assert result.trace.ac_selected_cost == 22
     rejected = {item.block_id: item.reason for item in result.trace.rejections}
     assert rejected["raw-1"] == "EMERGENCY_RAW_PREFIX_OMITTED"
-    assert rejected["anchor"] == "EMERGENCY_REQUIRED_NOT_FIT"
     assert rejected["optional"] == "EMERGENCY_OPTIONAL_OMITTED"
     assert result.trace.total_input_cost <= result.trace.b_input
 
 
-def test_emergency_follows_frozen_slot_priority_before_exact_anchor() -> None:
+def test_required_exact_anchor_overflow_is_explicit() -> None:
     canonical_surface()
     config = runtime.BudgetConfig(
-        target_input_budget=10,
-        hard_input_ceiling=10,
-        model_context_limit=10,
+        target_input_budget=9,
+        hard_input_ceiling=9,
+        model_context_limit=9,
         reserved_output_and_tools=0,
         safety_margin=0,
     )
     candidates = (
         block("goal", runtime.RuntimeSlot.ACTIVE_GOAL, "GGGG", required=True),
-        block(
-            "raw-1",
-            runtime.RuntimeSlot.RAW_DELTA,
-            "RRRR",
-            required=True,
-            event_sequence=1,
-        ),
         block("anchor", runtime.RuntimeSlot.EXACT_ANCHOR, "AAAA", required=True),
     )
 
-    result = call_assemble(candidates, config=config)
+    with pytest.raises(runtime.BudgetInvariantError) as caught:
+        call_assemble(candidates, config=config)
 
-    assert result.trace.mode == runtime.AssemblyMode.EMERGENCY_ASSEMBLY
-    assert tuple(item.block_id for item in result.selected_blocks) == (
-        "goal",
-        "raw-1",
-    )
-    assert result.projected_text == "GGGG\n\nRRRR"
-    assert result.trace.ac_selected_cost == 10
-    assert any(
-        item.block_id == "anchor" and item.reason == "EMERGENCY_REQUIRED_NOT_FIT"
-        for item in result.trace.rejections
-    )
+    assert caught.value.code == "REQUIRED_INPUT_EXCEEDS_BUDGET"
 
 
-def test_emergency_budget_never_selects_tool_result_without_its_call() -> None:
+def test_required_tool_round_overflow_is_explicit_and_never_split() -> None:
     config = runtime.BudgetConfig(
-        target_input_budget=1,
-        hard_input_ceiling=1,
-        model_context_limit=1,
+        target_input_budget=6,
+        hard_input_ceiling=6,
+        model_context_limit=6,
         reserved_output_and_tools=0,
         safety_margin=0,
     )
     candidates = (
-        block(
-            "tool-call",
-            runtime.RuntimeSlot.RAW_DELTA,
-            "CALL",
-            required=True,
-            event_sequence=1,
-            event_type=ac.EventType.TOOL_CALL,
-            tool_name="weather",
-        ),
-        block(
-            "tool-result",
-            runtime.RuntimeSlot.RAW_DELTA,
-            "R",
-            required=True,
-            event_sequence=2,
-            event_type=ac.EventType.TOOL_RESULT,
-            tool_name="weather",
+        replace(
+            block(
+                "tool-round",
+                runtime.RuntimeSlot.RAW_DELTA,
+                "CALL\nRESULT\nASSISTANT",
+                required=True,
+                event_sequence=1,
+            ),
+            source_event_ids=("call", "result", "assistant"),
         ),
     )
 
-    result = call_assemble(candidates, config=config)
+    with pytest.raises(runtime.BudgetInvariantError) as captured:
+        call_assemble(candidates, config=config)
 
-    assert result.trace.mode is runtime.AssemblyMode.EMERGENCY_ASSEMBLY
-    assert result.selected_blocks == ()
-    assert {item.block_id for item in result.trace.rejections} == {
-        "tool-call",
-        "tool-result",
-    }
+    assert captured.value.code == "REQUIRED_INPUT_EXCEEDS_BUDGET"
 
 
 @pytest.mark.parametrize("event_type", (ac.EventType.TOOL_CALL, ac.EventType.TOOL_RESULT))
 def test_emergency_budget_omits_unmatched_tool_event(event_type: ac.EventType) -> None:
     config = runtime.BudgetConfig(
-        target_input_budget=1,
-        hard_input_ceiling=1,
-        model_context_limit=1,
+        target_input_budget=4,
+        hard_input_ceiling=4,
+        model_context_limit=4,
         reserved_output_and_tools=0,
         safety_margin=0,
     )
@@ -402,10 +388,10 @@ def test_emergency_budget_omits_unmatched_tool_event(event_type: ac.EventType) -
         ),
     )
 
-    result = call_assemble(candidates, config=config)
+    with pytest.raises(runtime.BudgetInvariantError) as captured:
+        call_assemble(candidates, config=config)
 
-    assert result.trace.mode is runtime.AssemblyMode.EMERGENCY_ASSEMBLY
-    assert result.selected_blocks == ()
+    assert captured.value.code == "REQUIRED_INPUT_EXCEEDS_BUDGET"
 
 
 def test_zero_ac_budget_and_unfittable_required_block_are_explicit() -> None:
@@ -418,20 +404,16 @@ def test_zero_ac_budget_and_unfittable_required_block_are_explicit() -> None:
         safety_margin=5,
     )
 
-    result = call_assemble(
-        (block("goal", runtime.RuntimeSlot.ACTIVE_GOAL, "goal", required=True),),
-        current_input="12345",
-        opaque_token_cost=5,
-        fixed_required_cost=5,
-        config=config,
-    )
+    with pytest.raises(runtime.BudgetInvariantError) as captured:
+        call_assemble(
+            (block("goal", runtime.RuntimeSlot.ACTIVE_GOAL, "goal", required=True),),
+            current_input="12345",
+            opaque_token_cost=5,
+            fixed_required_cost=5,
+            config=config,
+        )
 
-    assert result.trace.b_required == 15
-    assert result.trace.b_ac == 0
-    assert result.trace.mode == runtime.AssemblyMode.EMERGENCY_ASSEMBLY
-    assert result.selected_blocks == ()
-    assert result.trace.rejections[0].reason == "EMERGENCY_REQUIRED_NOT_FIT"
-    assert result.trace.total_input_cost == result.trace.b_input == 20
+    assert captured.value.code == "REQUIRED_INPUT_EXCEEDS_BUDGET"
 
 
 @pytest.mark.parametrize(
@@ -543,3 +525,261 @@ def test_opaque_api_is_cost_only_and_top_level_legacy_trace_is_preserved() -> No
     assert ac.RuntimeAssemblyTrace is runtime.AssemblyTrace
     assert ac.RuntimeAssemblyResult is runtime.AssemblyResult
     assert ac.RuntimeBudgetConfig is runtime.BudgetConfig
+
+
+def test_candidate_counts_are_bounded_and_growing_prefixes_are_not_encoded() -> None:
+    class RecordingCounter:
+        def __init__(self) -> None:
+            self.texts: list[str] = []
+
+        def count_text(self, text: str) -> int:
+            self.texts.append(text)
+            return len(text)
+
+    candidates = tuple(
+        block(
+            f"candidate-{index:03d}",
+            runtime.RuntimeSlot.ACTIVE_TASK,
+            f"payload-{index:03d}",
+            score=float(256 - index),
+        )
+        for index in range(256)
+    )
+    counter = RecordingCounter()
+    result = call_assemble(
+        candidates,
+        counter=counter,
+        config=runtime.BudgetConfig(
+            target_input_budget=100_000,
+            hard_input_ceiling=100_000,
+            model_context_limit=100_000,
+            reserved_output_and_tools=0,
+            safety_margin=0,
+        ),
+    )
+
+    assert all(counter.texts.count(candidate.text) == 1 for candidate in candidates)
+    growing_prefixes = {
+        "\n\n".join(candidate.text for candidate in candidates[:end])
+        for end in range(2, len(candidates))
+    }
+    assert growing_prefixes.isdisjoint(counter.texts)
+    assert result.projected_text in counter.texts
+
+
+def test_exact_projection_cost_can_make_projection_overhead_negative() -> None:
+    class MergingCounter:
+        def count_text(self, text: str) -> int:
+            costs = {
+                "left": 10,
+                "right": 10,
+                "\n\n": 1,
+                "left\n\nright": 5,
+            }
+            return costs.get(text, len(text))
+
+    result = call_assemble(
+        (
+            block(
+                "left",
+                runtime.RuntimeSlot.ACTIVE_TASK,
+                "left",
+                score=2.0,
+            ),
+            block(
+                "right",
+                runtime.RuntimeSlot.ACTIVE_TASK,
+                "right",
+            ),
+        ),
+        counter=MergingCounter(),
+        config=runtime.BudgetConfig(
+            target_input_budget=30,
+            hard_input_ceiling=30,
+            model_context_limit=30,
+            reserved_output_and_tools=0,
+            safety_margin=0,
+        ),
+    )
+
+    assert result.trace.ac_selected_cost == 5
+    assert result.trace.projection_overhead_cost == -15
+    assert (
+        sum(item.token_cost for item in result.trace.selections)
+        + result.trace.projection_overhead_cost
+        == result.trace.ac_selected_cost
+    )
+    assert result.trace.total_input_cost <= result.trace.b_input
+
+
+def test_emergency_raw_suffix_uses_one_block_map_before_required_overflow() -> None:
+    class RecordingCounter:
+        def __init__(self) -> None:
+            self.texts: list[str] = []
+
+        def count_text(self, text: str) -> int:
+            self.texts.append(text)
+            return len(text)
+
+    candidates = (
+        block(
+            "goal",
+            runtime.RuntimeSlot.ACTIVE_GOAL,
+            "goal",
+            required=True,
+        ),
+        *(
+            block(
+                f"raw-{index:03d}",
+                runtime.RuntimeSlot.RAW_DELTA,
+                f"raw-{index:03d}",
+                required=True,
+                event_sequence=index + 1,
+            )
+            for index in range(255)
+        ),
+    )
+    counter = RecordingCounter()
+    with pytest.raises(runtime.BudgetInvariantError) as captured:
+        call_assemble(
+            candidates,
+            counter=counter,
+            config=runtime.BudgetConfig(
+                target_input_budget=40,
+                hard_input_ceiling=40,
+                model_context_limit=40,
+                reserved_output_and_tools=0,
+                safety_margin=0,
+            ),
+        )
+
+    assert captured.value.code == "REQUIRED_INPUT_EXCEEDS_BUDGET"
+    assert all(counter.texts.count(candidate.text) == 1 for candidate in candidates)
+    composite_counts = [text for text in counter.texts if text != "\n\n" and "\n\n" in text]
+    assert composite_counts == []
+
+
+def test_exact_overflow_removes_an_optional_parallel_tool_round_atomically() -> None:
+    class ExpandingCounter:
+        def count_text(self, text: str) -> int:
+            costs = {
+                "goal": 1,
+                "CALL-A\nCALL-B\nRESULT-B\nRESULT-A\nASSISTANT": 1,
+                "\n\n": 0,
+                "goal\n\nCALL-A\nCALL-B\nRESULT-B\nRESULT-A\nASSISTANT": 10,
+            }
+            return costs.get(text, len(text))
+
+    candidates = (
+        block(
+            "goal",
+            runtime.RuntimeSlot.ACTIVE_GOAL,
+            "goal",
+            required=True,
+        ),
+        replace(
+            block(
+                "parallel-tool-round",
+                runtime.RuntimeSlot.RAW_DELTA,
+                "CALL-A\nCALL-B\nRESULT-B\nRESULT-A\nASSISTANT",
+                event_sequence=1,
+            ),
+            source_event_ids=("call-a", "call-b", "result-b", "result-a", "assistant"),
+        ),
+    )
+
+    result = call_assemble(
+        candidates,
+        counter=ExpandingCounter(),
+        config=runtime.BudgetConfig(
+            target_input_budget=3,
+            hard_input_ceiling=3,
+            model_context_limit=3,
+            reserved_output_and_tools=0,
+            safety_margin=0,
+        ),
+    )
+
+    assert tuple(item.block_id for item in result.selected_blocks) == ("goal",)
+    exact_removed = {
+        item.block_id
+        for item in result.trace.rejections
+        if item.reason == "EXACT_BUDGET_COMPONENT_REMOVED"
+    }
+    assert exact_removed == {"parallel-tool-round"}
+    assert result.trace.ac_selected_cost == 1
+    assert result.trace.total_input_cost <= result.trace.b_input
+
+
+def test_raw_tail_breaks_when_an_atomic_unit_is_missing() -> None:
+    first = replace(
+        block("round-one", runtime.RuntimeSlot.RAW_DELTA, "round one", event_sequence=1),
+        source_event_ids=("event-1", "event-2", "event-3"),
+    )
+    after_gap = replace(
+        block("round-three", runtime.RuntimeSlot.RAW_DELTA, "round three", event_sequence=7),
+        source_event_ids=("event-7",),
+    )
+
+    raw_tail = runtime.budget._contiguous_raw_tail((first, after_gap))
+
+    assert raw_tail == (after_gap,)
+
+
+def test_cross_slot_dependency_with_raw_companion_is_selected_once() -> None:
+    dependency = replace(
+        block(
+            "dependency",
+            runtime.RuntimeSlot.ACTIVE_GOAL,
+            "D",
+            required=True,
+        ),
+        kind=runtime.CandidateKind.DEPENDENCY,
+        capsule_id="cross-slot",
+        source_event_ids=("source-cross-slot",),
+    )
+    raw_companion = replace(
+        block(
+            "raw-companion",
+            runtime.RuntimeSlot.RAW_DELTA,
+            "R",
+            event_sequence=1,
+        ),
+        source_event_ids=("source-cross-slot",),
+    )
+    candidates = (
+        dependency,
+        block(
+            "normal-only-optional",
+            runtime.RuntimeSlot.HARD_CONSTRAINT,
+            "OO",
+        ),
+        raw_companion,
+        block(
+            "anchor",
+            runtime.RuntimeSlot.EXACT_ANCHOR,
+            "A",
+            required=True,
+        ),
+    )
+
+    result = call_assemble(
+        candidates,
+        config=runtime.BudgetConfig(
+            target_input_budget=8,
+            hard_input_ceiling=8,
+            model_context_limit=8,
+            reserved_output_and_tools=0,
+            safety_margin=0,
+        ),
+    )
+
+    assert result.trace.mode is runtime.AssemblyMode.EMERGENCY_ASSEMBLY
+    assert tuple(item.block_id for item in result.selected_blocks) == (
+        "dependency",
+        "raw-companion",
+        "anchor",
+    )
+    assert result.projected_text == "D\n\nR\n\nA"
+    assert result.trace.ac_selected_cost == 7
+    assert sum(item.block_id == "raw-companion" for item in result.trace.selections) == 1

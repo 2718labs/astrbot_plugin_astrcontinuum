@@ -2,7 +2,7 @@
 
 English | [简体中文](./ARCHITECTURE.zh-CN.md)
 
-This document describes the architecture that exists at repository version `v0.1.0`, the
+This document describes the architecture that exists at repository version `v0.2.1`, the
 invariants that make it safe, and the difference between implemented core capabilities and
 capabilities currently activated by the AstrBot plugin lifecycle.
 
@@ -18,12 +18,12 @@ root. It is designed to:
 - restore AstrBot's native message graph before host persistence;
 - compile and atomically publish structured, audited Snapshots in a background lane.
 
-At `v0.1.0`, all six items are wired into the AstrBot lifecycle. The `Star` starts one durable
+At `v0.2.1`, all six items are wired into the AstrBot lifecycle. The `Star` starts one durable
 worker, binds an AstrBot-backed extractive compiler, renews fenced leases during slow model
-calls, and cancels the tracked task during termination. At-rest database encryption and a
-provider-backed semantic-audit adapter remain outside this preview.
-
-The repository is therefore a technical preview, not yet an AstrBot-market release.
+calls, and cancels the tracked task during termination. Authenticated at-rest encryption,
+offline model-aware text counting, automatic AstrBot context-limit resolution, canonical
+token-metric sidecars, and bounded metric backfill are active. A provider-backed
+semantic-audit adapter is not part of `v0.2.1`.
 
 ## 2. Architectural goals
 
@@ -47,6 +47,12 @@ Correctness comes from:
 
 Process-local locks, queues, and task ownership are optimizations only.
 
+Token accounting has three explicit coordinate systems. Canonical metrics are durable,
+profile-keyed sidecars for immutable artifacts; live metrics belong to one immutable
+request-local profile; compaction consumes only complete canonical metrics. Compatibility byte
+counts remain logically unchanged for wire identities and legacy validation and are never
+reinterpreted as current model tokens.
+
 ### 2.3 Loss-aware compaction
 
 A Snapshot is not a free-form summary. It is an immutable, structured representation of a
@@ -65,14 +71,13 @@ AstrContinuum is optional to the host request. Compatibility or enhancement fail
 turn into an AstrBot outage. Durable corruption, false coverage, and partially published
 Snapshots are never accepted as the price of availability.
 
-## 3. Non-goals in `v0.1.0`
+## 3. Non-goals in `v0.2.1`
 
-- no plugin-market availability;
+- no repository-managed AstrBot-market distribution workflow;
 - no user-facing rollback or time-travel command;
 - no WebUI administration page;
 - no provider-backed semantic-audit adapter;
-- no at-rest encryption for Journal or Snapshot content;
-- no claim that UTF-8 byte counting equals provider tokenization;
+- no claim that one tokenizer profile is accurate for every provider model;
 - no platform-adapter-specific behavior or declared adapter support;
 - no import of external Sylanne memory payloads into durable AstrContinuum records.
 
@@ -332,9 +337,12 @@ Candidate selection is deterministic. Stable sorting uses:
 ### 12.1 Pressure policy
 
 Pressure is assessed against usable capacity (`model limit - output/tool reserve`). A positive
-provider usage value is preferred; otherwise the complete native input is estimated
-conservatively. The default compaction and projection ratios are `0.75` and `0.80`. These
-thresholds are independent of conversation turn count.
+provider usage value is preferred; otherwise the complete native input is counted with the
+request's frozen profile. `model_context_limit=0` resolves the current Provider through
+AstrBot's public `get_using_provider()` API and accepts a matching positive
+`max_context_tokens`; missing or mismatched metadata uses the content-free
+`AUTO_SAFE_FALLBACK` limit of `128000`. A positive configured value is `MANUAL`. The default
+compaction and projection ratios are `0.75` and `0.80`, independent of turn count.
 
 ### 12.2 Normal assembly
 
@@ -353,10 +361,25 @@ If a required block cannot fit under normal selection:
 The assembly trace contains ids, slots, costs, scores, reasons, coverage, and totals, but not
 message text.
 
-### 12.4 Counting limitation
+### 12.4 Token coordinate systems
 
-The plugin currently uses `Utf8ByteTokenCounter`, which counts one unit per UTF-8 byte. It is
-deterministic and conservative but not provider-token accurate.
+The request path resolves one immutable `TokenizerProfile` before persistence or assembly.
+Known OpenAI model mappings select bundled `cl100k_base` or `o200k_base`; an unknown mapping
+uses the conservative `reference-o200k-v1` profile with an integer `11000/10000` multiplier.
+The two tokenizer assets are packaged with fixed size and SHA-256 metadata and are loaded
+offline without a mutable download cache.
+
+All host text, current input, candidate blocks, and the final Provider projection are counted
+under that one request profile. Tool calls and their corresponding results are indivisible
+selection units. If tokenizer construction or counting fails, every partial primary result is
+discarded and the complete request is replayed from source under `utf8-byte-v1`; BPE and byte
+units are never mixed within one request.
+
+The canonical lane uses `canonical-o200k-v1` sidecars for immutable Events, Capsules, and
+Snapshots. New artifacts commit their metric atomically with their durable row or publication;
+older artifacts are counted in bounded, retryable batches. Compaction defers with a stable code
+when a required canonical metric is unavailable instead of borrowing live or compatibility
+counts.
 
 ## 13. Projection ownership and restoration
 
@@ -405,6 +428,8 @@ foreign plugin's objects.
 | `snapshot_capsules` | authoritative ordered membership |
 | `active_snapshots` | at most one active pointer per session |
 | `compaction_jobs` | durable intent and fenced state machine |
+| `token_metrics` | encrypted immutable count keyed by artifact, id, and profile |
+| `token_metric_backfill_intents` | bounded retryable work for missing canonical metrics |
 
 See [DATABASE_SCHEMA.md](./DATABASE_SCHEMA.md) for every column and constraint.
 
@@ -515,6 +540,9 @@ if durable intent is still beyond the winner's coverage.
 | --- | --- |
 | Missing event-extra API | Skip AstrContinuum state for the request |
 | Initialization/storage error | Record redacted `INITIALIZE_FAILED`; host request proceeds |
+| Invalid or unavailable AstrBot context limit | Use `AUTO_SAFE_FALLBACK` at `128000` |
+| Tokenizer construction/count failure | Discard partial counts and recount the complete request in BYTE mode |
+| Canonical metric unavailable | Defer compaction and preserve retryable backfill work |
 | Missing projection capability below hard pressure | Do not alter the provider message list |
 | Assembly/projection unavailable at hard pressure | Remove native history with an empty Provider View |
 | Invalid projection boundary | Record a content-free adapter fault; skip projection |
@@ -530,9 +558,9 @@ logs.
 ## 18. Privacy and trust boundaries
 
 AstrContinuum stores complete user and assistant content because those records are the
-authoritative local Journal. Operators must protect the plugin data directory accordingly.
-The `v0.1.0` SQLite database is not encrypted at rest; this is an explicit preview limitation,
-not a security claim.
+authoritative local Journal. Conversation-derived SQLite values and canonical token counts are
+stored in authenticated AES-256-GCM envelopes. Operators must still protect the plugin data
+directory, backups, and external/environment key material.
 
 Tool metadata is canonicalized with bounded:
 
@@ -542,6 +570,8 @@ Tool metadata is canonicalized with bounded:
 - total UTF-8 byte size.
 
 Arbitrary object `repr` is never persisted. Oversized values become typed or truncated metadata.
+Tokenizer operation is offline. Diagnostics omit model identities, tokenizer asset paths,
+message text, and dynamic exception details.
 
 External Sylanne memory may eventually provide ephemeral retrieval signals, but its payload is
 not an admissible Journal event, Capsule source, or stable hash input.
@@ -551,17 +581,16 @@ not an admissible Journal event, Capsule source, or stable hash input.
 Most of the integration uses `astrbot.api.*`. The one internal exception is provider-message
 projection, which is isolated behind a capability probe and fail-open behavior.
 
-The exact committed archive has passed real `PluginManager` lifecycle probes on:
+The exact release archive is probed through real public AstrBot Provider and ProviderRequest
+objects on:
 
 - AstrBot `4.24.0`;
-- AstrBot `4.24.2`;
 - AstrBot `4.26.7`;
 - Python `3.12.13`.
 
 The probe verifies module loading through
-`data.plugins.astrbot_plugin_astrcontinuum.main`, handler priorities, initialization, two turns,
-tool call/result capture, provider-only projection, exact native identity restoration, Journal
-order, and termination.
+`data.plugins.astrbot_plugin_astrcontinuum.main`, all eight registered handlers, public
+`get_using_provider()` metadata resolution, offline bundled counting, and zero LLM requests.
 
 AstrBot `4.24.0` emits an upstream `StarMetadata.pages` fallback warning. The plugin lifecycle
 and behavior still pass.

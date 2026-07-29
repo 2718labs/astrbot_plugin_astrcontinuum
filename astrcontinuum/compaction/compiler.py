@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import json
-from collections.abc import Sequence
+from collections.abc import Mapping, Sequence
 from datetime import datetime
 
 from ..domain.capsules import AnchorStatus, ContextCapsuleEnvelope
@@ -19,6 +19,8 @@ from ..runtime.types import TokenCounter
 from ..storage.repository import SnapshotCapsuleMembership
 from .segmenter import segment
 from .types import (
+    CompactionFitProvenance,
+    CompactionProviderBinding,
     CompilationCandidate,
     CompilationRequest,
     CompilerBackend,
@@ -26,6 +28,7 @@ from .types import (
     CompilerErrorCode,
     CompilerInvariantError,
     CompilerOutput,
+    EventSegment,
     SegmenterConfig,
 )
 from .validator import validate_candidate
@@ -39,14 +42,25 @@ async def compile_candidate(
     base_snapshot: SnapshotEnvelope | None,
     base_capsules: Sequence[ContextCapsuleEnvelope],
     source_events: Sequence[EventEnvelope],
+    event_token_counts: Mapping[str, int],
     target_high_water_mark: int,
     token_ceiling: int,
     backend: CompilerBackend,
-    counter: TokenCounter,
     now: datetime,
     segmenter_config: SegmenterConfig,
     preferred_end_sequences: Sequence[int] = (),
+    compatibility_counter: TokenCounter | None = None,
+    counter: TokenCounter | None = None,
+    provider_binding: CompactionProviderBinding | None = None,
+    provider_binding_captured: bool = False,
 ) -> CompilationCandidate:
+    if compatibility_counter is not None and counter is not None:
+        raise TypeError("provide only compatibility_counter")
+    resolved_compatibility_counter = (
+        compatibility_counter if compatibility_counter is not None else counter
+    )
+    if resolved_compatibility_counter is None:
+        raise TypeError("compatibility_counter must be provided")
     base_capsule_tuple = tuple(base_capsules)
     source_event_tuple = tuple(source_events)
     session_key = _validate_inputs(
@@ -60,6 +74,7 @@ async def compile_candidate(
     )
     segments = segment(
         source_event_tuple,
+        token_counts=event_token_counts,
         config=segmenter_config,
         preferred_end_sequences=preferred_end_sequences,
     )
@@ -70,6 +85,9 @@ async def compile_candidate(
         segments=segments,
         target_high_water_mark=target_high_water_mark,
         token_ceiling=token_ceiling,
+        canonical_event_token_counts=event_token_counts,
+        provider_binding=provider_binding,
+        provider_binding_captured=provider_binding_captured,
     )
 
     try:
@@ -79,9 +97,18 @@ async def compile_candidate(
     except Exception:  # noqa: BLE001 - adapter boundary maps arbitrary failures.
         raise CompilerInvariantError(CompilerErrorCode.BACKEND_FAILURE) from None
 
-    candidate_capsules, rendered_context = _validate_backend_output(output)
+    (
+        candidate_capsules,
+        rendered_context,
+        fitted_segments,
+        fit_provenance,
+    ) = _validate_backend_output(
+        output,
+        source_events=source_event_tuple,
+        original_segments=segments,
+    )
     try:
-        token_cost = counter.count_text(rendered_context)
+        token_cost = resolved_compatibility_counter.count_text(rendered_context)
     except Exception:  # noqa: BLE001 - adapter boundary maps arbitrary failures.
         raise CompilerInvariantError(CompilerErrorCode.TOKEN_COUNTER_FAILURE) from None
     if isinstance(token_cost, bool) or not isinstance(token_cost, int) or token_cost < 0:
@@ -151,8 +178,9 @@ async def compile_candidate(
     return CompilationCandidate(
         snapshot=candidate_snapshot,
         memberships=memberships,
-        segments=segments,
+        segments=fitted_segments,
         permanent_report=report,
+        fit_provenance=fit_provenance,
     )
 
 
@@ -222,7 +250,15 @@ def _validate_inputs(
 
 def _validate_backend_output(
     output: object,
-) -> tuple[tuple[ContextCapsuleEnvelope, ...], str]:
+    *,
+    source_events: tuple[EventEnvelope, ...],
+    original_segments: tuple[EventSegment, ...],
+) -> tuple[
+    tuple[ContextCapsuleEnvelope, ...],
+    str,
+    tuple[EventSegment, ...],
+    CompactionFitProvenance | None,
+]:
     if not isinstance(output, CompilerOutput):
         raise CompilerInvariantError(CompilerErrorCode.BACKEND_OUTPUT_INVALID)
     if not isinstance(output.capsules, tuple) or not isinstance(output.rendered_context, str):
@@ -231,7 +267,28 @@ def _validate_backend_output(
         raise CompilerInvariantError(CompilerErrorCode.BACKEND_OUTPUT_EMPTY)
     if any(not isinstance(item, ContextCapsuleEnvelope) for item in output.capsules):
         raise CompilerInvariantError(CompilerErrorCode.BACKEND_OUTPUT_INVALID)
-    return output.capsules, output.rendered_context
+    fitted_segments = (
+        original_segments if output.fitted_segments is None else output.fitted_segments
+    )
+    if (
+        not isinstance(fitted_segments, tuple)
+        or not fitted_segments
+        or any(not isinstance(item, EventSegment) for item in fitted_segments)
+        or tuple(event for segment in fitted_segments for event in segment.events) != source_events
+    ):
+        raise CompilerInvariantError(CompilerErrorCode.BACKEND_OUTPUT_INVALID)
+    fit_provenance = output.fit_provenance
+    if fit_provenance is not None and not isinstance(
+        fit_provenance,
+        CompactionFitProvenance,
+    ):
+        raise CompilerInvariantError(CompilerErrorCode.BACKEND_OUTPUT_INVALID)
+    return (
+        output.capsules,
+        output.rendered_context,
+        fitted_segments,
+        fit_provenance,
+    )
 
 
 def _active_anchor_ids(
