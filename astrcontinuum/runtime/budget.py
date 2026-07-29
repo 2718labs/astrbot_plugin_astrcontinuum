@@ -4,7 +4,6 @@ from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import NoReturn
 
-from ..domain import EventType
 from ..storage import RequestView
 from .types import (
     RUNTIME_SLOT_PRIORITY,
@@ -265,24 +264,14 @@ def _contiguous_raw_tail(
     while start > 0:
         previous = ordered[start - 1].event_sequence
         current = ordered[start].event_sequence
-        if previous is None or current is None or previous + 1 != current:
+        if (
+            previous is None
+            or current is None
+            or previous + len(ordered[start - 1].source_event_ids) != current
+        ):
             break
         start -= 1
     return ordered[start:]
-
-
-def _is_tool_pair(group: tuple[CandidateBlock, ...]) -> bool:
-    if len(group) != 2:
-        return False
-    left, right = group
-    return (
-        left.event_type is EventType.TOOL_CALL
-        and right.event_type is EventType.TOOL_RESULT
-        and left.tool_name is not None
-        and left.tool_name == right.tool_name
-        and left.event_sequence is not None
-        and right.event_sequence == left.event_sequence + 1
-    )
 
 
 def _longest_raw_suffix(
@@ -293,28 +282,10 @@ def _longest_raw_suffix(
     separator_cost: int,
     b_ac: int,
 ) -> tuple[CandidateBlock, ...]:
-    units: list[tuple[CandidateBlock, ...]] = []
-    index = 0
-    while index < len(raw_tail):
-        current = raw_tail[index]
-        if index + 1 < len(raw_tail):
-            following = raw_tail[index + 1]
-            if (
-                current.event_type is EventType.TOOL_CALL
-                and following.event_type is EventType.TOOL_RESULT
-                and current.tool_name is not None
-                and current.tool_name == following.tool_name
-                and current.event_sequence is not None
-                and following.event_sequence == current.event_sequence + 1
-            ):
-                units.append((current, following))
-                index += 2
-                continue
-        if current.event_type in {EventType.TOOL_CALL, EventType.TOOL_RESULT}:
-            index += 1
-            continue
-        units.append((current,))
-        index += 1
+    # Retrieval has already made every full durable continuation one raw block.
+    # Do not reconstruct callback-order pairs here: that would reintroduce a
+    # split point for parallel, duplicate, or multi-wave tool rounds.
+    units = [(candidate,) for candidate in raw_tail]
 
     suffix_costs = [0] * (len(units) + 1)
     suffix_counts = [0] * (len(units) + 1)
@@ -361,11 +332,7 @@ def _emergency_selection(
             atomic_group_ids: set[str] = set()
             for candidate in slot_candidates:
                 group = group_by_id.get(candidate.block_id, (candidate,))
-                if (
-                    len(group) == 1
-                    or (all(item.slot is slot for item in group) and _is_tool_pair(group))
-                    or candidate.block_id in atomic_group_ids
-                ):
+                if len(group) == 1 or candidate.block_id in atomic_group_ids:
                     continue
                 atomic_groups.append(group)
                 atomic_group_ids.update(item.block_id for item in group)

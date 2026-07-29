@@ -3,7 +3,8 @@ from __future__ import annotations
 from collections.abc import Mapping, Sequence
 from itertools import islice
 
-from ..domain.events import EventEnvelope, EventType
+from ..domain.events import EventEnvelope
+from ..runtime.tool_loop import durable_event_units
 from .types import EventSegment, SegmentBoundaryReason, SegmenterConfig
 
 
@@ -24,10 +25,13 @@ def segment(
         config.max_preferred_boundaries,
     )
 
+    units = durable_event_units(source_events)
+    if units is None:
+        raise ValueError("SEGMENTER_TOOL_LOOP_INVALID")
+
     segments: list[EventSegment] = []
     current: list[EventEnvelope] = []
     current_token_cost = 0
-    deferred_preferred_boundary = False
 
     def close_current(reason: SegmentBoundaryReason) -> None:
         nonlocal current_token_cost
@@ -44,42 +48,31 @@ def segment(
         current.clear()
         current_token_cost = 0
 
-    for index, event in enumerate(source_events):
-        event_token_count = token_counts[event.event_id]
-        if current and len(current) >= config.max_events_per_segment:
+    for index, unit in enumerate(units):
+        unit_token_count = sum(token_counts[event.event_id] for event in unit)
+        if current and len(current) + len(unit) > config.max_events_per_segment:
             close_current(SegmentBoundaryReason.MAX_EVENTS)
-            deferred_preferred_boundary = False
-        elif current and current_token_cost + event_token_count > config.max_tokens_per_segment:
+        elif current and current_token_cost + unit_token_count > config.max_tokens_per_segment:
             close_current(SegmentBoundaryReason.MAX_TOKENS)
-            deferred_preferred_boundary = False
 
-        current.append(event)
-        current_token_cost += event_token_count
-        is_last = index == len(source_events) - 1
+        current.extend(unit)
+        current_token_cost += unit_token_count
+        is_last = index == len(units) - 1
+        unit_is_oversized = (
+            len(unit) > config.max_events_per_segment
+            or unit_token_count > config.max_tokens_per_segment
+        )
 
-        if event_token_count > config.max_tokens_per_segment:
+        if unit_is_oversized:
             close_current(SegmentBoundaryReason.OVERSIZED_EVENT)
-            deferred_preferred_boundary = False
         elif is_last:
             close_current(SegmentBoundaryReason.END_OF_INPUT)
         elif len(current) >= config.max_events_per_segment:
             close_current(SegmentBoundaryReason.MAX_EVENTS)
-            deferred_preferred_boundary = False
         elif current_token_cost >= config.max_tokens_per_segment:
             close_current(SegmentBoundaryReason.MAX_TOKENS)
-            deferred_preferred_boundary = False
-        elif deferred_preferred_boundary:
+        elif any(event.sequence in preferred_boundaries for event in unit):
             close_current(SegmentBoundaryReason.PREFERRED)
-            deferred_preferred_boundary = False
-        elif event.sequence in preferred_boundaries:
-            next_event = source_events[index + 1]
-            if (
-                event.event_type is EventType.TOOL_CALL
-                and next_event.event_type is EventType.TOOL_RESULT
-            ):
-                deferred_preferred_boundary = True
-            else:
-                close_current(SegmentBoundaryReason.PREFERRED)
 
     return tuple(segments)
 

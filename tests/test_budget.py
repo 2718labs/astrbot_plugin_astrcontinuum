@@ -318,44 +318,27 @@ def test_emergency_uses_latest_raw_suffix_before_later_slots() -> None:
     assert result.trace.total_input_cost <= result.trace.b_input
 
 
-def test_emergency_follows_frozen_slot_priority_before_exact_anchor() -> None:
+def test_required_exact_anchor_overflow_is_explicit() -> None:
     canonical_surface()
     config = runtime.BudgetConfig(
-        target_input_budget=10,
-        hard_input_ceiling=10,
-        model_context_limit=10,
+        target_input_budget=9,
+        hard_input_ceiling=9,
+        model_context_limit=9,
         reserved_output_and_tools=0,
         safety_margin=0,
     )
     candidates = (
         block("goal", runtime.RuntimeSlot.ACTIVE_GOAL, "GGGG", required=True),
-        block(
-            "raw-1",
-            runtime.RuntimeSlot.RAW_DELTA,
-            "RRRR",
-            event_sequence=1,
-            event_type=ac.EventType.TOOL_CALL,
-            tool_name="weather",
-        ),
         block("anchor", runtime.RuntimeSlot.EXACT_ANCHOR, "AAAA", required=True),
     )
 
-    result = call_assemble(candidates, config=config)
+    with pytest.raises(runtime.BudgetInvariantError) as caught:
+        call_assemble(candidates, config=config)
 
-    assert result.trace.mode == runtime.AssemblyMode.EMERGENCY_ASSEMBLY
-    assert tuple(item.block_id for item in result.selected_blocks) == (
-        "goal",
-        "anchor",
-    )
-    assert result.projected_text == "GGGG\n\nAAAA"
-    assert result.trace.ac_selected_cost == 10
-    assert any(
-        item.block_id == "raw-1" and item.reason == "EMERGENCY_RAW_PREFIX_OMITTED"
-        for item in result.trace.rejections
-    )
+    assert caught.value.code == "REQUIRED_INPUT_EXCEEDS_BUDGET"
 
 
-def test_required_tool_pair_overflow_is_explicit_and_never_split() -> None:
+def test_required_tool_round_overflow_is_explicit_and_never_split() -> None:
     config = runtime.BudgetConfig(
         target_input_budget=6,
         hard_input_ceiling=6,
@@ -364,22 +347,15 @@ def test_required_tool_pair_overflow_is_explicit_and_never_split() -> None:
         safety_margin=0,
     )
     candidates = (
-        block(
-            "tool-call",
-            runtime.RuntimeSlot.RAW_DELTA,
-            "CALL",
-            required=True,
-            event_sequence=1,
-            event_type=ac.EventType.TOOL_CALL,
-            tool_name="weather",
-        ),
-        block(
-            "tool-result",
-            runtime.RuntimeSlot.RAW_DELTA,
-            "R",
-            event_sequence=2,
-            event_type=ac.EventType.TOOL_RESULT,
-            tool_name="weather",
+        replace(
+            block(
+                "tool-round",
+                runtime.RuntimeSlot.RAW_DELTA,
+                "CALL\nRESULT\nASSISTANT",
+                required=True,
+                event_sequence=1,
+            ),
+            source_event_ids=("call", "result", "assistant"),
         ),
     )
 
@@ -683,15 +659,14 @@ def test_emergency_raw_suffix_uses_one_block_map_before_required_overflow() -> N
     assert composite_counts == []
 
 
-def test_exact_overflow_removes_an_optional_tool_pair_atomically() -> None:
+def test_exact_overflow_removes_an_optional_parallel_tool_round_atomically() -> None:
     class ExpandingCounter:
         def count_text(self, text: str) -> int:
             costs = {
                 "goal": 1,
-                "CALL": 1,
-                "RESULT": 1,
+                "CALL-A\nCALL-B\nRESULT-B\nRESULT-A\nASSISTANT": 1,
                 "\n\n": 0,
-                "goal\n\nCALL\n\nRESULT": 10,
+                "goal\n\nCALL-A\nCALL-B\nRESULT-B\nRESULT-A\nASSISTANT": 10,
             }
             return costs.get(text, len(text))
 
@@ -702,21 +677,14 @@ def test_exact_overflow_removes_an_optional_tool_pair_atomically() -> None:
             "goal",
             required=True,
         ),
-        block(
-            "tool-call",
-            runtime.RuntimeSlot.RAW_DELTA,
-            "CALL",
-            event_sequence=1,
-            event_type=ac.EventType.TOOL_CALL,
-            tool_name="weather",
-        ),
-        block(
-            "tool-result",
-            runtime.RuntimeSlot.RAW_DELTA,
-            "RESULT",
-            event_sequence=2,
-            event_type=ac.EventType.TOOL_RESULT,
-            tool_name="weather",
+        replace(
+            block(
+                "parallel-tool-round",
+                runtime.RuntimeSlot.RAW_DELTA,
+                "CALL-A\nCALL-B\nRESULT-B\nRESULT-A\nASSISTANT",
+                event_sequence=1,
+            ),
+            source_event_ids=("call-a", "call-b", "result-b", "result-a", "assistant"),
         ),
     )
 
@@ -738,9 +706,24 @@ def test_exact_overflow_removes_an_optional_tool_pair_atomically() -> None:
         for item in result.trace.rejections
         if item.reason == "EXACT_BUDGET_COMPONENT_REMOVED"
     }
-    assert exact_removed == {"tool-call", "tool-result"}
+    assert exact_removed == {"parallel-tool-round"}
     assert result.trace.ac_selected_cost == 1
     assert result.trace.total_input_cost <= result.trace.b_input
+
+
+def test_raw_tail_breaks_when_an_atomic_unit_is_missing() -> None:
+    first = replace(
+        block("round-one", runtime.RuntimeSlot.RAW_DELTA, "round one", event_sequence=1),
+        source_event_ids=("event-1", "event-2", "event-3"),
+    )
+    after_gap = replace(
+        block("round-three", runtime.RuntimeSlot.RAW_DELTA, "round three", event_sequence=7),
+        source_event_ids=("event-7",),
+    )
+
+    raw_tail = runtime.budget._contiguous_raw_tail((first, after_gap))
+
+    assert raw_tail == (after_gap,)
 
 
 def test_cross_slot_dependency_with_raw_companion_is_selected_once() -> None:

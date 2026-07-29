@@ -14,6 +14,9 @@ from typing import Any
 
 import pytest
 
+from astrcontinuum.adapters.astrbot import _content_texts
+from astrcontinuum.runtime import durable_event_units
+
 TEST_MASTER_KEY = base64.urlsafe_b64encode(b"\x01" * 32).decode("ascii").rstrip("=")
 TEST_MASTER_KEY_ID = hashlib.sha256(b"\x01" * 32).hexdigest()[:16]
 
@@ -345,6 +348,29 @@ def load_main(
     return imported, logger
 
 
+def test_host_text_extractors_never_read_private_thinking_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class ThinkingCanaryPart:
+        text = "visible"
+        think = "PRIVATE_CANARY"
+        thinking = "PRIVATE_CANARY"
+        signature = "PRIVATE_SIGNATURE_CANARY"
+        reasoning_content = "PRIVATE_CANARY"
+
+        def __getattribute__(self, name: str) -> object:
+            if name in {"think", "thinking", "signature", "reasoning_content"}:
+                raise AssertionError(f"private thinking field accessed: {name}")
+            return super().__getattribute__(name)
+
+    message = SimpleNamespace(content=[ThinkingCanaryPart()])
+    module, _logger = load_main(monkeypatch, tmp_path)
+
+    assert _content_texts(message) == ("visible",)
+    assert module._host_texts(message) == ("visible",)
+
+
 def test_main_imports_from_real_astrbot_plugin_package_layout(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -489,6 +515,154 @@ async def test_lifecycle_command_and_llm_response_are_idempotent_and_observation
     await plugin.terminate()
 
 
+@pytest.mark.asyncio
+async def test_unstable_tool_preflight_has_no_provider_or_sanitizer_side_effects(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    await plugin.initialize()
+    opening = FakeEvent(message_id="opening")
+    await plugin.on_llm_request(opening, fake_request("opening input"))
+    opening_state = plugin._state(opening)
+    assert opening_state is not None and opening_state.prepared is not None
+    providers = plugin._providers
+    assert providers is not None
+    original_binding = providers.resolve(opening_state.prepared.turn.session_key)
+    await plugin.on_using_llm_tool(
+        opening,
+        SimpleNamespace(name="weather"),
+        {"city": "杭州"},
+    )
+    sanitizer_calls: list[object] = []
+    binding_calls: list[object] = []
+    monkeypatch.setattr(
+        module,
+        "sanitize_claude_openai_contexts",
+        lambda *args, **kwargs: sanitizer_calls.append((args, kwargs)) or False,
+    )
+    original_invalidate = plugin._invalidate_current_provider_binding
+
+    def record_invalidation(*args: object) -> None:
+        binding_calls.append(args)
+        original_invalidate(*args)
+
+    monkeypatch.setattr(plugin, "_invalidate_current_provider_binding", record_invalidation)
+    blocked = FakeEvent(message_id="blocked")
+    request = fake_request("blocked input")
+
+    await plugin.on_llm_request(blocked, request)
+
+    blocked_state = plugin._state(blocked)
+    assert blocked_state is not None
+    assert blocked_state.prepared is None
+    assert sanitizer_calls == []
+    assert binding_calls == []
+    assert providers.resolve(opening_state.prepared.turn.session_key) == original_binding
+    bridge = plugin._bridge
+    assert bridge is not None
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 2
+        assert connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0] == 0
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_metadata_failure_preserves_binding_when_durable_tool_loop_is_nonstable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    await plugin.initialize()
+    opening = FakeEvent(message_id="metadata-nonstable-opening")
+    await plugin.on_llm_request(opening, fake_request("opening input"))
+    opening_state = plugin._state(opening)
+    assert opening_state is not None and opening_state.prepared is not None
+    providers = plugin._providers
+    assert providers is not None
+    session_key = opening_state.prepared.turn.session_key
+    original_binding = providers.resolve(session_key)
+    await plugin.on_using_llm_tool(
+        opening,
+        SimpleNamespace(name="weather"),
+        {"city": "杭州"},
+    )
+    sanitizer_calls: list[object] = []
+    monkeypatch.setattr(
+        module,
+        "sanitize_claude_openai_contexts",
+        lambda *args, **kwargs: sanitizer_calls.append((args, kwargs)) or False,
+    )
+
+    def fail_metadata(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("private metadata failure")
+
+    monkeypatch.setattr(module, "resolve_astrbot_request_metadata", fail_metadata)
+
+    await plugin.on_llm_request(
+        FakeEvent(message_id="metadata-nonstable-blocked"),
+        fake_request("must not be persisted"),
+    )
+
+    assert providers.resolve(session_key) == original_binding
+    assert sanitizer_calls == []
+    bridge = plugin._bridge
+    assert bridge is not None
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 2
+        assert connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0] == 0
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_metadata_failure_preserves_binding_when_stability_guard_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    await plugin.initialize()
+    opening = FakeEvent(message_id="metadata-guard-opening")
+    await plugin.on_llm_request(opening, fake_request("opening input"))
+    opening_state = plugin._state(opening)
+    assert opening_state is not None and opening_state.prepared is not None
+    providers = plugin._providers
+    assert providers is not None
+    session_key = opening_state.prepared.turn.session_key
+    original_binding = providers.resolve(session_key)
+    sanitizer_calls: list[object] = []
+    monkeypatch.setattr(
+        module,
+        "sanitize_claude_openai_contexts",
+        lambda *args, **kwargs: sanitizer_calls.append((args, kwargs)) or False,
+    )
+
+    def fail_metadata(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("private metadata failure")
+
+    async def fail_stability_guard(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("private durable read failure")
+
+    bridge = plugin._bridge
+    assert bridge is not None
+    monkeypatch.setattr(module, "resolve_astrbot_request_metadata", fail_metadata)
+    monkeypatch.setattr(bridge, "read_tool_loop_state", fail_stability_guard)
+
+    await plugin.on_llm_request(
+        FakeEvent(message_id="metadata-guard-blocked"),
+        fake_request("must not be persisted"),
+    )
+
+    assert providers.resolve(session_key) == original_binding
+    assert sanitizer_calls == []
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0] == 0
+    await plugin.terminate()
+
+
 @pytest.mark.parametrize(
     ("trusted_usage", "expected_projection", "expected_jobs"),
     [
@@ -565,6 +739,241 @@ async def test_pressure_controls_projection_and_durable_intent(
     with bridge.repository.factory.connection(read_only=True) as connection:
         job_count = connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0]
     assert job_count == expected_jobs
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_finalizer_does_not_capture_or_intend_while_tool_results_are_pending(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    await plugin.initialize()
+    event = FakeEvent(message_id="pending-finalizer")
+    await plugin.on_llm_request(event, fake_request("opening input"))
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    state.pressure = SimpleNamespace(should_compact=True)
+    await plugin.on_using_llm_tool(
+        event,
+        SimpleNamespace(name="weather"),
+        {"city": "杭州"},
+    )
+    bridge = plugin._bridge
+    assert bridge is not None
+    captured: list[object] = []
+    original_capture = bridge.capture_assistant
+
+    async def record_capture(*args: object, **kwargs: object) -> object:
+        captured.append((args, kwargs))
+        return await original_capture(*args, **kwargs)
+
+    monkeypatch.setattr(bridge, "capture_assistant", record_capture)
+
+    await plugin.on_agent_done_finalize(
+        event,
+        SimpleNamespace(messages=[]),
+        SimpleNamespace(completion_text="must not be captured"),
+    )
+
+    assert captured == []
+    assert state.assistant_event is None
+    assert state.intent_raised is False
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 2
+        assert connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0] == 0
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_finalizer_does_not_capture_or_intend_when_durable_state_is_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    await plugin.initialize()
+    event = FakeEvent(message_id="invalid-finalizer")
+    await plugin.on_llm_request(event, fake_request("opening input"))
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    state.pressure = SimpleNamespace(should_compact=True)
+    bridge = plugin._bridge
+    assert bridge is not None
+    capture_calls: list[object] = []
+    intent_calls: list[object] = []
+
+    async def invalid_state(*_args: object, **_kwargs: object) -> object:
+        return SimpleNamespace(state=module.ToolLoopState.INVALID)
+
+    async def record_capture(*args: object, **kwargs: object) -> object:
+        capture_calls.append((args, kwargs))
+        raise AssertionError("capture must not run for an invalid durable state")
+
+    async def record_intent(*args: object, **kwargs: object) -> object:
+        intent_calls.append((args, kwargs))
+        raise AssertionError("intent must not run for an invalid durable state")
+
+    monkeypatch.setattr(bridge, "read_tool_loop_state", invalid_state)
+    monkeypatch.setattr(bridge, "capture_assistant", record_capture)
+    monkeypatch.setattr(bridge, "raise_compaction_intent", record_intent)
+
+    await plugin.on_agent_done_finalize(
+        event,
+        SimpleNamespace(messages=[]),
+        SimpleNamespace(completion_text="must not be captured"),
+    )
+
+    assert capture_calls == []
+    assert intent_calls == []
+    assert state.assistant_event is None
+    assert state.intent_raised is False
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0] == 0
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_finalizer_closes_a_tool_round_before_raising_its_compaction_intent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    await plugin.initialize()
+    event = FakeEvent(message_id="closed-tool-finalizer")
+    await plugin.on_llm_request(event, fake_request("opening input"))
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    state.pressure = SimpleNamespace(should_compact=True)
+    tool = SimpleNamespace(name="weather")
+    tool_args = {"city": "杭州"}
+    await plugin.on_using_llm_tool(event, tool, tool_args)
+    await plugin.on_llm_tool_respond(event, tool, tool_args, {"temperature": 28})
+    bridge = plugin._bridge
+    worker = plugin._worker
+    assert bridge is not None and worker is not None
+    monkeypatch.setattr(worker, "wake", lambda: None)
+
+    await plugin.on_agent_done_finalize(
+        event,
+        SimpleNamespace(messages=[]),
+        SimpleNamespace(completion_text="assistant response"),
+    )
+
+    assert state.assistant_event is not None
+    assert state.assistant_event.sequence == 4
+    assert state.intent_raised is True
+    view = bridge.repository.read_request_view(state.prepared.turn.session_key)
+    units = durable_event_units(view.delta)
+    assert units is not None
+    assert tuple(tuple(item.sequence for item in unit) for unit in units) == ((1,), (2, 3, 4))
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        row = connection.execute(
+            "SELECT target_high_water_mark, intent_target_high_water_mark FROM compaction_jobs"
+        ).fetchone()
+    assert row is not None
+    assert tuple(row) == (4, 4)
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_finalizer_rechecks_durable_stability_before_raising_intent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    await plugin.initialize()
+    event = FakeEvent(message_id="postcapture-unstable")
+    await plugin.on_llm_request(event, fake_request("opening input"))
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    state.pressure = SimpleNamespace(should_compact=True)
+    bridge = plugin._bridge
+    assert bridge is not None
+    original_capture = bridge.capture_assistant
+
+    async def capture_then_open_tool(*args: object, **kwargs: object) -> object:
+        assistant_event = await original_capture(*args, **kwargs)
+        await bridge.capture_tool_call(
+            state.prepared,
+            SimpleNamespace(name="weather"),
+            {"city": "杭州"},
+            ordinal=97,
+        )
+        return assistant_event
+
+    monkeypatch.setattr(bridge, "capture_assistant", capture_then_open_tool)
+
+    await plugin.on_agent_done_finalize(
+        event,
+        SimpleNamespace(messages=[]),
+        SimpleNamespace(completion_text="assistant response"),
+    )
+
+    assert state.assistant_event is not None
+    assert state.assistant_event.sequence == 2
+    assert state.intent_raised is False
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 3
+        assert connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0] == 0
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_finalizer_intent_target_remains_the_assistant_high_water_mark(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    await plugin.initialize()
+    event = FakeEvent(message_id="assistant-high-water")
+    await plugin.on_llm_request(event, fake_request("opening input"))
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    state.pressure = SimpleNamespace(should_compact=True)
+    bridge = plugin._bridge
+    worker = plugin._worker
+    assert bridge is not None and worker is not None
+    monkeypatch.setattr(worker, "wake", lambda: None)
+    original_capture = bridge.capture_assistant
+    follow_up_events: list[object] = []
+
+    async def capture_then_append_stable_follow_up(*args: object, **kwargs: object) -> object:
+        assistant_event = await original_capture(*args, **kwargs)
+        follow_up = await bridge.prepare_request(
+            FakeEvent(message_id="assistant-high-water-follow-up"),
+            fake_request("later user input"),
+            budget_profile=state.prepared.budget_profile,
+        )
+        assert follow_up is not None
+        follow_up_events.append(follow_up.user_event)
+        return assistant_event
+
+    monkeypatch.setattr(bridge, "capture_assistant", capture_then_append_stable_follow_up)
+
+    await plugin.on_agent_done_finalize(
+        event,
+        SimpleNamespace(messages=[]),
+        SimpleNamespace(completion_text="assistant response"),
+    )
+
+    assert state.assistant_event is not None
+    assert state.assistant_event.sequence == 2
+    assert len(follow_up_events) == 1
+    assert state.intent_raised is True
+    view = bridge.repository.read_request_view(state.prepared.turn.session_key)
+    assert view.high_water_mark == 3
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        row = connection.execute(
+            "SELECT target_high_water_mark, intent_target_high_water_mark FROM compaction_jobs"
+        ).fetchone()
+    assert row is not None
+    assert tuple(row) == (2, 2)
     await plugin.terminate()
 
 

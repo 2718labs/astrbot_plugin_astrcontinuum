@@ -85,6 +85,7 @@ def resolve_astrbot_request_metadata(
     request_model = normalize_model_identity(_safe_attribute(request, "model"))
     provider_model: str | None = None
     provider_limit: int | None = None
+    provider_type: str | None = None
 
     umo = _safe_attribute(event, "unified_msg_origin")
     get_using_provider = _safe_attribute(context, "get_using_provider")
@@ -106,6 +107,12 @@ def resolve_astrbot_request_metadata(
         provider_config = _safe_attribute(provider, "provider_config")
         if isinstance(provider_config, Mapping):
             try:
+                configured_provider_type = provider_config.get("type")
+            except Exception:  # noqa: BLE001 - hostile Mapping implementations are optional
+                configured_provider_type = None
+            if isinstance(configured_provider_type, str):
+                provider_type = configured_provider_type
+            try:
                 configured_provider_limit = provider_config["max_context_tokens"]
             except Exception:  # noqa: BLE001 - hostile Mapping implementations are optional
                 configured_provider_limit = None
@@ -121,4 +128,5 @@ def resolve_astrbot_request_metadata(
         request_model=request_model,
         provider_model=provider_model,
         provider_limit=provider_limit,
+        provider_type=provider_type,
     )

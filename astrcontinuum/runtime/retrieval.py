@@ -13,6 +13,7 @@ from ..domain import (
     SemanticStatus,
 )
 from ..storage import RequestView
+from .tool_loop import durable_event_units
 from .types import (
     RUNTIME_SLOT_PRIORITY,
     CandidateBlock,
@@ -159,11 +160,34 @@ def required_candidates_complete(
             for anchor in capsule.exact_anchors
             if anchor.status is AnchorStatus.ACTIVE
         )
-    expected.update(
-        f"event:{event.event_id}" for event in view.delta if event.event_id not in satisfied
-    )
+    expected_event_ids = {event.event_id for event in view.delta if event.event_id not in satisfied}
     present = {candidate.block_id for candidate in candidates}
-    return expected.issubset(present)
+    raw_event_ids = {
+        event_id
+        for candidate in candidates
+        if candidate.kind is CandidateKind.RAW_EVENT
+        for event_id in candidate.source_event_ids
+    }
+    return expected.issubset(present) and expected_event_ids.issubset(raw_event_ids)
+
+
+def _bounded_raw_units(
+    units: tuple[tuple[EventEnvelope, ...], ...],
+    *,
+    max_delta_events: int,
+) -> tuple[tuple[EventEnvelope, ...], ...]:
+    if max_delta_events < 1:
+        return ()
+    selected: list[tuple[EventEnvelope, ...]] = []
+    selected_events = 0
+    for unit in reversed(units):
+        unit_events = len(unit)
+        if selected and selected_events + unit_events > max_delta_events:
+            break
+        selected.append(unit)
+        selected_events += unit_events
+    selected.reverse()
+    return tuple(selected)
 
 
 def select_candidates(
@@ -233,15 +257,23 @@ def select_candidates(
             ):
                 break
 
-    for item in view.delta[-config.max_delta_events :] if config.max_delta_events else ():
-        raw_text = _raw_event_text(item)
+    durable_units = durable_event_units(view.delta)
+    raw_units = (
+        _bounded_raw_units(durable_units, max_delta_events=config.max_delta_events)
+        if durable_units is not None
+        else ()
+    )
+    for unit in raw_units:
+        item = unit[0]
+        raw_text = "\n\n".join(_raw_event_text(event) for event in unit)
+        is_singleton = len(unit) == 1
         if not add(
             CandidateBlock(
                 block_id=f"event:{item.event_id}",
                 slot=RuntimeSlot.RAW_DELTA,
                 kind=CandidateKind.RAW_EVENT,
                 text=raw_text,
-                source_event_ids=(item.event_id,),
+                source_event_ids=tuple(event.event_id for event in unit),
                 score=_score(
                     raw_text,
                     base_weight=config.raw_delta_weight,
@@ -252,8 +284,8 @@ def select_candidates(
                 required=True,
                 capsule_id=None,
                 event_sequence=item.sequence,
-                event_type=item.event_type,
-                tool_name=_raw_tool_name(item),
+                event_type=item.event_type if is_singleton else None,
+                tool_name=_raw_tool_name(item) if is_singleton else None,
             )
         ):
             break

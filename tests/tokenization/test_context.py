@@ -326,6 +326,67 @@ def test_metadata_prefers_valid_request_model_over_provider_model() -> None:
     )
 
 
+@pytest.mark.parametrize(
+    ("provider_config", "expected_provider_type"),
+    [
+        (
+            {"max_context_tokens": 128_000, "type": "openai_chat_completion"},
+            "openai_chat_completion",
+        ),
+        ({"max_context_tokens": 128_000}, None),
+        ({"max_context_tokens": 128_000, "type": 7}, None),
+    ],
+)
+def test_metadata_extracts_only_string_provider_type(
+    provider_config: dict[str, object],
+    expected_provider_type: str | None,
+) -> None:
+    metadata = resolve_astrbot_request_metadata(
+        _metadata_context(_metadata_provider(provider_config=provider_config)),
+        _metadata_event(),
+        _metadata_request(),
+    )
+
+    assert metadata.provider_type == expected_provider_type
+
+
+def test_metadata_tolerates_throwing_provider_config_without_leaking() -> None:
+    class ThrowingProvider:
+        get_model = staticmethod(lambda: "provider-model")
+
+        @property
+        def provider_config(self) -> object:
+            raise RuntimeError("SECRET-provider-config")
+
+    metadata = resolve_astrbot_request_metadata(
+        _metadata_context(ThrowingProvider()),
+        _metadata_event(),
+        _metadata_request(),
+    )
+
+    assert metadata.provider_type is None
+    assert "SECRET" not in repr(metadata)
+
+
+def test_metadata_tolerates_throwing_provider_type_mapping_without_leaking() -> None:
+    class ThrowingMapping(dict[str, object]):
+        def get(self, key: object, default: object = None) -> object:
+            raise RuntimeError(f"SECRET-provider-type:{key}")
+
+    metadata = resolve_astrbot_request_metadata(
+        _metadata_context(
+            _metadata_provider(
+                provider_config=ThrowingMapping(max_context_tokens=128_000),
+            )
+        ),
+        _metadata_event(),
+        _metadata_request(),
+    )
+
+    assert metadata.provider_type is None
+    assert "SECRET" not in repr(metadata)
+
+
 def test_metadata_falls_back_from_invalid_request_model_to_provider() -> None:
     metadata = resolve_astrbot_request_metadata(
         _metadata_context(_metadata_provider()),

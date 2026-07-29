@@ -265,6 +265,44 @@ async def test_missing_stable_identity_skips_every_durable_write(tmp_path: Path)
 
 
 @pytest.mark.asyncio
+async def test_unfinished_durable_tool_loop_blocks_request_before_a_user_write(
+    tmp_path: Path,
+) -> None:
+    bridge, _ = _bridge(tmp_path)
+    initial_request = _request()
+    initial = await bridge.prepare_request(
+        FakeEvent(message_id="opening-request"),
+        initial_request,
+        budget_profile=_budget_profile(),
+    )
+    assert initial is not None
+    await bridge.capture_tool_call(
+        initial,
+        SimpleNamespace(name="weather"),
+        {"city": "杭州"},
+        ordinal=0,
+    )
+    blocked_request = _request()
+    original_contexts = blocked_request.contexts
+    original_messages = tuple(blocked_request.contexts)
+
+    blocked = await bridge.prepare_request(
+        FakeEvent(message_id="blocked-request"),
+        blocked_request,
+        budget_profile=_budget_profile(),
+    )
+
+    assert blocked is None
+    assert blocked_request.contexts is original_contexts
+    assert tuple(blocked_request.contexts) == original_messages
+    assessment = await bridge.read_tool_loop_state(initial.turn.session_key)
+    assert assessment.state.value == "awaiting_results"
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 2
+        assert connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0] == 0
+
+
+@pytest.mark.asyncio
 async def test_canonical_asset_failure_keeps_byte_event_and_one_backfill_intent(
     tmp_path: Path,
 ) -> None:

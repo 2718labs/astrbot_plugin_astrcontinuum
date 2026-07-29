@@ -11,6 +11,14 @@ from .projection import (
 )
 from .read_view import RequestViewInvariantError, read_request_view
 from .retrieval import select_candidates
+from .tool_loop import (
+    PendingTool,
+    ToolFingerprint,
+    ToolLoopAssessment,
+    ToolLoopState,
+    durable_event_units,
+    evaluate_tool_loop,
+)
 from .types import (
     RUNTIME_SLOT_PRIORITY,
     AssemblyMode,
@@ -44,6 +52,7 @@ __all__ = [
     "BudgetInvariantError",
     "CandidateBlock",
     "CandidateKind",
+    "PendingTool",
     "PressureConfig",
     "PressureDecision",
     "PressureSource",
@@ -59,9 +68,14 @@ __all__ = [
     "RetrievalConfig",
     "RuntimeSlot",
     "TokenCounter",
+    "ToolFingerprint",
+    "ToolLoopAssessment",
+    "ToolLoopState",
     "Utf8ByteTokenCounter",
     "assemble",
     "assess_pressure",
+    "durable_event_units",
+    "evaluate_tool_loop",
     "guard_projection",
     "project",
     "read_request_view",

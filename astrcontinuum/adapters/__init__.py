@@ -20,6 +20,7 @@ from .astrbot import (
     extract_host_session_key,
     extract_host_turn_identity,
     projection_factory_from_user_message,
+    sanitize_claude_openai_contexts,
     select_projection_boundaries,
 )
 from .sylanne import SylanneAdapter
@@ -45,5 +46,6 @@ __all__ = [
     "extract_host_session_key",
     "extract_host_turn_identity",
     "projection_factory_from_user_message",
+    "sanitize_claude_openai_contexts",
     "select_projection_boundaries",
 ]

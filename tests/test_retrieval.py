@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 from typing import Any
@@ -212,6 +213,63 @@ def test_structured_fields_and_raw_delta_are_independently_retrievable() -> None
         kind_type.DECISION,
     } <= kinds
     assert all(candidate.capsule_id != "Unhelpful." for candidate in candidates)
+
+
+def test_parallel_tool_continuation_becomes_one_atomic_raw_candidate() -> None:
+    key = session_key()
+
+    def tool_event(
+        sequence: int,
+        event_type: ac.EventType,
+        payload: dict[str, object],
+    ) -> ac.EventEnvelope:
+        return ac.EventEnvelope.create(
+            event_id=f"tool-event-{sequence}",
+            session_key=key,
+            sequence=sequence,
+            event_type=event_type,
+            content=json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
+            idempotency_key=f"tool-idempotency-{sequence}",
+            token_count=1,
+            created_at=NOW,
+        )
+
+    delta = (
+        tool_event(
+            1, ac.EventType.TOOL_CALL, {"kind": "call", "tool": "search", "arguments": {"q": "a"}}
+        ),
+        tool_event(
+            2, ac.EventType.TOOL_CALL, {"kind": "call", "tool": "lookup", "arguments": {"id": 7}}
+        ),
+        tool_event(
+            3,
+            ac.EventType.TOOL_RESULT,
+            {"kind": "result", "tool": "lookup", "arguments": {"id": 7}, "result": "found"},
+        ),
+        tool_event(
+            4,
+            ac.EventType.TOOL_RESULT,
+            {"kind": "result", "tool": "search", "arguments": {"q": "a"}, "result": "ok"},
+        ),
+        tool_event(5, ac.EventType.ASSISTANT_MESSAGE, {}),
+    )
+    view = ac.RequestView(
+        session_key=key,
+        snapshot=None,
+        memberships=(),
+        pointer_version=0,
+        covered_event_end=0,
+        high_water_mark=5,
+        delta=delta,
+    )
+
+    candidates = ac.select_candidates(view, "", ac.RetrievalConfig())
+    raw = tuple(item for item in candidates if item.kind is ac.CandidateKind.RAW_EVENT)
+
+    assert len(raw) == 1
+    assert raw[0].source_event_ids == tuple(item.event_id for item in delta)
+    assert raw[0].event_type is None
+    assert all(item.content in raw[0].text for item in delta)
 
 
 def test_decision_block_keeps_complete_reasoning_and_dependency_context() -> None:

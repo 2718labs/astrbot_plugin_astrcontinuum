@@ -356,6 +356,7 @@ class AstrBotRequestMetadata:
     request_model: str | None
     provider_model: str | None
     provider_limit: int | None
+    provider_type: str | None = None
 
     def __repr__(self) -> str:
         return "AstrBotRequestMetadata()"

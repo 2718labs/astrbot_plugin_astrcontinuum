@@ -88,6 +88,16 @@ def event(
     event_type: ac.EventType = ac.EventType.USER_MESSAGE,
 ) -> ac.EventEnvelope:
     selected_key = session_key or key()
+    if event_type is ac.EventType.TOOL_CALL and not content.lstrip().startswith("{"):
+        content = json.dumps(
+            {"kind": "call", "tool": "fixture-tool", "arguments": {}},
+            separators=(",", ":"),
+        )
+    elif event_type is ac.EventType.TOOL_RESULT and not content.lstrip().startswith("{"):
+        content = json.dumps(
+            {"kind": "result", "tool": "fixture-tool", "arguments": {}, "result": content},
+            separators=(",", ":"),
+        )
     return ac.EventEnvelope.create(
         event_id=f"event-{sequence}",
         session_key=selected_key,
@@ -468,7 +478,7 @@ async def test_preflight_counter_failure_replays_whole_request_before_provider_s
 @pytest.mark.asyncio
 async def test_preflight_splits_only_on_atomic_event_group_boundaries() -> None:
     registry = SessionProviderRegistry(max_entries=2)
-    registry.remember(key(), binding("provider-atomic", context_limit=8))
+    registry.remember(key(), binding("provider-atomic", context_limit=12))
     events = (
         event(1, "user", event_type=ac.EventType.USER_MESSAGE),
         event(2, "tool-call", event_type=ac.EventType.TOOL_CALL),
@@ -477,8 +487,7 @@ async def test_preflight_splits_only_on_atomic_event_group_boundaries() -> None:
     )
     generator = RecordingGenerator(
         extraction_for((events[0],)),
-        extraction_for((events[1], events[2])),
-        extraction_for((events[3],)),
+        extraction_for(events[1:]),
     )
     compiler = AstrBotExtractiveCompilerBackend(
         generator=generator,
@@ -494,8 +503,11 @@ async def test_preflight_splits_only_on_atomic_event_group_boundaries() -> None:
         tuple(item.event_type for item in segment.events) for segment in output.fitted_segments
     ) == (
         (ac.EventType.USER_MESSAGE,),
-        (ac.EventType.TOOL_CALL, ac.EventType.TOOL_RESULT),
-        (ac.EventType.ASSISTANT_MESSAGE,),
+        (
+            ac.EventType.TOOL_CALL,
+            ac.EventType.TOOL_RESULT,
+            ac.EventType.ASSISTANT_MESSAGE,
+        ),
     )
     assert all(
         segment.events[-1].event_type is not ac.EventType.TOOL_CALL
@@ -504,9 +516,55 @@ async def test_preflight_splits_only_on_atomic_event_group_boundaries() -> None:
 
 
 @pytest.mark.asyncio
-async def test_preflight_repairs_an_existing_segment_boundary_that_splits_tool_pair() -> None:
+async def test_preflight_keeps_unordered_parallel_tool_round_in_one_compiler_segment() -> None:
     registry = SessionProviderRegistry(max_entries=2)
-    registry.remember(key(), binding("provider-cross-segment", context_limit=8))
+    registry.remember(key(), binding("provider-parallel", context_limit=20))
+
+    def metadata(kind: str, tool: str, arguments: dict[str, object], **extra: object) -> str:
+        return json.dumps(
+            {"kind": kind, "tool": tool, "arguments": arguments, **extra},
+            separators=(",", ":"),
+        )
+
+    events = (
+        event(1, "user", event_type=ac.EventType.USER_MESSAGE),
+        event(2, metadata("call", "search", {"q": "a"}), event_type=ac.EventType.TOOL_CALL),
+        event(3, metadata("call", "lookup", {"id": 7}), event_type=ac.EventType.TOOL_CALL),
+        event(
+            4,
+            metadata("result", "lookup", {"id": 7}, result="found"),
+            event_type=ac.EventType.TOOL_RESULT,
+        ),
+        event(
+            5,
+            metadata("result", "search", {"q": "a"}, result="ok"),
+            event_type=ac.EventType.TOOL_RESULT,
+        ),
+        event(6, "assistant", event_type=ac.EventType.ASSISTANT_MESSAGE),
+    )
+    compiler = AstrBotExtractiveCompilerBackend(
+        generator=RecordingGenerator(extraction_for((events[0],)), extraction_for(events[1:])),
+        providers=registry,
+        compatibility_counter=LengthCounter(),
+        tokenizer_router=TokenizerRouter(lambda _model: "o200k_base"),
+        counter_provider=lambda profile: ProfiledCounter(profile),
+    )
+
+    output = await compiler.compile(request(events))
+
+    assert tuple(
+        tuple(item.sequence for item in segment.events) for segment in output.fitted_segments
+    ) == (
+        (1,),
+        (2, 3, 4, 5, 6),
+    )
+    assert output.capsules[1].source_event_ids == tuple(item.event_id for item in events[1:])
+
+
+@pytest.mark.asyncio
+async def test_preflight_keeps_an_existing_parallel_safe_unit_boundary() -> None:
+    registry = SessionProviderRegistry(max_entries=2)
+    registry.remember(key(), binding("provider-cross-segment", context_limit=12))
     events = (
         event(1, "user", event_type=ac.EventType.USER_MESSAGE),
         event(2, "tool-call", event_type=ac.EventType.TOOL_CALL),
@@ -514,12 +572,19 @@ async def test_preflight_repairs_an_existing_segment_boundary_that_splits_tool_p
         event(4, "assistant", event_type=ac.EventType.ASSISTANT_MESSAGE),
     )
     source_request = request(events, max_events_per_segment=2)
-    assert source_request.segments[0].events[-1].event_type is ac.EventType.TOOL_CALL
-    assert source_request.segments[1].events[0].event_type is ac.EventType.TOOL_RESULT
+    assert tuple(
+        tuple(item.event_type for item in segment.events) for segment in source_request.segments
+    ) == (
+        (ac.EventType.USER_MESSAGE,),
+        (
+            ac.EventType.TOOL_CALL,
+            ac.EventType.TOOL_RESULT,
+            ac.EventType.ASSISTANT_MESSAGE,
+        ),
+    )
     generator = RecordingGenerator(
         extraction_for((events[0],)),
-        extraction_for((events[1], events[2])),
-        extraction_for((events[3],)),
+        extraction_for(events[1:]),
     )
     compiler = AstrBotExtractiveCompilerBackend(
         generator=generator,
@@ -534,7 +599,11 @@ async def test_preflight_repairs_an_existing_segment_boundary_that_splits_tool_p
     fitted_event_groups = tuple(
         tuple(item.event_type for item in segment.events) for segment in output.fitted_segments
     )
-    assert (ac.EventType.TOOL_CALL, ac.EventType.TOOL_RESULT) in fitted_event_groups
+    assert (
+        ac.EventType.TOOL_CALL,
+        ac.EventType.TOOL_RESULT,
+        ac.EventType.ASSISTANT_MESSAGE,
+    ) in fitted_event_groups
     assert all(
         segment.events[-1].event_type is not ac.EventType.TOOL_CALL
         for segment in output.fitted_segments
@@ -544,7 +613,7 @@ async def test_preflight_repairs_an_existing_segment_boundary_that_splits_tool_p
 @pytest.mark.asyncio
 async def test_fitted_segment_token_cost_remains_the_canonical_lane_sum() -> None:
     registry = SessionProviderRegistry(max_entries=2)
-    registry.remember(key(), binding("provider-canonical-cost", context_limit=8))
+    registry.remember(key(), binding("provider-canonical-cost", context_limit=100))
     events = (
         event(1, "user", event_type=ac.EventType.USER_MESSAGE),
         event(2, "tool-call", event_type=ac.EventType.TOOL_CALL),
@@ -558,11 +627,7 @@ async def test_fitted_segment_token_cost_remains_the_canonical_lane_sum() -> Non
         events[3].event_id: 40,
     }
     compiler = AstrBotExtractiveCompilerBackend(
-        generator=RecordingGenerator(
-            extraction_for((events[0],)),
-            extraction_for((events[1], events[2])),
-            extraction_for((events[3],)),
-        ),
+        generator=RecordingGenerator(extraction_for(events)),
         providers=registry,
         compatibility_counter=LengthCounter(),
         tokenizer_router=TokenizerRouter(lambda _model: "o200k_base"),
@@ -571,7 +636,7 @@ async def test_fitted_segment_token_cost_remains_the_canonical_lane_sum() -> Non
 
     output = await compiler.compile(request(events, canonical_counts=canonical_counts))
 
-    assert tuple(segment.token_cost for segment in output.fitted_segments) == (10, 50, 40)
+    assert tuple(segment.token_cost for segment in output.fitted_segments) == (100,)
 
 
 @pytest.mark.asyncio
@@ -632,12 +697,13 @@ async def test_provider_binding_effective_cap_controls_compaction_input_limit() 
 
 
 @pytest.mark.asyncio
-async def test_indivisible_over_budget_tool_pair_defers_before_provider_call() -> None:
+async def test_indivisible_over_budget_tool_continuation_defers_before_provider_call() -> None:
     registry = SessionProviderRegistry(max_entries=2)
     registry.remember(key(), binding("provider-too-large", context_limit=7))
     events = (
         event(1, "tool-call", event_type=ac.EventType.TOOL_CALL),
         event(2, "tool-result", event_type=ac.EventType.TOOL_RESULT),
+        event(3, "assistant", event_type=ac.EventType.ASSISTANT_MESSAGE),
     )
     generator = RecordingGenerator()
     compiler = AstrBotExtractiveCompilerBackend(
@@ -658,7 +724,7 @@ async def test_indivisible_over_budget_tool_pair_defers_before_provider_call() -
 @pytest.mark.asyncio
 async def test_compiler_returns_backend_fitted_segments_and_profile_provenance() -> None:
     registry = SessionProviderRegistry(max_entries=2)
-    registry.remember(key(), binding("provider-candidate", context_limit=8))
+    registry.remember(key(), binding("provider-candidate", context_limit=12))
     events = (
         event(1, "user", event_type=ac.EventType.USER_MESSAGE),
         event(2, "tool-call", event_type=ac.EventType.TOOL_CALL),
@@ -668,8 +734,7 @@ async def test_compiler_returns_backend_fitted_segments_and_profile_provenance()
     compiler = AstrBotExtractiveCompilerBackend(
         generator=RecordingGenerator(
             extraction_for((events[0],)),
-            extraction_for((events[1], events[2])),
-            extraction_for((events[3],)),
+            extraction_for(events[1:]),
         ),
         providers=registry,
         compatibility_counter=LengthCounter(),
@@ -694,8 +759,11 @@ async def test_compiler_returns_backend_fitted_segments_and_profile_provenance()
         tuple(item.event_type for item in segment.events) for segment in candidate.segments
     ) == (
         (ac.EventType.USER_MESSAGE,),
-        (ac.EventType.TOOL_CALL, ac.EventType.TOOL_RESULT),
-        (ac.EventType.ASSISTANT_MESSAGE,),
+        (
+            ac.EventType.TOOL_CALL,
+            ac.EventType.TOOL_RESULT,
+            ac.EventType.ASSISTANT_MESSAGE,
+        ),
     )
     assert candidate.fit_provenance is not None
     assert candidate.fit_provenance.tokenizer_profile_id == OPENAI_O200K.profile_id

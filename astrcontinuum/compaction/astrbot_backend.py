@@ -19,10 +19,10 @@ from ..domain import (
     Decision,
     Entity,
     EventEnvelope,
-    EventType,
     SemanticStatus,
     SessionKey,
 )
+from ..runtime.tool_loop import durable_event_units
 from ..runtime.types import TokenCounter
 from ..tokenization import (
     BYTE_FALLBACK,
@@ -647,21 +647,10 @@ class AstrBotExtractiveCompilerBackend:
     def _event_groups(
         events: tuple[EventEnvelope, ...],
     ) -> tuple[tuple[EventEnvelope, ...], ...]:
-        groups: list[tuple[EventEnvelope, ...]] = []
-        index = 0
-        while index < len(events):
-            event = events[index]
-            if (
-                event.event_type is EventType.TOOL_CALL
-                and index + 1 < len(events)
-                and events[index + 1].event_type is EventType.TOOL_RESULT
-            ):
-                groups.append((event, events[index + 1]))
-                index += 2
-            else:
-                groups.append((event,))
-                index += 1
-        return tuple(groups)
+        groups = durable_event_units(events)
+        if groups is None:
+            raise CompilerBackendDeferred("TOOL_LOOP_INVALID")
+        return groups
 
     @staticmethod
     def _normalize_atomic_segments(

@@ -23,6 +23,7 @@ if TYPE_CHECKING or not __package__:
         build_projection_objects,
         extract_host_session_key,
         projection_factory_from_user_message,
+        sanitize_claude_openai_contexts,
         select_projection_boundaries,
     )
     from astrcontinuum.compaction import (
@@ -42,6 +43,7 @@ if TYPE_CHECKING or not __package__:
         ProjectionGuard,
         ProjectionInvariantError,
         RestoredView,
+        ToolLoopState,
         Utf8ByteTokenCounter,
         guard_projection,
         project,
@@ -87,6 +89,7 @@ else:
         build_projection_objects,
         extract_host_session_key,
         projection_factory_from_user_message,
+        sanitize_claude_openai_contexts,
         select_projection_boundaries,
     )
     from .astrcontinuum.compaction import (
@@ -106,6 +109,7 @@ else:
         ProjectionGuard,
         ProjectionInvariantError,
         RestoredView,
+        ToolLoopState,
         Utf8ByteTokenCounter,
         guard_projection,
         project,
@@ -191,8 +195,8 @@ class _RequestState:
     outcome: RequestBudgetOutcome | None = field(default=None, repr=False)
     original_conversation: object | None = field(default=None, repr=False)
     intent_raised: bool = False
-    next_tool_ordinal: int = 0
-    pending_tool_ordinals: list[int] = field(default_factory=list, repr=False)
+    next_tool_call_ordinal: int = 0
+    next_tool_result_ordinal: int = 0
     faults: list[AdapterFault] = field(default_factory=list, repr=False)
 
 
@@ -324,7 +328,7 @@ def _host_texts(message: object) -> tuple[str, ...]:
         if isinstance(part, str):
             texts.append(part)
             continue
-        for name in ("text", "think", "image_url", "audio_url"):
+        for name in ("text", "image_url", "audio_url"):
             value = _host_attribute(part, name)
             if value is _HOST_ATTRIBUTE_MISSING:
                 continue
@@ -740,6 +744,22 @@ class AstrContinuumPlugin(Star):
             return
         providers.remember_unavailable(session_key)
 
+    async def _invalidate_provider_after_stable_read(
+        self,
+        bridge: AstrBotHookBridge,
+        event: AstrMessageEvent,
+        request: Any,
+    ) -> None:
+        """Clear stale live binding only after a read-only durable stability gate."""
+
+        try:
+            session_key = extract_host_session_key(event, getattr(request, "conversation", None))
+            assessment = await bridge.read_tool_loop_state(session_key)
+        except Exception:  # noqa: BLE001 - compatibility recovery must stay side-effect-free
+            return
+        if assessment.state is ToolLoopState.STABLE:
+            self._invalidate_current_provider_binding(event, request)
+
     async def _remember_current_provider(
         self,
         event: AstrMessageEvent,
@@ -1046,7 +1066,7 @@ class AstrContinuumPlugin(Star):
         bridge = self._bridge
         if bridge is None:
             return
-        self._invalidate_current_provider_binding(event, req)
+        prepare_started = False
         try:
             metadata = resolve_astrbot_request_metadata(self.context, event, req)
             context_limit = self._context_limit_resolver.resolve(
@@ -1061,10 +1081,24 @@ class AstrContinuumPlugin(Star):
                 context_limit,
                 model_identity=metadata.model_identity,
             )
-            state.prepared = await bridge.prepare_request(
+            prepare_started = True
+            prepared = await bridge.prepare_request(
                 event,
                 req,
                 budget_profile=profile,
+            )
+            if prepared is None:
+                self._record_fault(
+                    state,
+                    _generic_fault("DURABLE_TOOL_LOOP_UNSTABLE", "REQUEST"),
+                )
+                return
+            state.prepared = prepared
+            self._invalidate_current_provider_binding(event, req)
+            sanitize_claude_openai_contexts(
+                req,
+                provider_type=metadata.provider_type,
+                model_identity=metadata.model_identity,
             )
             await self._remember_current_provider(event, state)
         except StorageSecurityError as error:
@@ -1074,8 +1108,12 @@ class AstrContinuumPlugin(Star):
                 _generic_fault(error.code.value, "STORAGE"),
             )
         except AstrBotAdapterError as error:
+            if not prepare_started:
+                await self._invalidate_provider_after_stable_read(bridge, event, req)
             self._record_fault(state, error.fault)
         except Exception:  # noqa: BLE001 - persistence details stay private
+            if not prepare_started:
+                await self._invalidate_provider_after_stable_read(bridge, event, req)
             self._record_fault(
                 state,
                 _generic_fault("REQUEST_PREPARE_FAILED", "REQUEST"),
@@ -1280,6 +1318,16 @@ class AstrContinuumPlugin(Star):
             content = ""
         if state.assistant_event is None:
             try:
+                tool_loop = await bridge.read_tool_loop_state(state.prepared.turn.session_key)
+                if tool_loop.state not in {
+                    ToolLoopState.STABLE,
+                    ToolLoopState.AWAITING_ASSISTANT,
+                }:
+                    self._record_fault(
+                        state,
+                        _generic_fault("DURABLE_TOOL_LOOP_UNSTABLE", "ASSISTANT_CAPTURE"),
+                    )
+                    return
                 state.assistant_event = await bridge.capture_assistant(
                     state.prepared,
                     content,
@@ -1302,6 +1350,13 @@ class AstrContinuumPlugin(Star):
                 return
         if state.pressure is not None and state.pressure.should_compact and not state.intent_raised:
             try:
+                tool_loop = await bridge.read_tool_loop_state(state.prepared.turn.session_key)
+                if tool_loop.state is not ToolLoopState.STABLE:
+                    self._record_fault(
+                        state,
+                        _generic_fault("DURABLE_TOOL_LOOP_UNSTABLE", "COMPACTION_INTENT"),
+                    )
+                    return
                 job = await bridge.raise_compaction_intent(
                     state.prepared,
                     target_high_water_mark=state.assistant_event.sequence,
@@ -1342,9 +1397,7 @@ class AstrContinuumPlugin(Star):
         bridge = self._bridge
         if state is None or state.prepared is None or bridge is None:
             return
-        ordinal = state.next_tool_ordinal
-        state.next_tool_ordinal += 1
-        state.pending_tool_ordinals.append(ordinal)
+        ordinal = state.next_tool_call_ordinal
         try:
             await bridge.capture_tool_call(
                 state.prepared,
@@ -1352,6 +1405,7 @@ class AstrContinuumPlugin(Star):
                 tool_args,
                 ordinal=ordinal,
             )
+            state.next_tool_call_ordinal += 1
         except StorageSecurityError as error:
             await self._enter_storage_locked(error)
             self._record_fault(
@@ -1387,11 +1441,7 @@ class AstrContinuumPlugin(Star):
         bridge = self._bridge
         if state is None or state.prepared is None or bridge is None:
             return
-        if state.pending_tool_ordinals:
-            ordinal = state.pending_tool_ordinals.pop(0)
-        else:
-            ordinal = state.next_tool_ordinal
-            state.next_tool_ordinal += 1
+        ordinal = state.next_tool_result_ordinal
         try:
             await bridge.capture_tool_result(
                 state.prepared,
@@ -1400,6 +1450,7 @@ class AstrContinuumPlugin(Star):
                 tool_result,
                 ordinal=ordinal,
             )
+            state.next_tool_result_ordinal += 1
         except StorageSecurityError as error:
             await self._enter_storage_locked(error)
             self._record_fault(

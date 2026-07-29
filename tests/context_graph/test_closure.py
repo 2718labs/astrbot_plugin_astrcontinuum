@@ -18,7 +18,7 @@ from astrcontinuum.storage import RequestView
 from tests.context_graph.helpers import candidate
 
 
-def test_closure_adds_required_companions_and_complete_tool_pairs() -> None:
+def test_closure_adds_required_companions_and_keeps_a_tool_unit_indivisible() -> None:
     required = replace(
         candidate("required", required=True, text="required"),
         kind=CandidateKind.CONSTRAINT,
@@ -29,37 +29,27 @@ def test_closure_adds_required_companions_and_complete_tool_pairs() -> None:
         kind=CandidateKind.DEPENDENCY,
         capsule_id="capsule",
     )
-    tool_call = replace(
-        candidate("tool-call", text="[TOOL_CALL/TOOL event-call]\n{}"),
+    tool_round = replace(
+        candidate("tool-round", text="[TOOL_CALL/TOOL event-call]\n{}\n[assistant]"),
         kind=CandidateKind.RAW_EVENT,
         slot=RuntimeSlot.RECENT_RAW,
         event_sequence=10,
-        event_type=EventType.TOOL_CALL,
-        tool_name="weather",
+        source_event_ids=("tool-call", "tool-result", "assistant"),
     )
-    tool_result = replace(
-        candidate("tool-result", text="[TOOL_RESULT/TOOL event-result]\n{}"),
-        kind=CandidateKind.RAW_EVENT,
-        slot=RuntimeSlot.RECENT_RAW,
-        event_sequence=11,
-        event_type=EventType.TOOL_RESULT,
-        tool_name="weather",
-    )
-    universe = (required, companion, tool_call, tool_result)
+    universe = (required, companion, tool_round)
 
-    closure = close_dependency_closure((tool_call,), universe, max_blocks=8)
+    closure = close_dependency_closure((tool_round,), universe, max_blocks=8)
 
     assert tuple(item.block_id for item in closure.blocks) == (
         "required",
         "companion",
-        "tool-call",
-        "tool-result",
+        "tool-round",
     )
     assert validate_dependency_closure(closure.blocks, universe, max_blocks=8) is True
-    assert validate_dependency_closure((required, tool_call), universe, max_blocks=8) is False
+    assert validate_dependency_closure((required, tool_round), universe, max_blocks=8) is False
 
 
-def test_real_retrieval_blocks_close_tool_call_and_result_as_one_pair() -> None:
+def test_real_retrieval_blocks_keep_a_closed_tool_continuation_as_one_unit() -> None:
     key = SessionKey(
         platform_instance_id="platform",
         message_type="friend",
@@ -89,21 +79,20 @@ def test_real_retrieval_blocks_close_tool_call_and_result_as_one_pair() -> None:
         memberships=(),
         pointer_version=0,
         covered_event_end=0,
-        high_water_mark=2,
+        high_water_mark=3,
         delta=(
             tool_event(1, EventType.TOOL_CALL, "call"),
             tool_event(2, EventType.TOOL_RESULT, "result"),
+            tool_event(3, EventType.ASSISTANT_MESSAGE, "assistant"),
         ),
     )
     blocks = select_candidates(view, "", RetrievalConfig())
-    result = next(block for block in blocks if block.event_type is EventType.TOOL_RESULT)
+    continuation = next(block for block in blocks if block.kind is CandidateKind.RAW_EVENT)
 
-    closure = close_dependency_closure((result,), blocks, max_blocks=8)
+    closure = close_dependency_closure((continuation,), blocks, max_blocks=8)
 
-    assert tuple(block.event_type for block in closure.blocks) == (
-        EventType.TOOL_CALL,
-        EventType.TOOL_RESULT,
-    )
+    assert closure.blocks == (continuation,)
+    assert continuation.source_event_ids == ("event-1", "event-2", "event-3")
 
 
 def test_closure_is_bounded_before_recursive_expansion() -> None:
@@ -116,7 +105,7 @@ def test_closure_is_bounded_before_recursive_expansion() -> None:
         close_dependency_closure((), required, max_blocks=2)
 
 
-def test_removable_groups_keep_dependency_components_and_tool_pairs_atomic() -> None:
+def test_removable_groups_keep_dependency_components_and_tool_units_atomic() -> None:
     dependency_left = replace(
         candidate("dependency-left"),
         kind=CandidateKind.DEPENDENCY,
@@ -127,21 +116,12 @@ def test_removable_groups_keep_dependency_components_and_tool_pairs_atomic() -> 
         kind=CandidateKind.DEPENDENCY,
         capsule_id="capsule-dependency",
     )
-    tool_call = replace(
-        candidate("tool-call"),
+    tool_round = replace(
+        candidate("tool-round"),
         kind=CandidateKind.RAW_EVENT,
         slot=RuntimeSlot.RECENT_RAW,
         event_sequence=10,
-        event_type=EventType.TOOL_CALL,
-        tool_name="weather",
-    )
-    tool_result = replace(
-        candidate("tool-result"),
-        kind=CandidateKind.RAW_EVENT,
-        slot=RuntimeSlot.RECENT_RAW,
-        event_sequence=11,
-        event_type=EventType.TOOL_RESULT,
-        tool_name="weather",
+        source_event_ids=("tool-call", "tool-result", "assistant"),
     )
     required = candidate("required", required=True)
 
@@ -149,13 +129,12 @@ def test_removable_groups_keep_dependency_components_and_tool_pairs_atomic() -> 
         (
             dependency_left,
             dependency_right,
-            tool_call,
-            tool_result,
+            tool_round,
             required,
         )
     )
     group_ids = tuple(tuple(block.block_id for block in group) for group in groups)
 
     assert ("dependency-left", "dependency-right") in group_ids
-    assert ("tool-call", "tool-result") in group_ids
+    assert ("tool-round",) in group_ids
     assert all(not any(block.required for block in group) for group in groups)

@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib
+import json
 from collections.abc import Sequence
 from dataclasses import FrozenInstanceError, is_dataclass
 from datetime import datetime, timezone
@@ -288,8 +289,16 @@ def test_soft_boundary_keeps_adjacent_tool_call_and_result_together() -> None:
     _, config_type, _, segment_function = surface()
     events = (
         event(1),
-        event(2, event_type=ac.EventType.TOOL_CALL),
-        event(3, event_type=ac.EventType.TOOL_RESULT),
+        event(
+            2,
+            event_type=ac.EventType.TOOL_CALL,
+            content='{"kind":"call","tool":"weather","arguments":{}}',
+        ),
+        event(
+            3,
+            event_type=ac.EventType.TOOL_RESULT,
+            content='{"kind":"result","tool":"weather","arguments":{},"result":"ok"}',
+        ),
         event(4, event_type=ac.EventType.ASSISTANT_MESSAGE),
     )
 
@@ -300,15 +309,66 @@ def test_soft_boundary_keeps_adjacent_tool_call_and_result_together() -> None:
         preferred_end_sequences=(2,),
     )
 
-    assert segment_ranges(segments) == ((1, 3), (4, 4))
-    assert segments[0].events[-2:] == events[1:3]
+    assert segment_ranges(segments) == ((1, 4),)
+    assert segments[0].events[-3:] == events[1:]
 
 
-def test_hard_event_limit_may_split_a_tool_pair() -> None:
+def test_parallel_tool_continuation_is_not_split_at_preferred_or_hard_boundaries() -> None:
+    _, config_type, _, segment_function = surface()
+
+    def tool_payload(kind: str, tool: str, arguments: dict[str, object], **extra: object) -> str:
+        return json.dumps(
+            {"kind": kind, "tool": tool, "arguments": arguments, **extra},
+            separators=(",", ":"),
+        )
+
+    events = (
+        event(1),
+        event(
+            2, event_type=ac.EventType.TOOL_CALL, content=tool_payload("call", "search", {"q": "a"})
+        ),
+        event(
+            3, event_type=ac.EventType.TOOL_CALL, content=tool_payload("call", "lookup", {"id": 7})
+        ),
+        event(
+            4,
+            event_type=ac.EventType.TOOL_RESULT,
+            content=tool_payload("result", "lookup", {"id": 7}, result="found"),
+        ),
+        event(
+            5,
+            event_type=ac.EventType.TOOL_RESULT,
+            content=tool_payload("result", "search", {"q": "a"}, result="ok"),
+        ),
+        event(6, event_type=ac.EventType.ASSISTANT_MESSAGE),
+        event(7),
+    )
+
+    segments = segment_function(
+        events,
+        token_counts=compatibility_counts(events),
+        config=config_type(max_events_per_segment=2, max_tokens_per_segment=100),
+        preferred_end_sequences=(3, 5),
+    )
+
+    assert segment_ranges(segments) == ((1, 1), (2, 6), (7, 7))
+    assert tuple(item.sequence for item in segments[1].events) == (2, 3, 4, 5, 6)
+
+
+def test_hard_event_limit_keeps_a_closed_tool_continuation_atomic() -> None:
     reason_type, config_type, _, segment_function = surface()
     events = (
-        event(1, event_type=ac.EventType.TOOL_CALL),
-        event(2, event_type=ac.EventType.TOOL_RESULT),
+        event(
+            1,
+            event_type=ac.EventType.TOOL_CALL,
+            content='{"kind":"call","tool":"weather","arguments":{}}',
+        ),
+        event(
+            2,
+            event_type=ac.EventType.TOOL_RESULT,
+            content='{"kind":"result","tool":"weather","arguments":{},"result":"ok"}',
+        ),
+        event(3, event_type=ac.EventType.ASSISTANT_MESSAGE),
     )
 
     segments = segment_function(
@@ -318,8 +378,8 @@ def test_hard_event_limit_may_split_a_tool_pair() -> None:
         preferred_end_sequences=(1,),
     )
 
-    assert segment_ranges(segments) == ((1, 1), (2, 2))
-    assert segments[0].boundary_reason is reason_type.MAX_EVENTS
+    assert segment_ranges(segments) == ((1, 3),)
+    assert segments[0].boundary_reason is reason_type.OVERSIZED_EVENT
 
 
 def test_hard_event_limit_bounds_each_segment() -> None:
