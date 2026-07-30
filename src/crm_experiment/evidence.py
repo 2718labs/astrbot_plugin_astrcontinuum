@@ -27,16 +27,26 @@ def sha256_file(path: Path) -> str:
     return hashlib.sha256(path.read_bytes()).hexdigest()
 
 
+def _resolve_protected_file(root: Path, path: Path) -> Path:
+    protected_root = root.resolve()
+    resolved_path = path.resolve()
+    if not resolved_path.is_relative_to(protected_root):
+        raise ValueError("protected file resolves outside the protected repository")
+    return resolved_path
+
+
 def collect_protected_hashes(
     root: Path,
     patterns: Iterable[str],
 ) -> list[dict[str, object]]:
     """Collect sorted, deduplicated metadata for files selected by glob."""
+    protected_root = root.resolve()
     selected: dict[str, Path] = {}
     for pattern in patterns:
-        for path in root.glob(pattern):
+        for path in protected_root.glob(pattern):
             if path.is_file():
-                selected[path.relative_to(root).as_posix()] = path
+                relative = path.relative_to(protected_root).as_posix()
+                selected[relative] = _resolve_protected_file(protected_root, path)
 
     return [
         {
@@ -69,7 +79,10 @@ def write_manifest(repo: Path, output: Path) -> None:
 
 def verify_manifest(repo: Path, manifest: Path) -> bool:
     """Return whether a protected-source manifest matches the repository."""
-    recorded = json.loads(manifest.read_text(encoding="utf-8"))
+    try:
+        recorded = json.loads(manifest.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError):
+        return False
     if not isinstance(recorded, dict):
         return False
     return (
