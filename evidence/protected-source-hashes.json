@@ -1,0 +1,281 @@
+{
+  "schema_version": 1,
+  "repo": "G:\\AstrContinuum",
+  "files": [
+    {
+      "path": "astrcontinuum/adapters/__init__.py",
+      "bytes": 1119,
+      "sha256": "daa80401c02b12fe9d647c63d33a6a18253376d11455cc158b9a79b6286f0a0c"
+    },
+    {
+      "path": "astrcontinuum/adapters/astrbot.py",
+      "bytes": 28132,
+      "sha256": "22d3961cf83e5d58abdcc1aa8ee18c05af68fac1989a0d62be49ed0dd6f341bb"
+    },
+    {
+      "path": "astrcontinuum/adapters/sylanne.py",
+      "bytes": 765,
+      "sha256": "5020c6314dd69a9ef5fe184bb02c38aede8c1007597d4b774b6c968164a5c6d0"
+    },
+    {
+      "path": "astrcontinuum/compaction/compiler.py",
+      "bytes": 11080,
+      "sha256": "53ffa4b0b1106322377bc1a82f540db517a30c117fa97e05aa86d68729dd976f"
+    },
+    {
+      "path": "astrcontinuum/domain/capsules.py",
+      "bytes": 5186,
+      "sha256": "b7afb1f4b62267cea277a0903b46e85455f36507c04136f6799b6e46d1c05ec5"
+    },
+    {
+      "path": "astrcontinuum/domain/validation.py",
+      "bytes": 12328,
+      "sha256": "cb3f5134e5797090e4bf9854550016514cd453d4270829d6c2b62c57a8536318"
+    },
+    {
+      "path": "astrcontinuum/runtime/__init__.py",
+      "bytes": 1544,
+      "sha256": "ab154eebc4d14486ac3602488ff4a4d60431d5f578f6b7f36fcfec655aefa511"
+    },
+    {
+      "path": "astrcontinuum/runtime/budget.py",
+      "bytes": 12970,
+      "sha256": "8e7c8016fc67f0208f2419228d05bd9fa91cb33b14f82110a33374178cc2b95e"
+    },
+    {
+      "path": "astrcontinuum/runtime/projection.py",
+      "bytes": 9369,
+      "sha256": "ccba964961128c9a3b55f4c3126b7ac7a8f4b8a472c1c9d918012ba0ed5cfbc9"
+    },
+    {
+      "path": "astrcontinuum/runtime/read_view.py",
+      "bytes": 2842,
+      "sha256": "b984e6d5f3e85e7eab74ab49faddfad3f2a780552b25840d2003334ccf0ba22c"
+    },
+    {
+      "path": "astrcontinuum/runtime/retrieval.py",
+      "bytes": 13808,
+      "sha256": "ed7e13446aa9ba1ecce9fc6c2f5f32b815cd3e6b62fb1bc31ae845689e9b8885"
+    },
+    {
+      "path": "astrcontinuum/runtime/types.py",
+      "bytes": 10810,
+      "sha256": "df00536f99f03d6e3442103c185238eacfbeccbaa5260fe86fd99999d8744f7b"
+    },
+    {
+      "path": "astrcontinuum/storage/__init__.py",
+      "bytes": 1437,
+      "sha256": "6d1a276a183e3e608c9e1cbb449b335d11d08f0aac835eb4283f53ba6986f3f1"
+    },
+    {
+      "path": "astrcontinuum/storage/migrations.py",
+      "bytes": 22465,
+      "sha256": "90888990b0e624861c56b29a009271b62e2abdcdaf2159e8708b2d057dc4a1a6"
+    },
+    {
+      "path": "astrcontinuum/storage/repository.py",
+      "bytes": 69516,
+      "sha256": "370bd8517a28d02dc96efa954e7317991557e1cb7722f604a5c5acbe855c8669"
+    },
+    {
+      "path": "astrcontinuum/storage/sqlite.py",
+      "bytes": 3304,
+      "sha256": "a8b50fd801a2fe1807b64d5d86f83a6704d7649b000f6c2ed27e442ba52dbcde"
+    },
+    {
+      "path": "experiments/__init__.py",
+      "bytes": 219,
+      "sha256": "6fca340be1c2c00e1588c595a0564985fd665f04767175000dce34a6d568e1b3"
+    },
+    {
+      "path": "experiments/compression_benchmark.py",
+      "bytes": 61141,
+      "sha256": "13ab4ff32a6460b640d7d6a6f851a199bbdc5a96574d22cc3f5326953e116c3f"
+    },
+    {
+      "path": "experiments/evaluation.py",
+      "bytes": 75167,
+      "sha256": "dddd787b1f6a48abceece0ae293b7051ccee1b8f45bfb64b6c08ecbb6dbaba6e"
+    },
+    {
+      "path": "experiments/ollama_client.py",
+      "bytes": 8545,
+      "sha256": "fb34db48780edb5b5d39a07517fe1395383f4fa1a7565843d1a8db72e9b0cbfd"
+    },
+    {
+      "path": "experiments/scenarios.json",
+      "bytes": 12527,
+      "sha256": "50404e742836de8951279479c52c49d5d2d0eafe3615359b7c7c685ac9556c63"
+    },
+    {
+      "path": "main.py",
+      "bytes": 20435,
+      "sha256": "7683ddad8d57161b42931b742c0d36564534328feebb8cf64d67243806b7d1be"
+    },
+    {
+      "path": "pyproject.toml",
+      "bytes": 989,
+      "sha256": "4b240c45ba18403ee9ccb218c3d3b1d7846667b1256781d47e5480749eeeb5f8"
+    },
+    {
+      "path": "tests/adapters/test_astrbot_adapter.py",
+      "bytes": 7892,
+      "sha256": "0a6a9d699d1c7882dce6c16c08c5c98103b962ed3252bc5a97974df86f00272a"
+    },
+    {
+      "path": "tests/contracts/test_capsule_contract.py",
+      "bytes": 2079,
+      "sha256": "f6f891f205b81123012f8dcff296cb3e02408760435882e16173ac7c2b309d79"
+    },
+    {
+      "path": "tests/contracts/test_persistence_contract.py",
+      "bytes": 1349,
+      "sha256": "9f5de6a0f4261f929d73ed611d141db52cc55acf89e08184c31ca6578de6eebf"
+    },
+    {
+      "path": "tests/experiments/test_compression_benchmark.py",
+      "bytes": 32907,
+      "sha256": "9c23893ebf64b79f1f391a257ef72ae6f5a557e436b5d1b2f52a14851984d58d"
+    },
+    {
+      "path": "tests/experiments/test_evaluation.py",
+      "bytes": 14718,
+      "sha256": "845606d23848937d132deac790bbf4ad386223ffd2b87f3fe7984349c5d8fbc3"
+    },
+    {
+      "path": "tests/experiments/test_ollama_client.py",
+      "bytes": 6439,
+      "sha256": "b77105f730189161a8719d28286d69c29c62fec27c4b319e82564f3c299f233b"
+    },
+    {
+      "path": "tests/integration/test_astrbot_hook_repository.py",
+      "bytes": 5810,
+      "sha256": "de640b75711e3c9237084d648bce1c0d418218227e4516018ee674cfd030af67"
+    },
+    {
+      "path": "tests/integration/test_astrbot_projection_persistence.py",
+      "bytes": 10706,
+      "sha256": "b7b50a8d2b08ece8bef32a18905924d5c4bd850e1891987e0f0ebf31038143c0"
+    },
+    {
+      "path": "tests/runtime/test_projection.py",
+      "bytes": 8380,
+      "sha256": "ee6116ee18d3634edc1646c2ac7bede0091c5099eeae2f914489760c94f816a1"
+    },
+    {
+      "path": "tests/storage/test_compiler_publication.py",
+      "bytes": 18045,
+      "sha256": "bb14b78b49a797cfb6badfda82f4fef8ab56fb6c4d0a1efa48f306cb3c167ec8"
+    },
+    {
+      "path": "tests/storage/test_repository_capture.py",
+      "bytes": 9238,
+      "sha256": "28554040ab6e928c2003efca4e5c60c8ce48c717018cd96d0aee153b42309675"
+    },
+    {
+      "path": "tests/storage/test_repository_crash_atomicity.py",
+      "bytes": 17835,
+      "sha256": "a107a60316c815bce7a5a99bc87b0a8824969bb3446976fb988fc37ed158e66c"
+    },
+    {
+      "path": "tests/storage/test_repository_failure_recovery.py",
+      "bytes": 11530,
+      "sha256": "722aeb3e4b09dc52a45e1653cd600fa41ce77ac81be4c52cf95c0021c929b653"
+    },
+    {
+      "path": "tests/storage/test_repository_jobs.py",
+      "bytes": 11535,
+      "sha256": "5004606e8f937cac3b2955ff48395c26e13015987f9285a42661ab9b21120a66"
+    },
+    {
+      "path": "tests/storage/test_repository_publication.py",
+      "bytes": 27167,
+      "sha256": "eaba1ec59e462e3c975a0b2dba78299fe0c5c8876d7e48809a8bec0bfae99653"
+    },
+    {
+      "path": "tests/storage/test_repository_read_view.py",
+      "bytes": 10376,
+      "sha256": "120a6321c42f09e0d213441a97084d4a658ae889fa87a9241c1aa84b840f0b83"
+    },
+    {
+      "path": "tests/storage/test_sqlite_connection_policy.py",
+      "bytes": 3859,
+      "sha256": "e7707b72142db6b2cd8604b23debb4dda559057ff414396301b29050e86df910"
+    },
+    {
+      "path": "tests/storage/test_sqlite_migrations.py",
+      "bytes": 21667,
+      "sha256": "cf109e17529906662ee4160fdb76699a63bb142b0932b919a18afdcd4838687a"
+    },
+    {
+      "path": "tests/test_auditor.py",
+      "bytes": 1511,
+      "sha256": "37cebd8094a00717b623f8f8a524ef513b3cc77c7fa03da9066253a84c4ec2cb"
+    },
+    {
+      "path": "tests/test_budget.py",
+      "bytes": 15145,
+      "sha256": "e748daff3acea030af44a6e4b81d7e575aa37efe66a650d32ceea22bda7e5188"
+    },
+    {
+      "path": "tests/test_compaction_validator.py",
+      "bytes": 4663,
+      "sha256": "8e55312cc9251b7687a1e3ee1b4233158c0702533a6295e6beb653b55809a1ec"
+    },
+    {
+      "path": "tests/test_compiler.py",
+      "bytes": 29060,
+      "sha256": "b0b2ade5784c202d1a5a18788aea0017f31ed61ea00c9491ff9c1526a03aa500"
+    },
+    {
+      "path": "tests/test_domain_envelopes.py",
+      "bytes": 11052,
+      "sha256": "24aff8c981e2b7712c184badb64d833af003322e0ffdd3641cd7fe6f1941a05a"
+    },
+    {
+      "path": "tests/test_event_delta.py",
+      "bytes": 773,
+      "sha256": "fc310bb51f232faa6a21aac694cd49b74f5a2196d9c48eda6d08fc78e6ba4d3b"
+    },
+    {
+      "path": "tests/test_main_hooks.py",
+      "bytes": 10241,
+      "sha256": "7d1475e77ea4f4f4fffce64f36099d370d58366eefe380df10e659978de011cf"
+    },
+    {
+      "path": "tests/test_permanent_validator.py",
+      "bytes": 21806,
+      "sha256": "b7b840ae240404a9fbb160181d6f645f004c9c5a268b51ddaa56632b44be3f6c"
+    },
+    {
+      "path": "tests/test_retrieval.py",
+      "bytes": 10438,
+      "sha256": "3c381d07a825547138ccb28be9973e0368f28db1bc99bce69c1e16acbcdce042"
+    },
+    {
+      "path": "tests/test_runtime_read_view.py",
+      "bytes": 12894,
+      "sha256": "f3151ecfc5c744ea8a15442d8d506b173f18b8ecb4f09cbad274110fe4fe2f81"
+    },
+    {
+      "path": "tests/test_scheduler_nonblocking.py",
+      "bytes": 747,
+      "sha256": "7beb8a33795d18e52dc3041cb4fabf56d2cfdd50a57d1bbeab16d27481bd3693"
+    },
+    {
+      "path": "tests/test_segmenter.py",
+      "bytes": 14592,
+      "sha256": "102f325cee423e9c2d48c5accf93e3e788e70848b696a28a750612e2d371a06c"
+    },
+    {
+      "path": "tests/test_semantic_auditor.py",
+      "bytes": 21806,
+      "sha256": "22fe410802d46d0ba367926a2875b771e20c09a6edf8cef0d9dd6b809e671d28"
+    },
+    {
+      "path": "tests/test_snapshot_atomicity.py",
+      "bytes": 1072,
+      "sha256": "81b11e3f407842f462cdaf17203db142d760612a26a1087e118c020ce306ee88"
+    }
+  ]
+}
