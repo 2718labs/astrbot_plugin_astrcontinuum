@@ -11,6 +11,17 @@ from crm_experiment.evidence import (
     write_manifest,
 )
 
+BOUNDARY_ERROR = "manifest output must be outside the protected repository"
+
+
+def _assert_manifest_boundary_rejected(repo: Path, output: Path) -> None:
+    try:
+        write_manifest(repo, output)
+    except ValueError as error:
+        assert str(error) == BOUNDARY_ERROR
+    else:
+        raise AssertionError("write_manifest accepted a protected output path")
+
 
 def test_sha256_file_hashes_raw_bytes(tmp_path: Path) -> None:
     source = tmp_path / "payload.bin"
@@ -52,6 +63,23 @@ def test_collect_protected_hashes_is_sorted_deduplicated_and_portable(
         digest = row["sha256"]
         assert isinstance(digest, str)
         assert len(digest) == 64
+
+
+def test_write_manifest_rejects_output_inside_protected_repo(tmp_path: Path) -> None:
+    protected_repo = tmp_path / "protected-repo"
+    protected_repo.mkdir()
+    manifest = protected_repo / "evidence.json"
+
+    _assert_manifest_boundary_rejected(protected_repo, manifest)
+
+    assert not manifest.exists()
+
+
+def test_write_manifest_rejects_protected_repo_as_output(tmp_path: Path) -> None:
+    protected_repo = tmp_path / "protected-repo"
+    protected_repo.mkdir()
+
+    _assert_manifest_boundary_rejected(protected_repo, protected_repo)
 
 
 def test_write_manifest_contains_metadata_only(tmp_path: Path) -> None:

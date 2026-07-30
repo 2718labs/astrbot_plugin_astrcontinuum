@@ -50,9 +50,14 @@ def collect_protected_hashes(
 
 def write_manifest(repo: Path, output: Path) -> None:
     """Write a metadata-only checkpoint of protected production files."""
+    protected_root = repo.resolve()
+    manifest_output = output.resolve()
+    if manifest_output.is_relative_to(protected_root):
+        raise ValueError("manifest output must be outside the protected repository")
+
     payload = {
         "schema_version": MANIFEST_SCHEMA_VERSION,
-        "repo": str(repo.resolve()),
+        "repo": str(protected_root),
         "files": collect_protected_hashes(repo, PROTECTED_PATTERNS),
     }
     output.parent.mkdir(parents=True, exist_ok=True)

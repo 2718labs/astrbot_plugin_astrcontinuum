@@ -27,6 +27,14 @@ Create the isolated uv-managed Python experiment repository and freeze a content
 - `D:\bun\tmp\codex\AstrContinuum-capsule-replacement-r3\src\crm_experiment\evidence.py`
 - `D:\bun\tmp\codex\AstrContinuum-capsule-replacement-r3\tests\test_evidence.py`
 - `D:\bun\tmp\codex\AstrContinuum-capsule-replacement-r3\evidence\protected-source-hashes.json`
+- `D:\bun\tmp\codex\AstrContinuum-capsule-replacement-r3\product-brief.md`
+- `D:\bun\tmp\codex\AstrContinuum-capsule-replacement-r3\index.md`
+- `D:\bun\tmp\codex\AstrContinuum-capsule-replacement-r3\contracts\crm-experiment-design.md`
+- `D:\bun\tmp\codex\AstrContinuum-capsule-replacement-r3\contracts\python-toolchain.md`
+- `D:\bun\tmp\codex\AstrContinuum-capsule-replacement-r3\plans\2026-07-30-capsule-recomposition-matrix-implementation.md`
+- `D:\bun\tmp\codex\AstrContinuum-capsule-replacement-r3\tasks\spec-001.md`
+- `D:\bun\tmp\codex\AstrContinuum-capsule-replacement-r3\tasks\plan-001.md`
+- `D:\bun\tmp\codex\AstrContinuum-capsule-replacement-r3\tasks\impl-001.md`
 
 ## Steps
 
@@ -37,7 +45,7 @@ Create the isolated uv-managed Python experiment repository and freeze a content
 5. Add `.venv/`, `.uv-cache/`, `.tmp/`, Python/tool caches, generated runtime/query/gold data, results, and raster/vector figure outputs to `.gitignore`. Do not ignore `uv.lock` or `evidence\protected-source-hashes.json`.
 6. Add concise setup commands to `README.md`: `uv sync`, `uv run pre-commit install`, and the verification commands. Keep all experiment restrictions explicit.
 7. TDD RED: create `tests\test_evidence.py` first. It must exercise sorting, deduplication, POSIX relative paths, byte size, and 64-character SHA-256. Run it and retain evidence that it fails because `crm_experiment.evidence` does not exist.
-8. TDD GREEN: implement `sha256_file`, `collect_protected_hashes`, `write_manifest`, `verify_manifest`, and the CLI. Manifest schema version is 1 and rows contain only `path`, `bytes`, and `sha256`; the top level may contain `schema_version`, `repo`, and `files`.
+8. TDD GREEN: implement `sha256_file`, `collect_protected_hashes`, `write_manifest`, `verify_manifest`, and the CLI. Manifest schema version is 1 and rows contain only `path`, `bytes`, and `sha256`; the top level may contain `schema_version`, `repo`, and `files`. `write_manifest` must reject any output path located inside the protected repository, including the repository root itself.
 9. Generate `evidence\protected-source-hashes.json` from the protected patterns in the implementation plan. Verify it immediately using the CLI.
 10. Run the task acceptance commands and the 2718lab project validator. Review the diff and commit the task with message `chore: scaffold isolated CRM experiment`.
 
