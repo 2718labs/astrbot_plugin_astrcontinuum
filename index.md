@@ -4,23 +4,25 @@
 
 - `contracts/crm-experiment-design.md`
 - `contracts/python-toolchain.md`
+- `contracts/crm-data-model.md`
 
 ## Tasks
 
 - `tasks/spec-001.md`: done
 - `tasks/plan-001.md`: done
-- `tasks/impl-001.md`: ready
+- `tasks/impl-001.md`: done
+- `tasks/impl-002.md`: ready
 
 ## Dispatch
 
-- 当前 wave：`impl-001`
+- 当前 wave：`impl-002`
 - 写入冲突：无；始终仅允许一个实现写入代理。
 - 生产仓库：只读，不修改。
-- 下一门禁：`impl-001` 完成 TDD、规格审查和质量审查后，才创建并派发 `impl-002`。
+- 下一门禁：`impl-002` 完成 TDD、规格审查和质量审查后，才创建并派发 `impl-003`。
 
 ## Runtime State
 
 - 设计 workflow：`astrcontinuum-capsule-replacement-r3-spec-20260730`
 - 实现 workflow：`astrcontinuum-capsule-replacement-r3-impl-20260730`
-- 权威任务：`impl-001`
+- 权威任务：`impl-002`
 - 模式：独立实验实现；生产仓库只读。
