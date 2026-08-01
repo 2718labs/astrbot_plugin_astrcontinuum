@@ -19,18 +19,30 @@
 - `tasks/impl-006.md`: done
 - `tasks/impl-007.md`: done
 - `tasks/impl-008.md`: done
-- `tasks/impl-008a.md`: ready
+- `tasks/impl-008a.md`: done
+- `tasks/impl-008b.md`: done
+- `tasks/impl-009.md`: held until Protocol v2 evidence exists
+- `tasks/arch-001.md`: completion candidate; all local and Sol gates green,
+  DevKit completion pending
+- `tasks/arch-002.md`: DevKit-registered placeholder; card materializes on
+  dispatch; depends on `arch-001`
+- `tasks/arch-003.md`: DevKit-registered placeholder; card materializes on
+  dispatch; depends on `arch-002`
+- `tasks/protocol-v2.md`: DevKit-registered placeholder; card materializes on
+  dispatch; depends on `arch-003`
 
 ## Dispatch
 
-- 当前 wave：`impl-008a`
+- 当前 wave：`arch-001` completion candidate
 - 写入冲突：无；始终仅允许一个实现写入代理。
 - 生产仓库：只读，不修改。
-- 下一门禁：`impl-008a` 补齐指标来源并重跑完整协议后，才创建并派发 `impl-009`。
+- 下一门禁：精确 resident 字节、逻辑/物理分层与 kernel admission
+  通过后，才实现冻结态可逆 packing；Protocol v2 与 `impl-009` 报告均不得
+  越过三个架构任务。
 
 ## Runtime State
 
 - 设计 workflow：`astrcontinuum-capsule-replacement-r3-spec-20260730`
 - 实现 workflow：`astrcontinuum-capsule-replacement-r3-impl-20260730`
-- 权威任务：`impl-008a`
+- 权威任务：`arch-001`
 - 模式：独立实验实现；生产仓库只读。
