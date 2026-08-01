@@ -12,6 +12,7 @@ from crm_experiment.contracts import (
     ProjectionResult,
     QuerySpec,
     RecompositionRequest,
+    RecompositionResult,
     SemanticAtom,
 )
 from crm_experiment.kernel import select_kernel
@@ -109,7 +110,7 @@ class LegacyCapsuleBaseline:
 class NoProjectionAblation:
     """State-equivalent arm whose runner injects a query-blind stable prefix."""
 
-    def advance(
+    def advance_with_diagnostics(
         self,
         base_state: CapsuleState | None,
         delta: tuple[SemanticAtom, ...],
@@ -117,7 +118,8 @@ class NoProjectionAblation:
         kernel_schema: KernelSchema,
         loss_policy: LossPolicy,
         weight_version: str,
-    ) -> CapsuleState:
+    ) -> RecompositionResult:
+        """Return the complete CRM result used by the state-equivalent arm."""
         return recompose_capsule(
             RecompositionRequest(
                 base_state=base_state,
@@ -127,6 +129,24 @@ class NoProjectionAblation:
                 loss_policy=loss_policy,
                 weight_version=weight_version,
             )
+        )
+
+    def advance(
+        self,
+        base_state: CapsuleState | None,
+        delta: tuple[SemanticAtom, ...],
+        byte_budget: int,
+        kernel_schema: KernelSchema,
+        loss_policy: LossPolicy,
+        weight_version: str,
+    ) -> CapsuleState:
+        return self.advance_with_diagnostics(
+            base_state,
+            delta,
+            byte_budget,
+            kernel_schema,
+            loss_policy,
+            weight_version,
         ).state
 
     def project(
@@ -300,7 +320,7 @@ class RecursiveSummaryBaseline:
 class NoKernelAblation:
     """Offline copy that clears core flags and removes the continuity kernel."""
 
-    def advance(
+    def advance_with_diagnostics(
         self,
         base_state: CapsuleState | None,
         delta: tuple[SemanticAtom, ...],
@@ -308,7 +328,8 @@ class NoKernelAblation:
         kernel_schema: KernelSchema,
         loss_policy: LossPolicy,
         weight_version: str,
-    ) -> CapsuleState:
+    ) -> RecompositionResult:
+        """Return the CRM result for the isolated no-kernel state copy."""
         del kernel_schema
         cleared_delta = tuple(replace(atom, core_required=False) for atom in delta)
         cleared_base = None
@@ -332,4 +353,22 @@ class NoKernelAblation:
                 loss_policy=loss_policy,
                 weight_version=weight_version,
             )
+        )
+
+    def advance(
+        self,
+        base_state: CapsuleState | None,
+        delta: tuple[SemanticAtom, ...],
+        byte_budget: int,
+        kernel_schema: KernelSchema,
+        loss_policy: LossPolicy,
+        weight_version: str,
+    ) -> CapsuleState:
+        return self.advance_with_diagnostics(
+            base_state,
+            delta,
+            byte_budget,
+            kernel_schema,
+            loss_policy,
+            weight_version,
         ).state

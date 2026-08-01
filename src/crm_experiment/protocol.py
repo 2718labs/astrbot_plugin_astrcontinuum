@@ -61,7 +61,16 @@ class StreamCase:
 class ProtocolBundle:
     streams: tuple[StreamCase, ...]
     public_queries: tuple[QuerySpec, ...]
-    sealed_gold: tuple[QueryGold, ...]
+    sealed_gold: tuple[ProtocolQueryGold, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class ProtocolQueryGold(QueryGold):
+    """Protocol-only gold labels layered over the frozen scoring contract."""
+
+    role: AtomRole
+    is_exact_anchor: bool
+    is_topic_return: bool
 
 
 def _as_int(raw: object, name: str, *, positive: bool = False) -> int:
@@ -200,9 +209,9 @@ def _query_and_gold(
     generation: int,
     current: dict[str, SemanticAtom],
     history: dict[str, list[SemanticAtom]],
-) -> tuple[tuple[QuerySpec, ...], tuple[QueryGold, ...]]:
+) -> tuple[tuple[QuerySpec, ...], tuple[ProtocolQueryGold, ...]]:
     query_specs: list[QuerySpec] = []
-    gold: list[QueryGold] = []
+    gold: list[ProtocolQueryGold] = []
     for position, role in enumerate(_QUERY_ROLES):
         semantic_key = {
             AtomRole.ROOT_GOAL: "goal",
@@ -217,13 +226,16 @@ def _query_and_gold(
         active = current[semantic_key]
         previous = history[semantic_key][-2:-1]
         gold.append(
-            QueryGold(
+            ProtocolQueryGold(
                 query_id=query_id,
                 required_atom_ids=(active.atom_id,),
                 forbidden_atom_ids=tuple(item.atom_id for item in previous),
                 required_text=(active.text,),
                 forbidden_text=tuple(item.text for item in previous),
                 core_query=role is not AtomRole.CONTEXT,
+                role=role,
+                is_exact_anchor=role is AtomRole.EXACT_ANCHOR,
+                is_topic_return=role is AtomRole.CONTEXT,
             )
         )
     return tuple(query_specs), tuple(gold)
@@ -233,7 +245,7 @@ def generate_protocol(config: ProtocolConfig) -> ProtocolBundle:
     """Generate deterministic runtime events with separate public query/gold data."""
     streams: list[StreamCase] = []
     public_queries: list[QuerySpec] = []
-    sealed_gold: list[QueryGold] = []
+    sealed_gold: list[ProtocolQueryGold] = []
     for stream_index in range(config.stream_count):
         seed = config.seed_start + stream_index
         current: dict[str, SemanticAtom] = {}

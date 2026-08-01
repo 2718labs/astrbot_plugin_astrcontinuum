@@ -9,7 +9,7 @@ from collections import Counter
 from dataclasses import dataclass, replace
 from pathlib import Path
 from time import perf_counter_ns
-from typing import Any
+from typing import Any, NoReturn
 
 from crm_experiment.baselines import (
     ARM_ORDER,
@@ -45,25 +45,153 @@ from crm_experiment.protocol import (
 )
 from crm_experiment.recompose import recompose_capsule
 
+_SOURCE_ID_DIGEST_DOMAIN = "crm-source-id/v1"
+_SOURCE_SET_DIGEST_DOMAIN = "crm-source-set/v1"
+_CHECKPOINT_ID_DOMAIN = "crm-checkpoint/v1"
+
+
+class ForbiddenQueryRead(RuntimeError):
+    """Raised when projection attempts to read outside its frozen state view."""
+
+
+@dataclass(slots=True)
+class QueryReadTrace:
+    frozen_capsule_reads: int = 0
+    frozen_summary_reads: int = 0
+    old_capsule_reads: int = 0
+    delta_reads: int = 0
+    canonical_truth_reads: int = 0
+    sealed_gold_reads: int = 0
+    other_arm_reads: int = 0
+
+    @property
+    def fallback_reads(self) -> int:
+        return (
+            self.old_capsule_reads
+            + self.delta_reads
+            + self.canonical_truth_reads
+            + self.sealed_gold_reads
+            + self.other_arm_reads
+        )
+
+    @property
+    def query_source(self) -> str:
+        if self.frozen_capsule_reads and not self.frozen_summary_reads:
+            return "frozen_capsule"
+        if self.frozen_summary_reads and not self.frozen_capsule_reads:
+            return "frozen_summary"
+        return "not_read"
+
+    def as_dict(self) -> dict[str, int]:
+        return {
+            "frozen_capsule_reads": self.frozen_capsule_reads,
+            "frozen_summary_reads": self.frozen_summary_reads,
+            "old_capsule_reads": self.old_capsule_reads,
+            "delta_reads": self.delta_reads,
+            "canonical_truth_reads": self.canonical_truth_reads,
+            "sealed_gold_reads": self.sealed_gold_reads,
+            "other_arm_reads": self.other_arm_reads,
+        }
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenStateView:
+    """The only state surface available to query projection."""
+
+    _state: CapsuleState | str | None
+    state_hash: str
+    trace: QueryReadTrace
+
+    def read_capsule(self) -> CapsuleState:
+        if not isinstance(self._state, CapsuleState):
+            raise TypeError("frozen state is not a capsule")
+        self.trace.frozen_capsule_reads += 1
+        return self._state
+
+    def read_summary(self) -> str:
+        if not isinstance(self._state, str):
+            raise TypeError("frozen state is not a summary")
+        self.trace.frozen_summary_reads += 1
+        return self._state
+
+    def attempt_forbidden_read(self, source: str) -> NoReturn:
+        fields = {
+            "old_capsule": "old_capsule_reads",
+            "delta": "delta_reads",
+            "canonical_truth": "canonical_truth_reads",
+            "sealed_gold": "sealed_gold_reads",
+            "other_arm": "other_arm_reads",
+        }
+        field = fields.get(source, "other_arm_reads")
+        setattr(self.trace, field, getattr(self.trace, field) + 1)
+        raise ForbiddenQueryRead(source)
+
+
+@dataclass(frozen=True, slots=True)
+class _QueryExecution:
+    projection: ProjectionResult
+    error_code: str
+    query_source: str
+    query_source_state_hash: str | None
+    fallback_reads: int
+    read_trace: dict[str, int]
+
+
+@dataclass(frozen=True, slots=True)
+class _MeasurementAtom:
+    atom_id: str
+    semantic_keys: tuple[str, ...]
+    role: AtomRole
+    status: AtomStatus
+    revision: int
+    as_of: int
+    weight: float
+    core_required: bool
+
 
 @dataclass(frozen=True, slots=True)
 class _AdvanceResult:
     state: CapsuleState | str | None
     state_hash: str
+    requested_budget_bytes: int
+    accepted_budget_bytes: int
+    budget_overshoot_bytes: int
     persistent_bytes: int
+    kernel_payload_bytes: int
+    state_overhead_bytes: int
     kernel_bytes: int
     body_bytes: int
     outcome: str
-    released_count: int
-    omission_weight: float
-    error_risk: float
-    continuity_break: bool
-    stale_current: bool
+    error_risk: float | None
     matrix_hash: str
     stage_ns: tuple[tuple[str, int], ...]
     total_ns: int
     peak_workspace_bytes: int
     error_code: str
+    transition_committed: bool
+    consumed_delta: bool
+
+
+@dataclass(frozen=True, slots=True)
+class _TransitionMetrics:
+    step_input_bytes: int | None
+    semantic_weight_denominator: float
+    weighted_retained_weight: float
+    weighted_omitted_weight: float
+    released_count: int | None
+    release_denominator_count: int | None
+    net_released_bytes: int | None
+    rejected_delta_bytes: int
+    committed_base_state_reduction_bytes: int | None
+    coverage_intersection_count: int
+    coverage_union_count: int
+    previous_coverage_digest: str
+    new_coverage_digest: str
+    kernel_coverage_count: int
+    kernel_coverage_denominator: int
+    kernel_coverage_id_digests: tuple[str, ...]
+    internal_continuity_break: bool
+    internal_stale_current: bool
 
 
 def _write_json(path: Path, value: object) -> None:
@@ -225,10 +353,68 @@ def _load_public_queries(path: Path) -> dict[str, QuerySpec]:
     return queries
 
 
-def _capsule_ids(state: CapsuleState | None) -> set[str]:
+def _measurement_rank(atom: _MeasurementAtom) -> tuple[int, str]:
+    return atom.revision, atom.atom_id
+
+
+def _update_measurement_ledger(
+    ledger: dict[str, _MeasurementAtom],
+    delta: tuple[SemanticAtom, ...],
+) -> None:
+    """Update content-free latest-per-key telemetry from one already-seen delta."""
+    for atom in delta:
+        telemetry = _MeasurementAtom(
+            atom_id=atom.atom_id,
+            semantic_keys=tuple(sorted(atom.semantic_keys)),
+            role=atom.role,
+            status=atom.status,
+            revision=atom.revision,
+            as_of=atom.as_of,
+            weight=atom.weight,
+            core_required=atom.core_required,
+        )
+        for semantic_key in telemetry.semantic_keys:
+            previous = ledger.get(semantic_key)
+            if previous is None or _measurement_rank(telemetry) > _measurement_rank(
+                previous
+            ):
+                ledger[semantic_key] = telemetry
+
+
+def _measurement_universe(
+    ledger: dict[str, _MeasurementAtom],
+) -> tuple[_MeasurementAtom, ...]:
+    """Return each latest active source atom once, independent of arm state."""
+    active_by_id = {
+        atom.atom_id: atom
+        for atom in ledger.values()
+        if atom.status is AtomStatus.ACTIVE
+    }
+    return tuple(active_by_id[atom_id] for atom_id in sorted(active_by_id))
+
+
+def _expanded_atom_coverage(atom: SemanticAtom) -> set[str]:
+    return set(atom.covered_atom_ids or (atom.atom_id,))
+
+
+def _capsule_coverage(state: CapsuleState | None) -> set[str]:
     if state is None:
         return set()
-    return {atom.atom_id for atom in state.kernel + state.body}
+    return {
+        source_id
+        for atom in state.kernel + state.body
+        for source_id in _expanded_atom_coverage(atom)
+    }
+
+
+def _kernel_coverage(state: CapsuleState | str | None) -> set[str]:
+    if not isinstance(state, CapsuleState):
+        return set()
+    return {
+        source_id
+        for atom in state.kernel
+        for source_id in _expanded_atom_coverage(atom)
+    }
 
 
 def _persistent_bytes(state: CapsuleState | str | None) -> int:
@@ -237,6 +423,155 @@ def _persistent_bytes(state: CapsuleState | str | None) -> int:
     if isinstance(state, str):
         return utf8_bytes(state)
     return 0
+
+
+def _state_coverage(state: CapsuleState | str | None) -> set[str]:
+    if isinstance(state, CapsuleState):
+        return _capsule_coverage(state)
+    if isinstance(state, str):
+        return _summary_ids(state)
+    return set()
+
+
+def _delta_coverage(delta: tuple[SemanticAtom, ...]) -> set[str]:
+    return {source_id for atom in delta for source_id in _expanded_atom_coverage(atom)}
+
+
+def _source_id_digest(source_id: str, source_manifest_hash: str) -> str:
+    return sha256_text(
+        canonical_json(
+            {
+                "domain": _SOURCE_ID_DIGEST_DOMAIN,
+                "source_manifest_hash": source_manifest_hash,
+                "source_id": source_id,
+            }
+        )
+    )
+
+
+def _coverage_digest(source_ids: set[str], source_manifest_hash: str) -> str:
+    return sha256_text(
+        canonical_json(
+            {
+                "domain": _SOURCE_SET_DIGEST_DOMAIN,
+                "source_manifest_hash": source_manifest_hash,
+                "source_id_digests": tuple(
+                    _source_id_digest(source_id, source_manifest_hash)
+                    for source_id in sorted(source_ids)
+                ),
+            }
+        )
+    )
+
+
+def _checkpoint_id(
+    stream_id: str,
+    generation: int,
+    multiplier: float,
+    arm: str,
+    source_manifest_hash: str,
+) -> str:
+    return sha256_text(
+        canonical_json(
+            {
+                "domain": _CHECKPOINT_ID_DOMAIN,
+                "source_manifest_hash": source_manifest_hash,
+                "stream_id": stream_id,
+                "generation": generation,
+                "budget_multiplier": multiplier,
+                "arm": arm,
+            }
+        )
+    )
+
+
+def _state_byte_partitions(
+    state: CapsuleState | str | None,
+) -> tuple[int, int, int, int, int]:
+    """Return persistent, kernel payload, frame overhead, kernel, and body bytes."""
+    if isinstance(state, CapsuleState):
+        persistent = utf8_bytes(canonical_json(state))
+        resident_frame = utf8_bytes(canonical_json(replace(state, body=())))
+        kernel_payload = utf8_bytes(canonical_json(state.kernel))
+        state_overhead = resident_frame - kernel_payload
+        body = persistent - resident_frame
+        return persistent, kernel_payload, state_overhead, resident_frame, body
+    if isinstance(state, str):
+        persistent = utf8_bytes(state)
+        return persistent, 0, 0, 0, persistent
+    return 0, 0, 0, 0, 0
+
+
+def _accepted_budget(state: CapsuleState | str | None, requested: int) -> int:
+    if isinstance(state, CapsuleState):
+        return state.accepted_budget
+    return requested
+
+
+def _measure_transition(
+    previous: CapsuleState | str | None,
+    delta_source_ids: set[str],
+    advance: _AdvanceResult,
+    universe: tuple[_MeasurementAtom, ...],
+    raw_step_input_bytes: int,
+    delta_bytes: int,
+    source_manifest_hash: str,
+) -> _TransitionMetrics:
+    previous_coverage = _state_coverage(previous)
+    new_coverage = _state_coverage(advance.state)
+    step_sources = previous_coverage | delta_source_ids
+    universe_by_id = {atom.atom_id: atom for atom in universe}
+    universe_ids = set(universe_by_id)
+    retained_ids = universe_ids & new_coverage
+    semantic_weight_denominator = sum(atom.weight for atom in universe_by_id.values())
+    weighted_retained_weight = sum(
+        universe_by_id[source_id].weight for source_id in retained_ids
+    )
+    weighted_omitted_weight = semantic_weight_denominator - weighted_retained_weight
+    required_ids = {
+        atom.atom_id for atom in universe_by_id.values() if atom.core_required
+    }
+    kernel_ids = _kernel_coverage(advance.state)
+    step_metrics_available = advance.transition_committed and advance.consumed_delta
+    previous_bytes = _persistent_bytes(previous)
+    return _TransitionMetrics(
+        step_input_bytes=raw_step_input_bytes if step_metrics_available else None,
+        semantic_weight_denominator=semantic_weight_denominator,
+        weighted_retained_weight=weighted_retained_weight,
+        weighted_omitted_weight=weighted_omitted_weight,
+        released_count=(
+            len(step_sources - new_coverage) if step_metrics_available else None
+        ),
+        release_denominator_count=(
+            len(step_sources) if step_metrics_available else None
+        ),
+        net_released_bytes=(
+            raw_step_input_bytes - advance.persistent_bytes
+            if step_metrics_available
+            else None
+        ),
+        rejected_delta_bytes=0 if advance.consumed_delta else delta_bytes,
+        committed_base_state_reduction_bytes=(
+            max(0, previous_bytes - advance.persistent_bytes)
+            if advance.transition_committed and not advance.consumed_delta
+            else None
+        ),
+        coverage_intersection_count=len(previous_coverage & new_coverage),
+        coverage_union_count=len(previous_coverage | new_coverage),
+        previous_coverage_digest=_coverage_digest(
+            previous_coverage,
+            source_manifest_hash,
+        ),
+        new_coverage_digest=_coverage_digest(new_coverage, source_manifest_hash),
+        kernel_coverage_count=len(required_ids & kernel_ids),
+        kernel_coverage_denominator=len(required_ids),
+        kernel_coverage_id_digests=tuple(
+            _source_id_digest(source_id, source_manifest_hash)
+            for source_id in sorted(kernel_ids)
+        ),
+        internal_continuity_break=not required_ids <= kernel_ids,
+        internal_stale_current=bool(new_coverage - universe_ids),
+    )
 
 
 def _summary_ids(value: str) -> set[str]:
@@ -326,7 +661,7 @@ def _advance_arm(
                 budget,
             )
         elif arm == "crm_no_projection":
-            state = NoProjectionAblation().advance(
+            result = NoProjectionAblation().advance_with_diagnostics(
                 previous if isinstance(previous, CapsuleState) else None,
                 delta,
                 budget,
@@ -334,8 +669,9 @@ def _advance_arm(
                 config.weights,
                 config.weight_version,
             )
+            state = result.state
         elif arm == "crm_no_kernel":
-            state = NoKernelAblation().advance(
+            result = NoKernelAblation().advance_with_diagnostics(
                 previous if isinstance(previous, CapsuleState) else None,
                 delta,
                 budget,
@@ -343,105 +679,93 @@ def _advance_arm(
                 config.weights,
                 config.weight_version,
             )
+            state = result.state
         else:
             raise ValueError(f"unknown arm: {arm}")
         _, peak = tracemalloc.get_traced_memory()
         total_ns = perf_counter_ns() - started
-        if isinstance(state, CapsuleState):
-            old_ids = _capsule_ids(
-                previous if isinstance(previous, CapsuleState) else None
-            )
-            new_ids = _capsule_ids(state)
-            released_count = (
-                len(result.loss.released_atom_ids)
-                if result is not None
-                else len(old_ids - new_ids)
-            )
-            state_digest = semantic_hash(state)
-            persistent_bytes = utf8_bytes(canonical_json(state))
-            kernel_bytes = utf8_bytes(canonical_json(state.kernel))
-            body_bytes = utf8_bytes(canonical_json(state.body))
-            outcome = (
-                result.outcome.value
-                if result is not None
-                else (
-                    OutcomeState.NORMAL.value
-                    if state.body
-                    else OutcomeState.KERNEL_ONLY.value
+        state_digest = (
+            semantic_hash(state)
+            if isinstance(state, CapsuleState)
+            else sha256_text(state or "")
+        )
+        (
+            persistent_bytes,
+            kernel_payload_bytes,
+            state_overhead_bytes,
+            kernel_bytes,
+            body_bytes,
+        ) = _state_byte_partitions(state)
+        accepted_budget_bytes = _accepted_budget(state, budget)
+        outcome = (
+            result.outcome.value
+            if result is not None
+            else (
+                OutcomeState.NORMAL.value
+                if (
+                    (isinstance(state, CapsuleState) and bool(state.body))
+                    or (isinstance(state, str) and bool(state))
                 )
+                else OutcomeState.KERNEL_ONLY.value
             )
-            omission_weight = 0.0 if result is None else result.loss.omission_weight
-            error_risk = 0.0 if result is None else result.loss.error_risk
-            continuity_break = False if result is None else result.loss.continuity_break
-            stale_current = False if result is None else result.loss.stale_current
-        else:
-            old_ids = _summary_ids(previous if isinstance(previous, str) else "")
-            new_ids = _summary_ids(state or "")
-            released_count = len(old_ids - new_ids)
-            state_digest = sha256_text(state or "")
-            persistent_bytes = utf8_bytes(state or "")
-            kernel_bytes = 0
-            body_bytes = persistent_bytes
-            outcome = (
-                OutcomeState.NORMAL.value if state else OutcomeState.KERNEL_ONLY.value
-            )
-            omission_weight = 0.0
-            error_risk = 0.0
-            continuity_break = False
-            stale_current = False
+        )
         return _AdvanceResult(
             state=state,
             state_hash=state_digest,
+            requested_budget_bytes=budget,
+            accepted_budget_bytes=accepted_budget_bytes,
+            budget_overshoot_bytes=max(0, persistent_bytes - accepted_budget_bytes),
             persistent_bytes=persistent_bytes,
+            kernel_payload_bytes=kernel_payload_bytes,
+            state_overhead_bytes=state_overhead_bytes,
             kernel_bytes=kernel_bytes,
             body_bytes=body_bytes,
             outcome=outcome,
-            released_count=released_count,
-            omission_weight=omission_weight,
-            error_risk=error_risk,
-            continuity_break=continuity_break,
-            stale_current=stale_current,
+            error_risk=None if result is None else result.loss.error_risk,
             matrix_hash="" if result is None else result.matrix_hash,
             stage_ns=() if result is None else result.stage_ns,
             total_ns=total_ns,
             peak_workspace_bytes=peak,
             error_code="",
+            transition_committed=True,
+            consumed_delta=True if result is None else result.consumed_delta,
         )
     except (TypeError, ValueError, KeyError):
         _, peak = tracemalloc.get_traced_memory()
         total_ns = perf_counter_ns() - started
-        if isinstance(previous, CapsuleState):
-            digest = semantic_hash(previous)
-            persistent_bytes = utf8_bytes(canonical_json(previous))
-            kernel_bytes = utf8_bytes(canonical_json(previous.kernel))
-            body_bytes = utf8_bytes(canonical_json(previous.body))
-        elif isinstance(previous, str):
-            digest = sha256_text(previous)
-            persistent_bytes = utf8_bytes(previous)
-            kernel_bytes = 0
-            body_bytes = persistent_bytes
-        else:
-            digest = sha256_text("")
-            persistent_bytes = 0
-            kernel_bytes = 0
-            body_bytes = 0
+        digest = (
+            semantic_hash(previous)
+            if isinstance(previous, CapsuleState)
+            else sha256_text(previous or "")
+        )
+        (
+            persistent_bytes,
+            kernel_payload_bytes,
+            state_overhead_bytes,
+            kernel_bytes,
+            body_bytes,
+        ) = _state_byte_partitions(previous)
+        accepted_budget_bytes = _accepted_budget(previous, budget)
         return _AdvanceResult(
             state=previous,
             state_hash=digest,
+            requested_budget_bytes=budget,
+            accepted_budget_bytes=accepted_budget_bytes,
+            budget_overshoot_bytes=max(0, persistent_bytes - accepted_budget_bytes),
             persistent_bytes=persistent_bytes,
+            kernel_payload_bytes=kernel_payload_bytes,
+            state_overhead_bytes=state_overhead_bytes,
             kernel_bytes=kernel_bytes,
             body_bytes=body_bytes,
             outcome="failure",
-            released_count=0,
-            omission_weight=0.0,
-            error_risk=0.0,
-            continuity_break=False,
-            stale_current=False,
+            error_risk=None,
             matrix_hash="",
             stage_ns=(),
             total_ns=total_ns,
             peak_workspace_bytes=peak,
             error_code="ADVANCE_FAILED",
+            transition_committed=False,
+            consumed_delta=False,
         )
     finally:
         tracemalloc.stop()
@@ -460,17 +784,62 @@ def _unknown(query_id: str) -> ProjectionResult:
 
 def _project_arm(
     arm: str,
-    state: CapsuleState | str | None,
+    view: FrozenStateView,
     query: QuerySpec,
     byte_budget: int,
 ) -> ProjectionResult:
-    if arm == "recursive_summary" and isinstance(state, str):
+    if arm == "recursive_summary":
+        state = view.read_summary()
         return RecursiveSummaryBaseline().project(state, query, byte_budget)
-    if arm == "crm_no_projection" and isinstance(state, CapsuleState):
+    state = view.read_capsule()
+    if arm == "crm_no_projection":
         return NoProjectionAblation().project(state, query.query_id, byte_budget)
-    if isinstance(state, CapsuleState):
-        return project_query(state, query, byte_budget)
-    return _unknown(query.query_id)
+    return project_query(state, query, byte_budget)
+
+
+def _execute_projection(
+    arm: str,
+    state: CapsuleState | str | None,
+    state_hash: str,
+    query: QuerySpec | None,
+    byte_budget: int,
+    *,
+    advance_error: str,
+    query_id: str | None = None,
+) -> _QueryExecution:
+    trace = QueryReadTrace()
+    resolved_query_id = query.query_id if query is not None else (query_id or "")
+    if query is None:
+        projection = _unknown(resolved_query_id)
+        error_code = "QUERY_MISSING"
+    elif advance_error:
+        projection = _unknown(resolved_query_id)
+        error_code = advance_error
+    else:
+        view = FrozenStateView(state, state_hash, trace)
+        try:
+            projection = _project_arm(arm, view, query, byte_budget)
+            error_code = ""
+        except ForbiddenQueryRead:
+            projection = _unknown(resolved_query_id)
+            error_code = "FORBIDDEN_QUERY_READ"
+        except (TypeError, ValueError, KeyError):
+            projection = _unknown(resolved_query_id)
+            error_code = "PROJECTION_FAILED"
+    if trace.fallback_reads:
+        projection = _unknown(resolved_query_id)
+        error_code = "FORBIDDEN_QUERY_READ"
+    query_source = trace.query_source
+    return _QueryExecution(
+        projection=projection,
+        error_code=error_code,
+        query_source=query_source,
+        query_source_state_hash=(
+            state_hash if query_source in {"frozen_capsule", "frozen_summary"} else None
+        ),
+        fallback_reads=trace.fallback_reads,
+        read_trace=trace.as_dict(),
+    )
 
 
 def _expected_query_ids(stream_id: str, generation: int) -> tuple[str, ...]:
@@ -485,43 +854,72 @@ def _expected_query_ids(stream_id: str, generation: int) -> tuple[str, ...]:
 
 
 def _learning_event(
+    checkpoint_id: str,
     stream_id: str,
     generation: int,
     multiplier: float,
     arm: str,
     advance: _AdvanceResult,
+    transition: _TransitionMetrics,
     weight_version: str,
     history_bytes: int,
-    step_input_bytes: int,
     delta_bytes: int,
+    source_manifest_hash: str,
 ) -> dict[str, object]:
-    return {
+    row = {
         "kind": "checkpoint",
+        "checkpoint_id": checkpoint_id,
         "stream_id": stream_id,
         "generation": generation,
         "budget_multiplier": multiplier,
         "arm": arm,
+        "state_hash": advance.state_hash,
+        "source_manifest_hash": source_manifest_hash,
+        "id_digest_domain": _SOURCE_ID_DIGEST_DOMAIN,
         "weight_version": weight_version,
         "matrix_hash": advance.matrix_hash,
         "role_counts": _role_counts(advance.state),
         "selected_count": sum(_role_counts(advance.state).values()),
-        "released_count": advance.released_count,
+        "released_count": transition.released_count,
+        "release_denominator_count": transition.release_denominator_count,
+        "requested_budget_bytes": advance.requested_budget_bytes,
+        "accepted_budget_bytes": advance.accepted_budget_bytes,
+        "budget_overshoot_bytes": advance.budget_overshoot_bytes,
         "persistent_bytes": advance.persistent_bytes,
+        "kernel_payload_bytes": advance.kernel_payload_bytes,
+        "state_overhead_bytes": advance.state_overhead_bytes,
         "kernel_bytes": advance.kernel_bytes,
         "body_bytes": advance.body_bytes,
         "history_bytes": history_bytes,
-        "step_input_bytes": step_input_bytes,
+        "step_input_bytes": transition.step_input_bytes,
         "delta_bytes": delta_bytes,
-        "omission_weight": advance.omission_weight,
+        "net_released_bytes": transition.net_released_bytes,
+        "transition_committed": advance.transition_committed,
+        "consumed_delta": advance.consumed_delta,
+        "rejected_delta_bytes": transition.rejected_delta_bytes,
+        "committed_base_state_reduction_bytes": (
+            transition.committed_base_state_reduction_bytes
+        ),
+        "semantic_weight_denominator": transition.semantic_weight_denominator,
+        "weighted_retained_weight": transition.weighted_retained_weight,
+        "weighted_omitted_weight": transition.weighted_omitted_weight,
         "error_risk": advance.error_risk,
-        "continuity_break": advance.continuity_break,
-        "stale_current": advance.stale_current,
+        "coverage_intersection_count": transition.coverage_intersection_count,
+        "coverage_union_count": transition.coverage_union_count,
+        "previous_coverage_digest": transition.previous_coverage_digest,
+        "new_coverage_digest": transition.new_coverage_digest,
+        "kernel_coverage_count": transition.kernel_coverage_count,
+        "kernel_coverage_denominator": transition.kernel_coverage_denominator,
+        "kernel_coverage_id_digests": transition.kernel_coverage_id_digests,
+        "internal_continuity_break": transition.internal_continuity_break,
+        "internal_stale_current": transition.internal_stale_current,
         "peak_workspace_bytes": advance.peak_workspace_bytes,
         "stage_ns": dict(advance.stage_ns),
         "total_ns": advance.total_ns,
         "outcome": advance.outcome,
         "error_code": advance.error_code,
     }
+    return row
 
 
 def _zero_delta_events(
@@ -541,11 +939,15 @@ def _zero_delta_events(
             else:
                 initial_hash = sha256_text(current or "")
             probe = current
-            stable = True
-            for _ in range(config.zero_delta_rounds):
+            round_hashes: list[str] = []
+            first_unstable_round: int | None = None
+            for round_number in range(1, config.zero_delta_rounds + 1):
                 advanced = _advance_arm(arm, probe, (), budget, config)
                 probe = advanced.state
-                stable = stable and advanced.state_hash == initial_hash
+                round_hashes.append(advanced.state_hash)
+                if first_unstable_round is None and advanced.state_hash != initial_hash:
+                    first_unstable_round = round_number
+            final_hash = round_hashes[-1] if round_hashes else initial_hash
             rows.append(
                 {
                     "kind": "zero_delta",
@@ -553,7 +955,11 @@ def _zero_delta_events(
                     "budget_multiplier": multiplier,
                     "arm": arm,
                     "rounds": config.zero_delta_rounds,
-                    "stable": stable,
+                    "initial_hash": initial_hash,
+                    "round_hashes": tuple(round_hashes),
+                    "final_hash": final_hash,
+                    "first_unstable_round": first_unstable_round,
+                    "stable": first_unstable_round is None,
                     "weight_version": config.weight_version,
                 }
             )
@@ -600,7 +1006,9 @@ def run_protocol(
 ) -> Path:
     """Run every budgeted arm while revealing queries only after state freeze."""
     config = load_protocol_config(config_path)
-    streams = _load_runtime(Path(runtime_path))
+    runtime_file = Path(runtime_path)
+    source_manifest_hash = hashlib.sha256(runtime_file.read_bytes()).hexdigest()
+    streams = _load_runtime(runtime_file)
     output = Path(output_root)
     output.mkdir(parents=True, exist_ok=True)
     records_path = output / "records.jsonl"
@@ -614,6 +1022,7 @@ def run_protocol(
     for stream in sorted(streams, key=lambda item: str(item["stream_id"])):
         stream_id = str(stream["stream_id"])
         history_bytes = 0
+        measurement_ledger: dict[str, _MeasurementAtom] = {}
         states: dict[tuple[float, str], CapsuleState | str | None] = {
             (multiplier, arm): "" if arm == "recursive_summary" else None
             for multiplier in config.budget_multipliers
@@ -631,47 +1040,69 @@ def run_protocol(
                 raise ValueError("runtime events must be immutable after loading")
             delta_bytes = utf8_bytes(canonical_json(delta))
             history_bytes += delta_bytes
+            _update_measurement_ledger(measurement_ledger, delta)
+            measurement_universe = _measurement_universe(measurement_ledger)
+            delta_source_ids = _delta_coverage(delta)
             for multiplier in config.budget_multipliers:
                 budget = round(multiplier * kernel_ceiling)
                 advances: dict[str, _AdvanceResult] = {}
-                step_input_bytes: dict[str, int] = {}
+                checkpoint_ids: dict[str, str] = {}
                 for arm in ARM_ORDER:
                     key = (multiplier, arm)
-                    step_input_bytes[arm] = _persistent_bytes(states[key]) + delta_bytes
+                    previous_state = states[key]
+                    raw_step_input_bytes = (
+                        _persistent_bytes(previous_state) + delta_bytes
+                    )
                     advance = _advance_arm(
                         arm,
-                        states[key],
+                        previous_state,
                         delta,
                         budget,
                         config,
                     )
+                    transition = _measure_transition(
+                        previous_state,
+                        delta_source_ids,
+                        advance,
+                        measurement_universe,
+                        raw_step_input_bytes,
+                        delta_bytes,
+                        source_manifest_hash,
+                    )
                     states[key] = advance.state
                     advances[arm] = advance
+                    checkpoint_id = _checkpoint_id(
+                        stream_id,
+                        generation,
+                        multiplier,
+                        arm,
+                        source_manifest_hash,
+                    )
+                    checkpoint_ids[arm] = checkpoint_id
                     manifest_rows.append(
                         {
+                            "checkpoint_id": checkpoint_id,
                             "stream_id": stream_id,
                             "generation": generation,
                             "budget_multiplier": multiplier,
-                            "budget_bytes": budget,
                             "arm": arm,
                             "state_hash": advance.state_hash,
-                            "persistent_bytes": advance.persistent_bytes,
-                            "outcome": advance.outcome,
-                            "released_count": advance.released_count,
-                            "error_code": advance.error_code,
+                            "source_manifest_hash": source_manifest_hash,
                         }
                     )
                     learning.append(
                         _learning_event(
+                            checkpoint_id,
                             stream_id,
                             generation,
                             multiplier,
                             arm,
                             advance,
+                            transition,
                             config.weight_version,
                             history_bytes,
-                            step_input_bytes[arm],
                             delta_bytes,
+                            source_manifest_hash,
                         )
                     )
 
@@ -680,69 +1111,57 @@ def run_protocol(
                     {"schema_version": 1, "checkpoints": manifest_rows},
                 )
                 revealed = _load_public_queries(Path(query_path))
-                query_outcomes: dict[str, list[ProjectionResult]] = {
+                query_executions: dict[str, list[_QueryExecution]] = {
                     arm: [] for arm in ARM_ORDER
                 }
                 for query_id in _expected_query_ids(stream_id, generation):
                     query = revealed.get(query_id)
                     for arm in ARM_ORDER:
                         advance = advances[arm]
-                        if query is None:
-                            projection = _unknown(query_id)
-                            error_code = "QUERY_MISSING"
-                        elif advance.error_code:
-                            projection = _unknown(query_id)
-                            error_code = advance.error_code
-                        else:
-                            try:
-                                projection = _project_arm(
-                                    arm,
-                                    advance.state,
-                                    query,
-                                    config.query_injection_bytes,
-                                )
-                                error_code = ""
-                            except (TypeError, ValueError, KeyError):
-                                projection = _unknown(query_id)
-                                error_code = "PROJECTION_FAILED"
+                        execution = _execute_projection(
+                            arm,
+                            advance.state,
+                            advance.state_hash,
+                            query,
+                            config.query_injection_bytes,
+                            advance_error=advance.error_code,
+                            query_id=query_id,
+                        )
+                        projection = execution.projection
                         records.append(
                             {
+                                "checkpoint_id": checkpoint_ids[arm],
                                 "stream_id": stream_id,
                                 "generation": generation,
                                 "budget_multiplier": multiplier,
-                                "budget_bytes": budget,
                                 "arm": arm,
                                 "query_id": query_id,
+                                "query_role": None
+                                if query is None
+                                else query.role.value,
+                                "projection_budget_bytes": config.query_injection_bytes,
+                                "query_source": execution.query_source,
+                                "query_source_state_hash": (
+                                    execution.query_source_state_hash
+                                ),
+                                "query_read_trace": execution.read_trace,
+                                "fallback_reads": execution.fallback_reads,
                                 "answer_text": projection.text,
                                 "selected_atom_ids": projection.selected_atom_ids,
                                 "selected_covered_ids": projection.selected_covered_ids,
                                 "projection_bytes": projection.byte_cost,
                                 "supported": projection.supported,
-                                "state_hash": advance.state_hash,
-                                "persistent_bytes": advance.persistent_bytes,
-                                "kernel_bytes": advance.kernel_bytes,
-                                "body_bytes": advance.body_bytes,
-                                "history_bytes": history_bytes,
-                                "step_input_bytes": step_input_bytes[arm],
-                                "delta_bytes": delta_bytes,
-                                "omission_weight": advance.omission_weight,
-                                "error_risk": advance.error_risk,
-                                "continuity_break": advance.continuity_break,
-                                "stale_current": advance.stale_current,
-                                "outcome": advance.outcome,
-                                "released_count": advance.released_count,
-                                "stage_ns": dict(advance.stage_ns),
-                                "total_ns": advance.total_ns,
-                                "peak_workspace_bytes": advance.peak_workspace_bytes,
-                                "error_code": error_code,
+                                "error_code": execution.error_code,
                             }
                         )
-                        query_outcomes[arm].append(projection)
+                        query_executions[arm].append(execution)
                 for arm in ARM_ORDER:
-                    projections = query_outcomes[arm]
+                    executions = query_executions[arm]
+                    projections = [execution.projection for execution in executions]
                     learning.append(
                         {
                             "kind": "query_outcome",
+                            "checkpoint_id": checkpoint_ids[arm],
                             "stream_id": stream_id,
                             "generation": generation,
                             "budget_multiplier": multiplier,
@@ -758,15 +1177,16 @@ def run_protocol(
                                 for projection in projections
                             ),
                             "error_count": sum(
-                                bool(row.get("error_code"))
-                                for row in records[-len(ARM_ORDER) * 6 :]
-                                if row["arm"] == arm
+                                bool(execution.error_code) for execution in executions
+                            ),
+                            "fallback_reads": sum(
+                                execution.fallback_reads for execution in executions
                             ),
                             "weight_version": config.weight_version,
                         }
                     )
                 del revealed
-                del query_outcomes
+                del query_executions
             generation_row["events"] = ()
             del delta
         learning.extend(_zero_delta_events(stream_id, states, config))

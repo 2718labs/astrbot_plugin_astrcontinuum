@@ -22,6 +22,7 @@ from crm_experiment.contracts import (
     LossPolicy,
     QuerySpec,
     RecompositionRequest,
+    RecompositionResult,
 )
 from crm_experiment.kernel import (
     default_kernel_schema,
@@ -80,6 +81,18 @@ def test_protocol_generation_is_byte_identical_and_sealed() -> None:
     )
     assert all(gold.required_atom_ids for gold in first.sealed_gold)
     assert any(gold.forbidden_atom_ids for gold in first.sealed_gold)
+    query_by_id = {query.query_id: query for query in first.public_queries}
+    assert all(
+        gold.role is query_by_id[gold.query_id].role for gold in first.sealed_gold
+    )
+    assert all(
+        gold.is_exact_anchor is (gold.role is AtomRole.EXACT_ANCHOR)
+        for gold in first.sealed_gold
+    )
+    assert all(
+        gold.is_topic_return is (gold.role is AtomRole.CONTEXT)
+        for gold in first.sealed_gold
+    )
     assert all(
         generation.events
         for stream in first.streams
@@ -214,6 +227,40 @@ def test_no_projection_reuses_the_frozen_crm_state(base_state, delta_atom) -> No
     )
 
     assert semantic_hash(actual) == semantic_hash(expected)
+
+
+@pytest.mark.parametrize("baseline", [NoProjectionAblation, NoKernelAblation])
+def test_crm_ablations_expose_recomposition_diagnostics_without_changing_advance(
+    base_state,
+    delta_atom,
+    baseline,
+) -> None:
+    schema = default_kernel_schema()
+    policy = LossPolicy(gamma=50.0, rho=0.1, risk_ceiling=0.05, exact_threshold=12)
+    budget = 8 * derive_kernel_ceiling(schema)
+    arm = baseline()
+
+    diagnostic = arm.advance_with_diagnostics(
+        base_state,
+        (delta_atom,),
+        budget,
+        schema,
+        policy,
+        "theta0",
+    )
+    existing = arm.advance(
+        base_state,
+        (delta_atom,),
+        budget,
+        schema,
+        policy,
+        "theta0",
+    )
+
+    assert isinstance(diagnostic, RecompositionResult)
+    assert diagnostic.state == existing
+    assert diagnostic.matrix_hash
+    assert dict(diagnostic.stage_ns).keys() == {"matrix", "optimizer", "gate"}
 
 
 def test_no_projection_uses_a_query_blind_stable_prefix(base_state) -> None:
