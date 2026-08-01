@@ -5,6 +5,7 @@ from __future__ import annotations
 import inspect
 import json
 from pathlib import Path
+from typing import cast
 
 import pytest
 
@@ -123,6 +124,38 @@ def test_runtime_records_keep_fixed_denominator_without_released_text(
     assert len(records) == 1 * 2 * 2 * len(ARM_ORDER) * 6
     assert "released_raw_text" not in records_path.read_text(encoding="utf-8")
     assert all("query_id" in row for row in records)
+
+
+def test_records_include_truthful_content_free_metric_provenance(
+    run_output: Path,
+) -> None:
+    rows = _jsonl(run_output / "records.jsonl")
+    required = {
+        "history_bytes",
+        "step_input_bytes",
+        "delta_bytes",
+        "kernel_bytes",
+        "body_bytes",
+        "omission_weight",
+        "error_risk",
+        "continuity_break",
+        "stale_current",
+    }
+
+    assert rows
+    assert all(required <= row.keys() for row in rows)
+    assert all(
+        cast(int, row["history_bytes"]) >= cast(int, row["delta_bytes"]) for row in rows
+    )
+    assert all(
+        cast(int, row["step_input_bytes"]) >= cast(int, row["delta_bytes"])
+        for row in rows
+    )
+    assert all(
+        cast(int, row["kernel_bytes"]) + cast(int, row["body_bytes"])
+        <= cast(int, row["persistent_bytes"])
+        for row in rows
+    )
 
 
 def test_learning_events_are_content_free(run_output: Path) -> None:

@@ -18,18 +18,19 @@
 - `tasks/tooling-001.md`: done
 - `tasks/impl-006.md`: done
 - `tasks/impl-007.md`: done
-- `tasks/impl-008.md`: ready
+- `tasks/impl-008.md`: done
+- `tasks/impl-008a.md`: ready
 
 ## Dispatch
 
-- 当前 wave：`impl-008`
+- 当前 wave：`impl-008a`
 - 写入冲突：无；始终仅允许一个实现写入代理。
 - 生产仓库：只读，不修改。
-- 下一门禁：`impl-008` 完成 TDD、规格审查和质量审查后，才创建并派发 `impl-009`。
+- 下一门禁：`impl-008a` 补齐指标来源并重跑完整协议后，才创建并派发 `impl-009`。
 
 ## Runtime State
 
 - 设计 workflow：`astrcontinuum-capsule-replacement-r3-spec-20260730`
 - 实现 workflow：`astrcontinuum-capsule-replacement-r3-impl-20260730`
-- 权威任务：`impl-008`
+- 权威任务：`impl-008a`
 - 模式：独立实验实现；生产仓库只读。

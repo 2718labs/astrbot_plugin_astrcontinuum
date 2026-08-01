@@ -51,8 +51,14 @@ class _AdvanceResult:
     state: CapsuleState | str | None
     state_hash: str
     persistent_bytes: int
+    kernel_bytes: int
+    body_bytes: int
     outcome: str
     released_count: int
+    omission_weight: float
+    error_risk: float
+    continuity_break: bool
+    stale_current: bool
     matrix_hash: str
     stage_ns: tuple[tuple[str, int], ...]
     total_ns: int
@@ -225,6 +231,14 @@ def _capsule_ids(state: CapsuleState | None) -> set[str]:
     return {atom.atom_id for atom in state.kernel + state.body}
 
 
+def _persistent_bytes(state: CapsuleState | str | None) -> int:
+    if isinstance(state, CapsuleState):
+        return utf8_bytes(canonical_json(state))
+    if isinstance(state, str):
+        return utf8_bytes(state)
+    return 0
+
+
 def _summary_ids(value: str) -> set[str]:
     identifiers: set[str] = set()
     for line in value.splitlines():
@@ -345,6 +359,8 @@ def _advance_arm(
             )
             state_digest = semantic_hash(state)
             persistent_bytes = utf8_bytes(canonical_json(state))
+            kernel_bytes = utf8_bytes(canonical_json(state.kernel))
+            body_bytes = utf8_bytes(canonical_json(state.body))
             outcome = (
                 result.outcome.value
                 if result is not None
@@ -354,21 +370,37 @@ def _advance_arm(
                     else OutcomeState.KERNEL_ONLY.value
                 )
             )
+            omission_weight = 0.0 if result is None else result.loss.omission_weight
+            error_risk = 0.0 if result is None else result.loss.error_risk
+            continuity_break = False if result is None else result.loss.continuity_break
+            stale_current = False if result is None else result.loss.stale_current
         else:
             old_ids = _summary_ids(previous if isinstance(previous, str) else "")
             new_ids = _summary_ids(state or "")
             released_count = len(old_ids - new_ids)
             state_digest = sha256_text(state or "")
             persistent_bytes = utf8_bytes(state or "")
+            kernel_bytes = 0
+            body_bytes = persistent_bytes
             outcome = (
                 OutcomeState.NORMAL.value if state else OutcomeState.KERNEL_ONLY.value
             )
+            omission_weight = 0.0
+            error_risk = 0.0
+            continuity_break = False
+            stale_current = False
         return _AdvanceResult(
             state=state,
             state_hash=state_digest,
             persistent_bytes=persistent_bytes,
+            kernel_bytes=kernel_bytes,
+            body_bytes=body_bytes,
             outcome=outcome,
             released_count=released_count,
+            omission_weight=omission_weight,
+            error_risk=error_risk,
+            continuity_break=continuity_break,
+            stale_current=stale_current,
             matrix_hash="" if result is None else result.matrix_hash,
             stage_ns=() if result is None else result.stage_ns,
             total_ns=total_ns,
@@ -381,18 +413,30 @@ def _advance_arm(
         if isinstance(previous, CapsuleState):
             digest = semantic_hash(previous)
             persistent_bytes = utf8_bytes(canonical_json(previous))
+            kernel_bytes = utf8_bytes(canonical_json(previous.kernel))
+            body_bytes = utf8_bytes(canonical_json(previous.body))
         elif isinstance(previous, str):
             digest = sha256_text(previous)
             persistent_bytes = utf8_bytes(previous)
+            kernel_bytes = 0
+            body_bytes = persistent_bytes
         else:
             digest = sha256_text("")
             persistent_bytes = 0
+            kernel_bytes = 0
+            body_bytes = 0
         return _AdvanceResult(
             state=previous,
             state_hash=digest,
             persistent_bytes=persistent_bytes,
+            kernel_bytes=kernel_bytes,
+            body_bytes=body_bytes,
             outcome="failure",
             released_count=0,
+            omission_weight=0.0,
+            error_risk=0.0,
+            continuity_break=False,
+            stale_current=False,
             matrix_hash="",
             stage_ns=(),
             total_ns=total_ns,
@@ -447,6 +491,9 @@ def _learning_event(
     arm: str,
     advance: _AdvanceResult,
     weight_version: str,
+    history_bytes: int,
+    step_input_bytes: int,
+    delta_bytes: int,
 ) -> dict[str, object]:
     return {
         "kind": "checkpoint",
@@ -460,6 +507,15 @@ def _learning_event(
         "selected_count": sum(_role_counts(advance.state).values()),
         "released_count": advance.released_count,
         "persistent_bytes": advance.persistent_bytes,
+        "kernel_bytes": advance.kernel_bytes,
+        "body_bytes": advance.body_bytes,
+        "history_bytes": history_bytes,
+        "step_input_bytes": step_input_bytes,
+        "delta_bytes": delta_bytes,
+        "omission_weight": advance.omission_weight,
+        "error_risk": advance.error_risk,
+        "continuity_break": advance.continuity_break,
+        "stale_current": advance.stale_current,
         "peak_workspace_bytes": advance.peak_workspace_bytes,
         "stage_ns": dict(advance.stage_ns),
         "total_ns": advance.total_ns,
@@ -557,6 +613,7 @@ def run_protocol(
 
     for stream in sorted(streams, key=lambda item: str(item["stream_id"])):
         stream_id = str(stream["stream_id"])
+        history_bytes = 0
         states: dict[tuple[float, str], CapsuleState | str | None] = {
             (multiplier, arm): "" if arm == "recursive_summary" else None
             for multiplier in config.budget_multipliers
@@ -572,11 +629,15 @@ def run_protocol(
             delta = generation_row["events"]
             if not isinstance(delta, tuple):
                 raise ValueError("runtime events must be immutable after loading")
+            delta_bytes = utf8_bytes(canonical_json(delta))
+            history_bytes += delta_bytes
             for multiplier in config.budget_multipliers:
                 budget = round(multiplier * kernel_ceiling)
                 advances: dict[str, _AdvanceResult] = {}
+                step_input_bytes: dict[str, int] = {}
                 for arm in ARM_ORDER:
                     key = (multiplier, arm)
+                    step_input_bytes[arm] = _persistent_bytes(states[key]) + delta_bytes
                     advance = _advance_arm(
                         arm,
                         states[key],
@@ -608,6 +669,9 @@ def run_protocol(
                             arm,
                             advance,
                             config.weight_version,
+                            history_bytes,
+                            step_input_bytes[arm],
+                            delta_bytes,
                         )
                     )
 
@@ -656,6 +720,15 @@ def run_protocol(
                                 "supported": projection.supported,
                                 "state_hash": advance.state_hash,
                                 "persistent_bytes": advance.persistent_bytes,
+                                "kernel_bytes": advance.kernel_bytes,
+                                "body_bytes": advance.body_bytes,
+                                "history_bytes": history_bytes,
+                                "step_input_bytes": step_input_bytes[arm],
+                                "delta_bytes": delta_bytes,
+                                "omission_weight": advance.omission_weight,
+                                "error_risk": advance.error_risk,
+                                "continuity_break": advance.continuity_break,
+                                "stale_current": advance.stale_current,
                                 "outcome": advance.outcome,
                                 "released_count": advance.released_count,
                                 "stage_ns": dict(advance.stage_ns),
