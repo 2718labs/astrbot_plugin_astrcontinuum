@@ -14,6 +14,7 @@ from crm_experiment.contracts_v2 import (
     DirectBlockV2,
     KeyWinnerV2,
     LogicalAtomV2,
+    PackingPolicyV2,
     SourceReceiptV2,
     SourceWeightV2,
     WeightPolicyV2,
@@ -273,3 +274,25 @@ def test_text_bytes_are_not_a_proxy_for_resident_bytes() -> None:
     )
 
     assert resident_bytes_v2(state) > text_bytes
+
+
+def test_physical_packing_policy_changes_only_resident_identity() -> None:
+    state = _state()
+    source_ids = tuple(
+        sorted(
+            winner.source_id for winner in state.frontier if not winner.core_required
+        )
+    )
+    changed = replace(
+        state,
+        packing_policy=PackingPolicyV2(
+            codec="dmc1-lcp-lcs-v1",
+            immutable_source_ids=source_ids,
+            max_records_per_block=4,
+            max_decoded_block_bytes=4096,
+        ),
+    )
+
+    assert logical_semantic_hash_v2(changed) == logical_semantic_hash_v2(state)
+    assert resident_hash_v2(changed) != resident_hash_v2(state)
+    assert resident_bytes_v2(changed) != resident_bytes_v2(state)

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Self
 
 from crm_experiment.canonical import canonical_json, sha256_text, utf8_bytes
@@ -13,6 +13,8 @@ _SOURCE_PAYLOAD_DOMAIN = "crm-v2-source-payload/v1"
 _SOURCE_RECORD_DOMAIN = "crm-v2-source-record/v2"
 _WEIGHT_POLICY_DOMAIN = "crm-v2-weight-policy/v1"
 _SOURCE_ID_PREFIX = "sha256:"
+_PACKING_CODEC_V2 = "dmc1-lcp-lcs-v1"
+_PACKED_CONTEXT_KIND_V2 = "packed-context-dmc1-v1"
 
 
 def _valid_sha256(value: str) -> bool:
@@ -21,6 +23,40 @@ def _valid_sha256(value: str) -> bool:
         and value.lower() == value
         and all(character in "0123456789abcdef" for character in value)
     )
+
+
+def _valid_source_id_v2(value: str) -> bool:
+    return value.startswith(_SOURCE_ID_PREFIX) and _valid_sha256(
+        value.removeprefix(_SOURCE_ID_PREFIX)
+    )
+
+
+def canonical_affixes_v2(texts: tuple[str, ...]) -> tuple[str, str]:
+    """Return the unique LCP then non-overlapping LCS factorization."""
+    if len(texts) < 2:
+        raise ValueError("canonical factoring requires at least two texts")
+    if any(not isinstance(text, str) for text in texts):
+        raise ValueError("packed texts must be strings")
+
+    first = texts[0]
+    prefix_length = min(len(text) for text in texts)
+    for index in range(prefix_length):
+        character = first[index]
+        if any(text[index] != character for text in texts[1:]):
+            prefix_length = index
+            break
+    common_prefix = first[:prefix_length]
+    remainders = tuple(text[prefix_length:] for text in texts)
+
+    first_remainder = remainders[0]
+    suffix_length = min(len(remainder) for remainder in remainders)
+    for offset in range(1, suffix_length + 1):
+        character = first_remainder[-offset]
+        if any(remainder[-offset] != character for remainder in remainders[1:]):
+            suffix_length = offset - 1
+            break
+    common_suffix = first_remainder[-suffix_length:] if suffix_length else ""
+    return common_prefix, common_suffix
 
 
 def _source_payload_hash_fields_v2(
@@ -413,6 +449,156 @@ class DirectBlockV2:
 
 
 @dataclass(frozen=True, slots=True)
+class PackingPolicyV2:
+    """Resident-only policy that authorizes bounded physical packing."""
+
+    codec: str
+    immutable_source_ids: tuple[str, ...]
+    max_records_per_block: int
+    max_decoded_block_bytes: int
+
+    @classmethod
+    def disabled(cls) -> Self:
+        return cls(
+            codec=_PACKING_CODEC_V2,
+            immutable_source_ids=(),
+            max_records_per_block=8,
+            max_decoded_block_bytes=65_536,
+        )
+
+    def __post_init__(self) -> None:
+        if self.codec != _PACKING_CODEC_V2:
+            raise ValueError(f"packing codec must be {_PACKING_CODEC_V2}")
+        if self.immutable_source_ids != tuple(sorted(self.immutable_source_ids)):
+            raise ValueError("immutable_source_ids must be canonically sorted")
+        if len(self.immutable_source_ids) != len(set(self.immutable_source_ids)):
+            raise ValueError("immutable_source_ids must be unique")
+        if any(
+            not _valid_source_id_v2(source_id)
+            for source_id in self.immutable_source_ids
+        ):
+            raise ValueError("immutable_source_ids must be content-addressed")
+        if self.max_records_per_block < 2:
+            raise ValueError("max_records_per_block must be at least two")
+        if self.max_decoded_block_bytes <= 0:
+            raise ValueError("max_decoded_block_bytes must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class PackedEntryV2:
+    """One leaf payload residual bound to a mandatory source receipt."""
+
+    source_id: str
+    active_keys: tuple[str, ...]
+    text_middle: str
+    provenance: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if not _valid_source_id_v2(self.source_id):
+            raise ValueError("packed entry source_id must be content-addressed")
+        if not self.active_keys:
+            raise ValueError("packed active_keys must not be empty")
+        if self.active_keys != tuple(sorted(set(self.active_keys))):
+            raise ValueError("packed active_keys must be unique and sorted")
+        if not isinstance(self.text_middle, str):
+            raise ValueError("packed text_middle must be a string")
+        if not self.provenance:
+            raise ValueError("packed provenance must not be empty")
+        if any(not item for item in self.provenance):
+            raise ValueError("packed provenance must not contain empty values")
+        if self.provenance != tuple(sorted(set(self.provenance))):
+            raise ValueError("packed provenance must be unique and sorted")
+
+    def decode(
+        self,
+        receipt: SourceReceiptV2,
+        common_prefix: str,
+        common_suffix: str,
+    ) -> ActiveRecordV2:
+        if receipt.source_id != self.source_id:
+            raise ValueError("packed entry is missing its source receipt")
+        try:
+            atom = LogicalAtomV2(
+                source_id=self.source_id,
+                semantic_keys=receipt.semantic_keys,
+                role=receipt.role,
+                text=f"{common_prefix}{self.text_middle}{common_suffix}",
+                status=receipt.status,
+                revision=receipt.revision,
+                as_of=receipt.as_of,
+                provenance=self.provenance,
+                exact=receipt.exact,
+                depends_on=receipt.depends_on,
+                core_required=receipt.core_required,
+            )
+        except ValueError as error:
+            raise ValueError(
+                "packed payload does not match its source receipt"
+            ) from error
+        if SourceReceiptV2.from_atom(atom) != receipt:
+            raise ValueError("packed payload does not reproduce its source receipt")
+        return ActiveRecordV2(atom, self.active_keys)
+
+
+@dataclass(frozen=True, slots=True)
+class PackedContextBlockV2:
+    """Depth-one DMC1 block decoded with receipts from the same frozen state."""
+
+    common_prefix: str
+    common_suffix: str
+    entries: tuple[PackedEntryV2, ...]
+    kind: str = _PACKED_CONTEXT_KIND_V2
+
+    def __post_init__(self) -> None:
+        if self.kind != _PACKED_CONTEXT_KIND_V2:
+            raise ValueError(f"packed block kind must be {_PACKED_CONTEXT_KIND_V2}")
+        if not isinstance(self.common_prefix, str) or not isinstance(
+            self.common_suffix, str
+        ):
+            raise ValueError("packed common affixes must be strings")
+        if len(self.entries) < 2:
+            raise ValueError("packed block must contain at least two entries")
+        if any(not isinstance(entry, PackedEntryV2) for entry in self.entries):
+            raise ValueError("packed entries must be leaf PackedEntryV2 records")
+        if self.entries != tuple(
+            sorted(self.entries, key=lambda entry: entry.source_id)
+        ):
+            raise ValueError("packed entries must be canonically sorted")
+        source_ids = tuple(entry.source_id for entry in self.entries)
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("packed entries must contain unique sources")
+        texts = tuple(
+            f"{self.common_prefix}{entry.text_middle}{self.common_suffix}"
+            for entry in self.entries
+        )
+        if canonical_affixes_v2(texts) != (
+            self.common_prefix,
+            self.common_suffix,
+        ):
+            raise ValueError("packed affixes must use canonical LCP/LCS factoring")
+
+    @property
+    def record(self) -> ActiveRecordV2:
+        """Fail closed if a direct-only caller tries to flatten this block."""
+        raise ValueError("packed block requires the frozen-state codec")
+
+    @property
+    def source_ids(self) -> tuple[str, ...]:
+        if any(not isinstance(entry, PackedEntryV2) for entry in self.entries):
+            raise ValueError("packed entries must be leaf PackedEntryV2 records")
+        return tuple(entry.source_id for entry in self.entries)
+
+
+BodyBlockV2 = DirectBlockV2 | PackedContextBlockV2
+
+
+def _body_source_ids_v2(block: BodyBlockV2) -> tuple[str, ...]:
+    if isinstance(block, DirectBlockV2):
+        return (block.record.atom.source_id,)
+    return block.source_ids
+
+
+@dataclass(frozen=True, slots=True)
 class CapsuleStateV2:
     """Frozen v2 state with mandatory control state and optional payloads."""
 
@@ -426,7 +612,8 @@ class CapsuleStateV2:
     receipts: tuple[SourceReceiptV2, ...]
     weight_policy: WeightPolicyV2
     kernel: tuple[ActiveRecordV2, ...]
-    body: tuple[DirectBlockV2, ...]
+    body: tuple[BodyBlockV2, ...]
+    packing_policy: PackingPolicyV2 = field(default_factory=PackingPolicyV2.disabled)
 
     def __post_init__(self) -> None:
         if self.schema_version != 2:
@@ -441,6 +628,10 @@ class CapsuleStateV2:
             raise ValueError("key_registry_limit must be positive")
         if self.max_semantic_key_bytes <= 0:
             raise ValueError("max_semantic_key_bytes must be positive")
+        if any(not isinstance(winner, KeyWinnerV2) for winner in self.frontier):
+            raise ValueError("frontier must contain KeyWinnerV2 records")
+        for winner in self.frontier:
+            winner.__post_init__()
         if self.frontier != tuple(
             sorted(self.frontier, key=lambda winner: winner.semantic_key)
         ):
@@ -452,6 +643,10 @@ class CapsuleStateV2:
             raise ValueError("frontier exceeds key_registry_limit")
         if any(utf8_bytes(key) > self.max_semantic_key_bytes for key in frontier_keys):
             raise ValueError("frontier semantic key exceeds byte limit")
+        if any(not isinstance(receipt, SourceReceiptV2) for receipt in self.receipts):
+            raise ValueError("receipts must contain SourceReceiptV2 records")
+        for receipt in self.receipts:
+            receipt.__post_init__()
         if self.receipts != tuple(
             sorted(self.receipts, key=lambda receipt: receipt.source_id)
         ):
@@ -496,6 +691,16 @@ class CapsuleStateV2:
             for winner in self.frontier
             if winner.status is AtomStatus.ACTIVE
         }
+        if not isinstance(self.weight_policy, WeightPolicyV2):
+            raise ValueError("weight_policy must be WeightPolicyV2")
+        if any(
+            not isinstance(source_weight, SourceWeightV2)
+            for source_weight in self.weight_policy.source_weights
+        ):
+            raise ValueError("weight policy must contain SourceWeightV2 records")
+        for source_weight in self.weight_policy.source_weights:
+            source_weight.__post_init__()
+        self.weight_policy.__post_init__()
         weight_ids = {
             source_weight.source_id
             for source_weight in self.weight_policy.source_weights
@@ -510,6 +715,16 @@ class CapsuleStateV2:
                         f"active dependency missing: {source_id}->{dependency}"
                     )
 
+        if not isinstance(self.packing_policy, PackingPolicyV2):
+            raise ValueError("packing_policy must be PackingPolicyV2")
+        self.packing_policy.__post_init__()
+        if not set(self.packing_policy.immutable_source_ids).issubset(
+            active_frontier_ids
+        ):
+            raise ValueError("packing policy sources must be active frontier sources")
+
+        if any(not isinstance(record, ActiveRecordV2) for record in self.kernel):
+            raise ValueError("kernel must contain ActiveRecordV2 records")
         if self.kernel != tuple(
             sorted(
                 self.kernel,
@@ -517,17 +732,70 @@ class CapsuleStateV2:
             )
         ):
             raise ValueError("kernel sources must be canonically sorted")
-        if self.body != tuple(
-            sorted(self.body, key=lambda block: block.record.atom.source_id)
+        if any(
+            not isinstance(block, (DirectBlockV2, PackedContextBlockV2))
+            for block in self.body
         ):
+            raise ValueError("body contains an unsupported block type")
+        if self.body != tuple(sorted(self.body, key=_body_source_ids_v2)):
             raise ValueError("body sources must be canonically sorted")
-        records = self.kernel + tuple(block.record for block in self.body)
+        body_source_ids = tuple(
+            source_id for block in self.body for source_id in _body_source_ids_v2(block)
+        )
+        if body_source_ids != tuple(sorted(body_source_ids)):
+            raise ValueError(
+                "body blocks must cover contiguous canonical source-ID slices"
+            )
+
+        body_records: list[ActiveRecordV2] = []
+        immutable_ids = set(self.packing_policy.immutable_source_ids)
+        for block in self.body:
+            block.__post_init__()
+            if isinstance(block, DirectBlockV2):
+                body_records.append(block.record)
+                continue
+            if len(block.entries) > self.packing_policy.max_records_per_block:
+                raise ValueError("packed block exceeds max_records_per_block")
+            if not set(block.source_ids).issubset(immutable_ids):
+                raise ValueError("packed source is not immutable in packing policy")
+            decoded: list[ActiveRecordV2] = []
+            for entry in block.entries:
+                entry.__post_init__()
+                receipt = receipt_by_source.get(entry.source_id)
+                if receipt is None:
+                    raise ValueError("packed entry is missing its source receipt")
+                decoded.append(
+                    entry.decode(
+                        receipt,
+                        block.common_prefix,
+                        block.common_suffix,
+                    )
+                )
+            if (
+                sum(utf8_bytes(record.atom.text) for record in decoded)
+                > self.packing_policy.max_decoded_block_bytes
+            ):
+                raise ValueError("packed block exceeds max_decoded_block_bytes")
+            if any(
+                record.atom.role is not AtomRole.CONTEXT
+                or record.atom.exact
+                or record.atom.core_required
+                or record.atom.depends_on
+                for record in decoded
+            ):
+                raise ValueError("packed block contains an ineligible source")
+            body_records.extend(decoded)
+
+        records = self.kernel + tuple(body_records)
+        for record in records:
+            record.atom.__post_init__()
+            record.__post_init__()
         source_ids = tuple(record.atom.source_id for record in records)
         if len(source_ids) != len(set(source_ids)):
             raise ValueError("resident source IDs must be unique")
         if any(not record.atom.core_required for record in self.kernel):
             raise ValueError("resident kernel atoms must be core_required")
-        if any(block.record.atom.core_required for block in self.body):
+        if any(record.atom.core_required for record in body_records):
             raise ValueError("core_required atoms must not reside in the body")
         if any(record.atom.as_of > self.high_water for record in records):
             raise ValueError("high_water must cover every resident atom")
@@ -568,6 +836,86 @@ class LogicalResolutionV2:
     frontier: tuple[KeyWinnerV2, ...]
     receipts: tuple[SourceReceiptV2, ...]
     high_water: int
+
+
+@dataclass(frozen=True, slots=True)
+class FrozenStateViewV2:
+    """The only state capability accepted by source projection."""
+
+    state: CapsuleStateV2
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectedSourceV2:
+    """One decoded source-bound record emitted to a query projection."""
+
+    source_id: str
+    semantic_keys: tuple[str, ...]
+    active_keys: tuple[str, ...]
+    role: AtomRole
+    text: str
+    revision: int
+
+    @classmethod
+    def from_record(cls, record: ActiveRecordV2) -> Self:
+        return cls(
+            source_id=record.atom.source_id,
+            semantic_keys=record.atom.semantic_keys,
+            active_keys=record.active_keys,
+            role=record.atom.role,
+            text=record.atom.text,
+            revision=record.atom.revision,
+        )
+
+    def __post_init__(self) -> None:
+        if not _valid_source_id_v2(self.source_id):
+            raise ValueError("projected source_id must be content-addressed")
+        if not self.semantic_keys or self.semantic_keys != tuple(
+            sorted(set(self.semantic_keys))
+        ):
+            raise ValueError("projected semantic_keys must be canonical")
+        if not self.active_keys or self.active_keys != tuple(
+            sorted(set(self.active_keys))
+        ):
+            raise ValueError("projected active_keys must be canonical")
+        if not set(self.active_keys).issubset(self.semantic_keys):
+            raise ValueError("projected active_keys must belong to semantic_keys")
+        if self.revision <= 0:
+            raise ValueError("projected revision must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectionResultV2:
+    """Projection whose selected coverage derives only from emitted records."""
+
+    query_id: str
+    records: tuple[ProjectedSourceV2, ...]
+    text: str
+    byte_cost: int
+    supported: bool
+    reason: str
+
+    @property
+    def selected_source_ids(self) -> tuple[str, ...]:
+        return tuple(record.source_id for record in self.records)
+
+    def __post_init__(self) -> None:
+        if not self.query_id:
+            raise ValueError("projection query_id must not be empty")
+        if not self.reason:
+            raise ValueError("projection reason must not be empty")
+        if self.byte_cost != utf8_bytes(self.text):
+            raise ValueError("projection byte_cost must match emitted UTF-8 text")
+        source_ids = self.selected_source_ids
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("projection records must contain unique sources")
+        if self.supported:
+            if not self.records or self.reason != "supported":
+                raise ValueError("supported projection requires emitted records")
+            if self.text != "\n".join(record.text for record in self.records):
+                raise ValueError("projection text must derive from emitted records")
+        elif self.records:
+            raise ValueError("unsupported projection must not emit source records")
 
 
 @dataclass(frozen=True, slots=True)
