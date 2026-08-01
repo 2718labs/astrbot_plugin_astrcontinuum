@@ -1,0 +1,22 @@
+{
+  "schema_version": 1,
+  "stream_count": 24,
+  "generation_count": 12,
+  "queries_per_generation": 6,
+  "seed_start": 271800,
+  "budget_multipliers": [8.0, 4.0, 2.0, 1.5, 1.0],
+  "main_budget_multiplier": 2.0,
+  "main_generation": 12,
+  "query_injection_bytes": 512,
+  "zero_delta_rounds": 16,
+  "bootstrap_replicates": 10000,
+  "bootstrap_seed": 2718,
+  "noninferiority_margin_pp": -5.0,
+  "weights": {
+    "gamma": 50.0,
+    "rho": 0.1,
+    "risk_ceiling": 0.05,
+    "exact_threshold": 12,
+    "version": "theta0"
+  }
+}
