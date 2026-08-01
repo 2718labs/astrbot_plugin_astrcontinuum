@@ -8,8 +8,10 @@ from crm_experiment.contracts import (
     CapsuleState,
     LossPolicy,
     MatrixBundle,
+    RecompositionRequest,
     SemanticAtom,
 )
+from crm_experiment.kernel import default_kernel_schema, derive_kernel_ceiling
 
 
 def make_atom(
@@ -141,3 +143,73 @@ def reference_matrix() -> MatrixBundle:
 @pytest.fixture
 def default_policy() -> LossPolicy:
     return LossPolicy(gamma=50.0, rho=0.0, risk_ceiling=0.05, exact_threshold=12)
+
+
+@pytest.fixture
+def normal_request(
+    base_state: CapsuleState,
+    delta_atom: SemanticAtom,
+    default_policy: LossPolicy,
+) -> RecompositionRequest:
+    schema = default_kernel_schema()
+    return RecompositionRequest(
+        base_state=base_state,
+        delta=(delta_atom,),
+        byte_budget=8 * derive_kernel_ceiling(schema),
+        kernel_schema=schema,
+        loss_policy=default_policy,
+        weight_version="theta-v1",
+    )
+
+
+@pytest.fixture
+def kernel_only_request(default_policy: LossPolicy) -> RecompositionRequest:
+    schema = default_kernel_schema()
+    state = CapsuleState(
+        generation=1,
+        high_water=1,
+        accepted_budget=8 * derive_kernel_ceiling(schema),
+        kernel=(
+            make_atom(
+                "goal-v1",
+                semantic_keys=("goal",),
+                role=AtomRole.ROOT_GOAL,
+                text="完成 CRM 实验",
+                core_required=True,
+            ),
+        ),
+        body=(
+            make_atom(
+                "oversized-context",
+                semantic_keys=("background",),
+                text="x" * 5000,
+                weight=1.0,
+            ),
+        ),
+        weight_version="theta-v1",
+    )
+    return RecompositionRequest(
+        base_state=state,
+        delta=(),
+        byte_budget=derive_kernel_ceiling(schema),
+        kernel_schema=schema,
+        loss_policy=default_policy,
+        weight_version="theta-v1",
+    )
+
+
+@pytest.fixture
+def blocked_request(
+    base_state: CapsuleState,
+    delta_atom: SemanticAtom,
+    default_policy: LossPolicy,
+) -> RecompositionRequest:
+    schema = default_kernel_schema()
+    return RecompositionRequest(
+        base_state=base_state,
+        delta=(delta_atom,),
+        byte_budget=derive_kernel_ceiling(schema) - 1,
+        kernel_schema=schema,
+        loss_policy=default_policy,
+        weight_version="theta-v2",
+    )
