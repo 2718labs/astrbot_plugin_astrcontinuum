@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
+from enum import StrEnum
 from typing import Self
 
 from crm_experiment.canonical import canonical_json, sha256_text, utf8_bytes
@@ -12,6 +13,7 @@ from crm_experiment.contracts import AtomRole, AtomStatus
 _SOURCE_PAYLOAD_DOMAIN = "crm-v2-source-payload/v1"
 _SOURCE_RECORD_DOMAIN = "crm-v2-source-record/v2"
 _WEIGHT_POLICY_DOMAIN = "crm-v2-weight-policy/v1"
+_RECOMPOSITION_POLICY_DOMAIN = "crm-v2-recomposition-policy/v1"
 _SOURCE_ID_PREFIX = "sha256:"
 _PACKING_CODEC_V2 = "dmc1-lcp-lcs-v1"
 _PACKED_CONTEXT_KIND_V2 = "packed-context-dmc1-v1"
@@ -396,6 +398,13 @@ class WeightPolicyV2:
     def __post_init__(self) -> None:
         if not self.version:
             raise ValueError("weight policy version must not be empty")
+        if any(
+            not isinstance(source_weight, SourceWeightV2)
+            for source_weight in self.source_weights
+        ):
+            raise ValueError("source_weights must contain SourceWeightV2 values")
+        for source_weight in self.source_weights:
+            source_weight.__post_init__()
         if self.source_weights != tuple(
             sorted(self.source_weights, key=lambda item: item.source_id)
         ):
@@ -422,6 +431,10 @@ class DeltaEnvelopeV2:
             raise ValueError("target_high_water must not precede base_high_water")
         if self.target_high_water - self.base_high_water > 1:
             raise ValueError("delta high-water interval must be continuous")
+        if any(not isinstance(atom, LogicalAtomV2) for atom in self.records):
+            raise ValueError("delta records must contain LogicalAtomV2 values")
+        for atom in self.records:
+            atom.__post_init__()
         if self.records != tuple(
             sorted(self.records, key=lambda atom: (atom.as_of, atom.source_id))
         ):
@@ -482,6 +495,380 @@ class PackingPolicyV2:
             raise ValueError("max_records_per_block must be at least two")
         if self.max_decoded_block_bytes <= 0:
             raise ValueError("max_decoded_block_bytes must be positive")
+
+
+class SolverModeV2(StrEnum):
+    AUTO = "auto"
+    EXACT_SMALL = "exact_small"
+    REFERENCE = "reference"
+    GREEDY = "greedy"
+
+
+class EncodingModeV2(StrEnum):
+    DMC1 = "dmc1"
+    DIRECT_ONLY = "direct_only"
+
+
+class SourcePlacementV2(StrEnum):
+    KERNEL = "kernel"
+    BODY = "body"
+    RELEASED_CONTROL = "released_control"
+
+
+class RecompositionOutcomeV2(StrEnum):
+    NORMAL = "normal"
+    KERNEL_ONLY = "kernel_only"
+    NOOP = "noop"
+    ROLLED_BACK = "rolled_back"
+
+
+@dataclass(frozen=True, slots=True)
+class CandidatePolicyV2:
+    """Frozen work bounds for logical selection and physical pack proposals."""
+
+    version: str = "crm-candidate-v1"
+    solver_mode: SolverModeV2 = SolverModeV2.AUTO
+    encoding_mode: EncodingModeV2 = EncodingModeV2.DMC1
+    exact_small_limit: int = 12
+    reference_row_limit: int = 16
+    max_pack_neighbors: int = 2
+    max_pack_proposals: int = 1024
+    max_plan_evaluations: int = 4096
+    max_greedy_steps: int = 256
+    max_refinement_evaluations: int = 128
+    near_tie_epsilon: float = 1e-12
+
+    @property
+    def enable_packing(self) -> bool:
+        return self.encoding_mode is EncodingModeV2.DMC1
+
+    @property
+    def max_oracle_evaluations(self) -> int:
+        return self.max_plan_evaluations
+
+    def __post_init__(self) -> None:
+        if not self.version:
+            raise ValueError("candidate policy version must not be empty")
+        if not isinstance(self.solver_mode, SolverModeV2):
+            raise ValueError("solver_mode must be SolverModeV2")
+        if not isinstance(self.encoding_mode, EncodingModeV2):
+            raise ValueError("encoding_mode must be EncodingModeV2")
+        if not 0 <= self.exact_small_limit <= 20:
+            raise ValueError("exact_small_limit must be between zero and twenty")
+        if not self.exact_small_limit <= self.reference_row_limit <= 20:
+            raise ValueError(
+                "reference_row_limit must be between exact_small_limit and twenty"
+            )
+        if self.max_pack_neighbors <= 0:
+            raise ValueError("max_pack_neighbors must be positive")
+        if self.max_pack_proposals <= 0:
+            raise ValueError("max_pack_proposals must be positive")
+        if self.max_plan_evaluations <= 0:
+            raise ValueError("max_plan_evaluations must be positive")
+        if self.max_greedy_steps <= 0:
+            raise ValueError("max_greedy_steps must be positive")
+        if not 0 <= self.max_refinement_evaluations <= self.max_plan_evaluations:
+            raise ValueError(
+                "max_refinement_evaluations must fit the oracle work budget"
+            )
+        if not math.isfinite(self.near_tie_epsilon) or self.near_tie_epsilon < 0:
+            raise ValueError("near_tie_epsilon must be finite and nonnegative")
+
+
+@dataclass(frozen=True, slots=True)
+class SourceRowV2:
+    """One latest-active logical source in the sparse optimizer universe."""
+
+    source_id: str
+    receipt: SourceReceiptV2
+    active_keys: tuple[str, ...]
+    record: ActiveRecordV2 | None
+    weight: float
+    placement: SourcePlacementV2
+    pack_eligible: bool
+
+    @property
+    def available(self) -> bool:
+        return self.record is not None
+
+    @property
+    def mandatory(self) -> bool:
+        return self.placement is SourcePlacementV2.KERNEL
+
+    @property
+    def depends_on(self) -> tuple[str, ...]:
+        return self.receipt.depends_on
+
+    def __post_init__(self) -> None:
+        if not _valid_source_id_v2(self.source_id):
+            raise ValueError("source row ID must be content-addressed")
+        self.receipt.__post_init__()
+        if self.source_id != self.receipt.source_id:
+            raise ValueError("source row ID must match its receipt")
+        if not self.active_keys or self.active_keys != tuple(
+            sorted(set(self.active_keys))
+        ):
+            raise ValueError("source row active_keys must be canonical")
+        if not math.isfinite(self.weight) or self.weight < 0:
+            raise ValueError("source row weight must be finite and nonnegative")
+        if not isinstance(self.placement, SourcePlacementV2):
+            raise ValueError("source row placement must be SourcePlacementV2")
+        if not isinstance(self.pack_eligible, bool):
+            raise ValueError("source row pack_eligible must be boolean")
+        if self.mandatory and not self.available:
+            raise ValueError("mandatory source payload must be available")
+        if self.pack_eligible and (not self.available or self.mandatory):
+            raise ValueError("pack-eligible source must be optional and available")
+        if self.record is not None:
+            self.record.__post_init__()
+            if self.record.atom.source_id != self.source_id:
+                raise ValueError("source row payload must match source ID")
+            if SourceReceiptV2.from_atom(self.record.atom) != self.receipt:
+                raise ValueError("source row payload must match its receipt")
+            if self.record.active_keys != self.active_keys:
+                raise ValueError("source row payload active_keys mismatch")
+        if self.placement is SourcePlacementV2.RELEASED_CONTROL and self.available:
+            raise ValueError("released-control row cannot retain a payload")
+        if self.placement is SourcePlacementV2.BODY and not self.available:
+            raise ValueError("body row must retain a payload")
+        if self.mandatory != self.receipt.core_required:
+            raise ValueError("source row placement must match core_required")
+
+
+@dataclass(frozen=True, slots=True)
+class SparseEdgeV2:
+    """One directed source-level dependency or canonical conflict edge."""
+
+    source_id: str
+    target_id: str
+
+    def __post_init__(self) -> None:
+        if not _valid_source_id_v2(self.source_id) or not _valid_source_id_v2(
+            self.target_id
+        ):
+            raise ValueError("sparse edge endpoints must be content-addressed")
+        if self.source_id == self.target_id:
+            raise ValueError("sparse edge cannot be a self-edge")
+
+
+@dataclass(frozen=True, slots=True)
+class PackProposalV2:
+    """One bounded source-ID adjacency proposal, never a semantic candidate."""
+
+    left_source_id: str
+    right_source_id: str
+    neighbor_distance: int
+
+    def __post_init__(self) -> None:
+        if not _valid_source_id_v2(self.left_source_id) or not _valid_source_id_v2(
+            self.right_source_id
+        ):
+            raise ValueError("pack proposal endpoints must be content-addressed")
+        if self.left_source_id >= self.right_source_id:
+            raise ValueError("pack proposal endpoints must be canonical")
+        if self.neighbor_distance <= 0:
+            raise ValueError("pack proposal neighbor_distance must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class SourceMatrixV2:
+    """Sparse logical rows plus bounded physical-layout suggestions."""
+
+    rows: tuple[SourceRowV2, ...]
+    dependencies: tuple[SparseEdgeV2, ...]
+    conflicts: tuple[SparseEdgeV2, ...]
+    pack_proposals: tuple[PackProposalV2, ...]
+
+    @property
+    def active_source_ids(self) -> tuple[str, ...]:
+        return tuple(row.source_id for row in self.rows)
+
+    @property
+    def selectable_source_ids(self) -> tuple[str, ...]:
+        return tuple(row.source_id for row in self.rows if row.available)
+
+    @property
+    def unavailable_source_ids(self) -> tuple[str, ...]:
+        return tuple(row.source_id for row in self.rows if not row.available)
+
+    @property
+    def mandatory_source_ids(self) -> tuple[str, ...]:
+        return tuple(row.source_id for row in self.rows if row.mandatory)
+
+    @property
+    def pack_proposal_count(self) -> int:
+        return len(self.pack_proposals)
+
+    @property
+    def total_candidate_count(self) -> int:
+        return len(self.selectable_source_ids) + self.pack_proposal_count
+
+    @property
+    def proposal_count(self) -> int:
+        """Compatibility alias for the explicitly named physical proposal count."""
+        return self.pack_proposal_count
+
+    def __post_init__(self) -> None:
+        if self.rows != tuple(sorted(self.rows, key=lambda row: row.source_id)):
+            raise ValueError("source matrix rows must be canonically sorted")
+        source_ids = self.active_source_ids
+        if len(source_ids) != len(set(source_ids)):
+            raise ValueError("source matrix rows must have unique source IDs")
+        source_id_set = set(source_ids)
+        for row in self.rows:
+            row.__post_init__()
+            if not set(row.depends_on).issubset(source_id_set):
+                raise ValueError("source row dependency is outside active universe")
+        for name, edges in (
+            ("dependencies", self.dependencies),
+            ("conflicts", self.conflicts),
+        ):
+            if edges != tuple(
+                sorted(edges, key=lambda edge: (edge.source_id, edge.target_id))
+            ):
+                raise ValueError(f"source matrix {name} must be canonically sorted")
+            if len(edges) != len(set(edges)):
+                raise ValueError(f"source matrix {name} must be unique")
+            for edge in edges:
+                edge.__post_init__()
+                if (
+                    edge.source_id not in source_id_set
+                    or edge.target_id not in source_id_set
+                ):
+                    raise ValueError(f"source matrix {name} endpoint is unknown")
+        if self.pack_proposals != tuple(
+            sorted(
+                self.pack_proposals,
+                key=lambda item: (
+                    item.left_source_id,
+                    item.right_source_id,
+                    item.neighbor_distance,
+                ),
+            )
+        ):
+            raise ValueError("pack proposals must be canonically sorted")
+        if len(self.pack_proposals) != len(set(self.pack_proposals)):
+            raise ValueError("pack proposals must be unique")
+        eligible = {row.source_id for row in self.rows if row.pack_eligible}
+        for proposal in self.pack_proposals:
+            proposal.__post_init__()
+            if not {
+                proposal.left_source_id,
+                proposal.right_source_id,
+            }.issubset(eligible):
+                raise ValueError("pack proposal references an ineligible source")
+
+
+@dataclass(frozen=True, slots=True)
+class CandidatePlanV2:
+    """Logical retention plan; physical direct/packed layout is derived later."""
+
+    retained_source_ids: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        if self.retained_source_ids != tuple(sorted(set(self.retained_source_ids))):
+            raise ValueError("retained source IDs must be unique and sorted")
+        if any(
+            not _valid_source_id_v2(source_id) for source_id in self.retained_source_ids
+        ):
+            raise ValueError("retained source ID must be content-addressed")
+
+
+@dataclass(frozen=True, slots=True)
+class PlanEvaluationV2:
+    """Exact complete-state cost returned by the shared canonical encoder."""
+
+    plan: CandidatePlanV2
+    resident_bytes: int
+    direct_equivalent_bytes: int
+    packing_savings_bytes: int
+    emitted_pack_count: int
+    valid: bool
+    reasons: tuple[str, ...]
+
+    def __post_init__(self) -> None:
+        self.plan.__post_init__()
+        if self.resident_bytes <= 0 or self.direct_equivalent_bytes <= 0:
+            raise ValueError("plan byte counts must be positive")
+        if self.direct_equivalent_bytes < self.resident_bytes:
+            raise ValueError("direct equivalent cannot be smaller than encoded plan")
+        if self.packing_savings_bytes != (
+            self.direct_equivalent_bytes - self.resident_bytes
+        ):
+            raise ValueError("plan packing savings must match exact bytes")
+        if self.emitted_pack_count < 0:
+            raise ValueError("emitted_pack_count must be nonnegative")
+        if self.emitted_pack_count == 0 and self.packing_savings_bytes != 0:
+            raise ValueError("unpacked plan cannot report packing savings")
+        if self.emitted_pack_count > 0 and self.packing_savings_bytes <= 0:
+            raise ValueError("emitted packs require strict aggregate savings")
+        if self.reasons != tuple(sorted(set(self.reasons))):
+            raise ValueError("plan evaluation reasons must be canonical")
+        if self.valid and self.reasons:
+            raise ValueError("valid plan evaluation cannot contain reasons")
+        if not self.valid and not self.reasons:
+            raise ValueError("invalid plan evaluation requires reasons")
+
+
+@dataclass(frozen=True, slots=True)
+class OptimizerWorkV2:
+    """Deterministic correctness counters; wall-clock is deliberately absent."""
+
+    plans_evaluated: int
+    oracle_evaluations: int
+    greedy_steps: int
+    refinement_evaluations: int
+    work_limit_hit: bool
+    reference_tie_breaks: int = 0
+
+    def __post_init__(self) -> None:
+        if any(
+            value < 0
+            for value in (
+                self.plans_evaluated,
+                self.oracle_evaluations,
+                self.greedy_steps,
+                self.refinement_evaluations,
+                self.reference_tie_breaks,
+            )
+        ):
+            raise ValueError("optimizer work counters must be nonnegative")
+        if self.plans_evaluated != self.oracle_evaluations:
+            raise ValueError("each unique plan must have one oracle evaluation")
+        if self.reference_tie_breaks > self.oracle_evaluations:
+            raise ValueError("reference tie-breaks require evaluated oracle plans")
+        if not isinstance(self.work_limit_hit, bool):
+            raise ValueError("work_limit_hit must be boolean")
+
+
+@dataclass(frozen=True, slots=True)
+class OptimizerSelectionV2:
+    """One feasible logical selection and its exact encoded-state cost."""
+
+    plan: CandidatePlanV2
+    released_source_ids: tuple[str, ...]
+    retained_weight: float
+    omitted_weight: float
+    evaluation: PlanEvaluationV2
+    solver_mode: SolverModeV2
+    work: OptimizerWorkV2
+
+    def __post_init__(self) -> None:
+        self.plan.__post_init__()
+        self.evaluation.__post_init__()
+        self.work.__post_init__()
+        if self.evaluation.plan != self.plan:
+            raise ValueError("optimizer evaluation must match selected plan")
+        if self.released_source_ids != tuple(sorted(set(self.released_source_ids))):
+            raise ValueError("released source IDs must be unique and sorted")
+        if set(self.released_source_ids) & set(self.plan.retained_source_ids):
+            raise ValueError("retained and released source IDs must be disjoint")
+        if not math.isfinite(self.retained_weight) or self.retained_weight < 0:
+            raise ValueError("retained_weight must be finite and nonnegative")
+        if not math.isfinite(self.omitted_weight) or self.omitted_weight < 0:
+            raise ValueError("omitted_weight must be finite and nonnegative")
+        if not isinstance(self.solver_mode, SolverModeV2):
+            raise ValueError("optimizer solver_mode must be SolverModeV2")
 
 
 @dataclass(frozen=True, slots=True)
@@ -614,6 +1001,7 @@ class CapsuleStateV2:
     kernel: tuple[ActiveRecordV2, ...]
     body: tuple[BodyBlockV2, ...]
     packing_policy: PackingPolicyV2 = field(default_factory=PackingPolicyV2.disabled)
+    recomposition_policy_hash: str = ""
 
     def __post_init__(self) -> None:
         if self.schema_version != 2:
@@ -722,6 +1110,10 @@ class CapsuleStateV2:
             active_frontier_ids
         ):
             raise ValueError("packing policy sources must be active frontier sources")
+        if self.recomposition_policy_hash and not _valid_sha256(
+            self.recomposition_policy_hash
+        ):
+            raise ValueError("recomposition policy hash must be lowercase SHA-256")
 
         if any(not isinstance(record, ActiveRecordV2) for record in self.kernel):
             raise ValueError("kernel must contain ActiveRecordV2 records")
@@ -947,11 +1339,33 @@ class KernelSchemaV2:
     def __post_init__(self) -> None:
         if not self.slots:
             raise ValueError("kernel schema slots must not be empty")
+        if any(not isinstance(slot, KernelSlotV2) for slot in self.slots):
+            raise ValueError("kernel schema slots must contain KernelSlotV2 values")
+        for slot in self.slots:
+            slot.__post_init__()
         roles = tuple(slot.role for slot in self.slots)
         if len(roles) != len(set(roles)):
             raise ValueError("kernel schema roles must be unique")
         if self.continuity_floor_bytes <= 0:
             raise ValueError("continuity_floor_bytes must be positive")
+
+
+def recomposition_policy_hash_v2(
+    kernel_schema: KernelSchemaV2,
+    candidate_policy: CandidatePolicyV2,
+) -> str:
+    """Bind every no-op-result-relevant recomposition policy input."""
+    kernel_schema.__post_init__()
+    candidate_policy.__post_init__()
+    return sha256_text(
+        canonical_json(
+            {
+                "candidate_policy": candidate_policy,
+                "domain": _RECOMPOSITION_POLICY_DOMAIN,
+                "kernel_schema": kernel_schema,
+            }
+        )
+    )
 
 
 @dataclass(frozen=True, slots=True)
@@ -960,3 +1374,252 @@ class KernelSelectionV2:
     resident_bytes: int | None
     valid: bool
     reasons: tuple[str, ...]
+
+
+@dataclass(frozen=True, slots=True)
+class EncodedPlanV2:
+    """One canonical physical realization of a logical retention plan."""
+
+    state: CapsuleStateV2
+    direct_state: CapsuleStateV2
+    evaluation: PlanEvaluationV2
+    codec_attempts: int
+    direct_fallback_count: int
+    full_state_evaluations: int
+
+    def __post_init__(self) -> None:
+        self.evaluation.__post_init__()
+        if (
+            self.codec_attempts < 0
+            or self.direct_fallback_count < 0
+            or self.full_state_evaluations <= 0
+        ):
+            raise ValueError("codec counters must be nonnegative")
+        if self.evaluation.emitted_pack_count > self.codec_attempts:
+            raise ValueError("emitted packs cannot exceed codec attempts")
+        if self.direct_fallback_count != (
+            self.codec_attempts - self.evaluation.emitted_pack_count
+        ):
+            raise ValueError("codec attempts must partition emit/fallback outcomes")
+        expected_full_evaluations = 2 if self.evaluation.emitted_pack_count else 1
+        if self.full_state_evaluations != expected_full_evaluations:
+            raise ValueError(
+                "encoder must materialize only the direct and optional final state"
+            )
+
+
+@dataclass(frozen=True, slots=True)
+class GateReportV2:
+    """Public, deterministic acceptance evidence for one candidate state."""
+
+    valid: bool
+    reasons: tuple[str, ...]
+    candidate_resident_bytes: int | None
+    direct_equivalent_bytes: int | None
+    accepted_budget: int
+    budget_margin: int | None
+    expected_logical_hash: str
+    actual_logical_hash: str | None
+
+    def __post_init__(self) -> None:
+        if self.reasons != tuple(sorted(set(self.reasons))):
+            raise ValueError("gate reasons must be canonical")
+        if self.accepted_budget <= 0:
+            raise ValueError("gate accepted_budget must be positive")
+        if not self.expected_logical_hash:
+            raise ValueError("gate expected logical hash must not be empty")
+        if (
+            self.candidate_resident_bytes is not None
+            and self.candidate_resident_bytes <= 0
+        ):
+            raise ValueError("gate candidate bytes must be positive")
+        if (
+            self.direct_equivalent_bytes is not None
+            and self.direct_equivalent_bytes <= 0
+        ):
+            raise ValueError("gate direct bytes must be positive")
+        if self.candidate_resident_bytes is None:
+            if self.budget_margin is not None:
+                raise ValueError(
+                    "unknown candidate bytes require unknown budget margin"
+                )
+        elif self.budget_margin != self.accepted_budget - self.candidate_resident_bytes:
+            raise ValueError("gate budget margin must match exact bytes")
+        if self.valid:
+            if self.reasons:
+                raise ValueError("valid gate cannot contain reasons")
+            if (
+                self.candidate_resident_bytes is None
+                or self.actual_logical_hash is None
+            ):
+                raise ValueError("valid gate requires complete evidence")
+        elif not self.reasons:
+            raise ValueError("invalid gate requires reasons")
+
+
+@dataclass(frozen=True, slots=True)
+class RecompositionRequestV2:
+    """All outcome-independent inputs required for one atomic generation."""
+
+    envelope: DeltaEnvelopeV2
+    requested_budget: int
+    kernel_schema: KernelSchemaV2
+    next_weight_policy: WeightPolicyV2
+    next_packing_policy: PackingPolicyV2
+    candidate_policy: CandidatePolicyV2
+    key_registry_limit: int
+    max_semantic_key_bytes: int
+
+    def __post_init__(self) -> None:
+        self.envelope.__post_init__()
+        self.kernel_schema.__post_init__()
+        self.next_weight_policy.__post_init__()
+        self.next_packing_policy.__post_init__()
+        self.candidate_policy.__post_init__()
+        if self.requested_budget <= 0:
+            raise ValueError("requested_budget must be positive")
+        if self.key_registry_limit <= 0 or self.max_semantic_key_bytes <= 0:
+            raise ValueError("recomposition registry bounds must be positive")
+
+
+@dataclass(frozen=True, slots=True)
+class RecompositionMetricsV2:
+    """Packing and source release remain separate, fixed-denominator accounts."""
+
+    persistent_bytes: int
+    direct_equivalent_bytes: int
+    packing_savings_bytes: int
+    packing_savings_rate: float
+    active_source_count: int
+    available_source_count: int
+    retained_source_count: int
+    released_source_count: int
+    released_control_source_count: int
+    known_released_payload_bytes: int
+    active_weight: float
+    retained_weight: float
+    omitted_weight: float
+    weighted_omission_rate: float
+    pack_proposal_count: int
+    codec_attempts: int
+    emitted_pack_count: int
+    direct_fallback_count: int
+    encoder_full_state_evaluations: int
+    optimizer_work: OptimizerWorkV2
+
+    def __post_init__(self) -> None:
+        if self.persistent_bytes <= 0 or self.direct_equivalent_bytes <= 0:
+            raise ValueError("recomposition byte counts must be positive")
+        if self.packing_savings_bytes != (
+            self.direct_equivalent_bytes - self.persistent_bytes
+        ):
+            raise ValueError("packing savings must match direct equivalent bytes")
+        expected_packing_rate = (
+            self.packing_savings_bytes / self.direct_equivalent_bytes
+        )
+        if not math.isclose(
+            self.packing_savings_rate,
+            expected_packing_rate,
+            rel_tol=0.0,
+            abs_tol=1e-15,
+        ):
+            raise ValueError(
+                "packing_savings_rate must use direct-equivalent denominator"
+            )
+        counts = (
+            self.active_source_count,
+            self.available_source_count,
+            self.retained_source_count,
+            self.released_source_count,
+            self.released_control_source_count,
+            self.known_released_payload_bytes,
+            self.pack_proposal_count,
+            self.codec_attempts,
+            self.emitted_pack_count,
+            self.direct_fallback_count,
+            self.encoder_full_state_evaluations,
+        )
+        if any(value < 0 for value in counts):
+            raise ValueError("recomposition counters must be nonnegative")
+        if (
+            self.retained_source_count + self.released_source_count
+            != self.active_source_count
+        ):
+            raise ValueError("retained/released counts must partition active sources")
+        if self.released_control_source_count > self.released_source_count:
+            raise ValueError("released-control sources must be released")
+        if self.released_control_source_count != (
+            self.active_source_count - self.available_source_count
+        ):
+            raise ValueError(
+                "released-control sources must equal the unavailable active sources"
+            )
+        if self.emitted_pack_count + self.direct_fallback_count != self.codec_attempts:
+            raise ValueError("codec outcomes must partition attempts")
+        if any(
+            not math.isfinite(value) or value < 0
+            for value in (self.active_weight, self.retained_weight, self.omitted_weight)
+        ):
+            raise ValueError("recomposition weights must be finite and nonnegative")
+        if not math.isclose(
+            self.retained_weight + self.omitted_weight,
+            self.active_weight,
+            rel_tol=0.0,
+            abs_tol=1e-12,
+        ):
+            raise ValueError("retained/omitted weights must partition active weight")
+        expected_omission_rate = (
+            self.omitted_weight / self.active_weight if self.active_weight else 0.0
+        )
+        if not math.isclose(
+            self.weighted_omission_rate,
+            expected_omission_rate,
+            rel_tol=0.0,
+            abs_tol=1e-15,
+        ):
+            raise ValueError("weighted omission must use active-weight denominator")
+        self.optimizer_work.__post_init__()
+
+
+@dataclass(frozen=True, slots=True)
+class RecompositionResultV2:
+    """Atomic transition result; invalid candidates never escape on rollback."""
+
+    state: CapsuleStateV2 | None
+    outcome: RecompositionOutcomeV2
+    committed: bool
+    consumed_delta: bool
+    gate: GateReportV2
+    selection: OptimizerSelectionV2 | None
+    metrics: RecompositionMetricsV2 | None
+    encoded_plan: EncodedPlanV2 | None
+
+    def __post_init__(self) -> None:
+        self.gate.__post_init__()
+        if not isinstance(self.outcome, RecompositionOutcomeV2):
+            raise ValueError("outcome must be RecompositionOutcomeV2")
+        if self.committed:
+            if self.state is None or not self.consumed_delta or not self.gate.valid:
+                raise ValueError(
+                    "committed result requires state, delta, and valid gate"
+                )
+        else:
+            if self.consumed_delta or self.gate.valid:
+                raise ValueError("rollback cannot consume delta or pass the gate")
+            if self.encoded_plan is not None:
+                raise ValueError("invalid encoded candidate must not escape rollback")
+        if self.outcome is RecompositionOutcomeV2.ROLLED_BACK and self.committed:
+            raise ValueError("rolled-back result cannot be committed")
+        if self.outcome is RecompositionOutcomeV2.NOOP:
+            if (
+                not self.committed
+                or self.selection is not None
+                or self.encoded_plan is not None
+            ):
+                raise ValueError(
+                    "noop must commit the original state without solver output"
+                )
+        if self.selection is not None:
+            self.selection.__post_init__()
+        if self.metrics is not None:
+            self.metrics.__post_init__()

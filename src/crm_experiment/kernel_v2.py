@@ -50,6 +50,7 @@ def select_kernel_v2(
     requested_budget: int,
     key_registry_limit: int,
     max_semantic_key_bytes: int,
+    recomposition_policy_hash: str = "",
 ) -> KernelSelectionV2:
     """Validate all mandatory kernel payloads and exact mandatory bytes."""
     by_role: dict[AtomRole, list[ActiveRecordV2]] = defaultdict(list)
@@ -110,6 +111,7 @@ def select_kernel_v2(
         weight_policy=weight_policy,
         kernel=ordered,
         body=(),
+        recomposition_policy_hash=recomposition_policy_hash,
     )
     resident_bytes = resident_bytes_v2(kernel_state)
     if resident_bytes > requested_budget:
