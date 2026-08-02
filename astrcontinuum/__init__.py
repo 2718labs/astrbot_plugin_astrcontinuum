@@ -59,6 +59,14 @@ from .models import (
     ExactAnchor,
     Snapshot,
 )
+from .reorganization import (
+    ReorganizationBudgetError,
+    ReorganizationInvariantError,
+    ReorganizationRecord,
+    ReorganizationResult,
+    ReorganizationStatus,
+    reorganize_capsules,
+)
 from .runtime import (
     RUNTIME_SLOT_PRIORITY,
     CandidateBlock,
@@ -162,6 +170,11 @@ __all__ = [
     "RequestViewErrorCode",
     "RequestViewInvariantError",
     "RequestViewSource",
+    "ReorganizationBudgetError",
+    "ReorganizationInvariantError",
+    "ReorganizationRecord",
+    "ReorganizationResult",
+    "ReorganizationStatus",
     "RetrievalConfig",
     "RuntimeAssemblyMode",
     "RuntimeAssemblyResult",
@@ -197,6 +210,7 @@ __all__ = [
     "audit_semantic",
     "compile_candidate",
     "read_request_view",
+    "reorganize_capsules",
     "runtime_assemble",
     "segment",
     "select_candidates",
