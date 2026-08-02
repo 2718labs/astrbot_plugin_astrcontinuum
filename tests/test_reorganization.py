@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timezone
+import json
 
 import pytest
 
@@ -8,6 +9,19 @@ import astrcontinuum as ac
 
 
 NOW = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+    )
+
+
+def _capsule_surface(capsule: ac.ContextCapsuleEnvelope) -> str:
+    return _canonical_json(capsule.model_dump(mode="json", exclude={"token_cost"}))
 
 
 def _session_key() -> ac.SessionKey:
@@ -108,8 +122,10 @@ def test_reorganize_capsules_is_deterministic_and_preserves_core_edges() -> None
         ),
     )
 
-    first = reorganize_capsules(capsules, token_budget=180)
-    second = reorganize_capsules(capsules, token_budget=180)
+    counter = ac.RuntimeUtf8ByteTokenCounter()
+    budget = 10_000
+    first = reorganize_capsules(capsules, token_budget=budget, counter=counter)
+    second = reorganize_capsules(capsules, token_budget=budget, counter=counter)
 
     assert first == second
     assert first.capsule.exact_anchors == (
@@ -120,8 +136,10 @@ def test_reorganize_capsules_is_deterministic_and_preserves_core_edges() -> None
         capsules[0].dependencies[0],
         capsules[1].dependencies[0],
     )
-    assert first.before_tokens == 160
-    assert first.after_tokens <= 180
+    assert first.before_tokens == sum(
+        counter.count_text(_capsule_surface(item)) for item in capsules
+    )
+    assert first.after_tokens <= budget
     assert first.compression_ratio == first.after_tokens / first.before_tokens
     assert first.reduction_ratio == 1.0 - first.compression_ratio
     assert first.loss_count == sum(
@@ -148,7 +166,11 @@ def test_reorganize_capsules_exposes_approximation_and_release_without_summary_f
         token_cost=120,
     )
 
-    result = reorganize_capsules((capsule,), token_budget=45)
+    result = reorganize_capsules(
+        (capsule,),
+        token_budget=1_150,
+        counter=ac.RuntimeUtf8ByteTokenCounter(),
+    )
     statuses = {record.kind: record.status for record in result.records}
 
     assert statuses["exact_anchor"] is ReorganizationStatus.RETAINED
@@ -177,6 +199,94 @@ def test_reorganize_capsules_fails_closed_when_core_edges_cannot_fit() -> None:
     assert caught.value.required_tokens > caught.value.budget
 
 
+def test_reorganize_capsules_uses_one_counter_for_canonical_unicode_metadata_and_summary() -> None:
+    from astrcontinuum.reorganization import reorganize_capsules
+
+    counter = ac.RuntimeUtf8ByteTokenCounter()
+    capsule = _capsule(
+        "capsule-unicode",
+        event_id="event-unicode",
+        goal_text="保留核心锚点与依赖，不调用摘要兜底。",
+        progress_text="中文 metadata 与 summary 必须进入同一计数表面。",
+        token_cost=1,
+    )
+    budget = counter.count_text(_capsule_surface(capsule)) * 3
+
+    result = reorganize_capsules((capsule,), token_budget=budget, counter=counter)
+
+    assert result.before_tokens == counter.count_text(_capsule_surface(capsule))
+    assert result.after_tokens == counter.count_text(_capsule_surface(result.capsule))
+    assert result.capsule.token_cost == result.after_tokens
+    assert result.after_tokens <= budget
+    assert all(
+        record.before_tokens
+        == counter.count_text(
+            _canonical_json(
+                next(
+                    item.model_dump(mode="json")
+                    for item in (
+                        *capsule.goals,
+                        *capsule.progress,
+                        *capsule.exact_anchors,
+                        *capsule.dependencies,
+                    )
+                    if getattr(item, "claim_id", None) == record.item_id
+                    or getattr(item, "anchor_id", None) == record.item_id
+                    or getattr(item, "dependency_id", None) == record.item_id
+                )
+            )
+        )
+        for record in result.records
+        if record.source_capsule_id == capsule.capsule_id and record.kind != "narrative_summary"
+    )
+
+
+def test_reorganize_capsules_rejects_item_source_outside_capsule_provenance() -> None:
+    from astrcontinuum.reorganization import reorganize_capsules
+
+    capsule = _capsule(
+        "capsule-gap",
+        event_id="event-gap",
+        goal_text="provenance closure",
+        progress_text="must fail closed",
+        token_cost=10,
+    ).model_copy(
+        update={
+            "goals": (
+                _claim(
+                    "capsule-gap-goal",
+                    "provenance closure",
+                    "event-not-covered",
+                ),
+            )
+        }
+    )
+
+    with pytest.raises(ValueError, match="source_event_ids"):
+        reorganize_capsules((capsule,), token_budget=10_000)
+
+
+def test_reorganize_capsule_id_binds_complete_canonical_source_content() -> None:
+    from astrcontinuum.reorganization import reorganize_capsules
+
+    first = _capsule(
+        "capsule-same-id",
+        event_id="event-same",
+        goal_text="first source content",
+        progress_text="progress",
+        token_cost=10,
+    )
+    second = first.model_copy(
+        update={
+            "goals": (_claim("capsule-same-id-goal", "different source content", "event-same"),)
+        }
+    )
+    first_result = reorganize_capsules((first,), token_budget=10_000)
+    second_result = reorganize_capsules((second,), token_budget=10_000)
+
+    assert first_result.capsule.capsule_id != second_result.capsule.capsule_id
+
+
 def test_reorganization_is_exported_from_production_package() -> None:
     from astrcontinuum.reorganization import reorganize_capsules
 
@@ -201,7 +311,7 @@ def test_reorganization_rejects_conflicting_duplicate_core_identity() -> None:
     second = first.model_copy(
         update={
             "capsule_id": "capsule-b",
-            "source_event_ids": ("event-b",),
+            "source_event_ids": ("event-a", "event-b"),
             "exact_anchors": (second_anchor,),
         }
     )

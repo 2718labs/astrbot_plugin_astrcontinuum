@@ -10,10 +10,10 @@ never silently dropped.
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Sequence
 from dataclasses import dataclass
 from enum import Enum
-from math import ceil
 from typing import Any, TypeVar
 
 from .domain import (
@@ -26,6 +26,8 @@ from .domain import (
     Dependency,
     Entity,
 )
+from .runtime.budget import Utf8ByteTokenCounter
+from .runtime.types import TokenCounter
 
 
 class ReorganizationStatus(str, Enum):
@@ -51,7 +53,12 @@ class ReorganizationRecord:
 
 @dataclass(frozen=True, slots=True)
 class ReorganizationResult:
-    """New capsule plus deterministic loss accounting."""
+    """Worker-local lossy artifact plus deterministic loss accounting.
+
+    This result is not a publishable snapshot.  Callers must route its capsule
+    and records through the existing permanent validator and publication gate;
+    this module intentionally does not relax either safety floor.
+    """
 
     capsule: ContextCapsuleEnvelope
     records: tuple[ReorganizationRecord, ...]
@@ -114,6 +121,7 @@ def reorganize_capsules(
     capsules: Sequence[ContextCapsuleEnvelope],
     *,
     token_budget: int,
+    counter: TokenCounter | None = None,
 ) -> ReorganizationResult:
     """Deterministically fold ``capsules`` into one bounded capsule.
 
@@ -121,15 +129,22 @@ def reorganize_capsules(
     structured values are retained in canonical order, shortened by a fixed
     character rule when necessary, or released with an audit row.  Core exact
     anchors and dependencies must fit in full or the operation fails closed.
+    The returned value is a worker-local artifact and must not bypass the
+    permanent validator/publication gate.
     """
 
     source = _validate_inputs(capsules, token_budget)
+    token_counter = counter if counter is not None else Utf8ByteTokenCounter()
+    _validate_counter(token_counter)
     ordered = tuple(sorted(source, key=lambda item: item.capsule_id))
     session_key = ordered[0].session_key
     if any(item.session_key != session_key for item in ordered[1:]):
         raise ValueError("all capsules must use one session key")
 
-    before_tokens = sum(item.token_cost for item in ordered)
+    # ``token_cost`` is not part of the counted surface: including it would
+    # make the final value recursive.  Every other canonical field, including
+    # metadata and narrative_summary, is counted as UTF-8 through one counter.
+    before_tokens = sum(_count_text(token_counter, _capsule_surface(item)) for item in ordered)
     records: list[ReorganizationRecord] = []
     selected: dict[str, list[Any]] = {
         "goals": [],
@@ -144,7 +159,6 @@ def reorganize_capsules(
         "dependencies": [],
     }
     seen: dict[tuple[str, str], object] = {}
-    used_tokens = _BASE_OVERHEAD_TOKENS
 
     # Core edges are planned first and are always copied byte-for-byte.
     for capsule in ordered:
@@ -162,8 +176,7 @@ def reorganize_capsules(
                         )
                     continue
                 seen[identity] = item
-                item_tokens = _item_tokens(kind, item)
-                used_tokens += item_tokens
+                item_tokens = _item_tokens(token_counter, kind, item)
                 selected[field_name].append(item)
                 records.append(
                     ReorganizationRecord(
@@ -177,9 +190,34 @@ def reorganize_capsules(
                     )
                 )
 
-    if used_tokens > token_budget:
+    # Summary rows are intentionally released: this worker-local artifact has
+    # no summary-generation fallback.  They still carry canonical accounting.
+    for capsule in ordered:
+        records.append(
+            ReorganizationRecord(
+                kind="narrative_summary",
+                item_id=f"{capsule.capsule_id}:narrative_summary",
+                source_capsule_id=capsule.capsule_id,
+                status=ReorganizationStatus.RELEASED,
+                before_tokens=_count_text(
+                    token_counter,
+                    _canonical_json({"narrative_summary": capsule.narrative_summary}),
+                ),
+                after_tokens=0,
+                required=False,
+            )
+        )
+
+    mandatory_tokens = _provisional_after_tokens(
+        ordered,
+        selected,
+        records,
+        token_budget=token_budget,
+        token_counter=token_counter,
+    )
+    if mandatory_tokens > token_budget:
         raise ReorganizationBudgetError(
-            required_tokens=used_tokens,
+            required_tokens=mandatory_tokens,
             budget=token_budget,
         )
 
@@ -205,31 +243,41 @@ def reorganize_capsules(
                         )
                     continue
                 seen[identity] = item
-                before_item_tokens = _item_tokens(kind, item)
-                remaining = token_budget - used_tokens
-                if before_item_tokens <= remaining:
-                    selected[field_name].append(item)
-                    used_tokens += before_item_tokens
-                    records.append(
-                        ReorganizationRecord(
-                            kind=kind,
-                            item_id=item_id,
-                            source_capsule_id=capsule.capsule_id,
-                            status=ReorganizationStatus.RETAINED,
-                            before_tokens=before_item_tokens,
-                            after_tokens=before_item_tokens,
-                            required=False,
-                        )
-                    )
-                    continue
-
-                approximate = _approximate_item(item, kind, remaining)
-                approximate_tokens = (
-                    _item_tokens(kind, approximate) if approximate is not None else 0
+                before_item_tokens = _item_tokens(token_counter, kind, item)
+                retained_record = ReorganizationRecord(
+                    kind=kind,
+                    item_id=item_id,
+                    source_capsule_id=capsule.capsule_id,
+                    status=ReorganizationStatus.RETAINED,
+                    before_tokens=before_item_tokens,
+                    after_tokens=before_item_tokens,
+                    required=False,
                 )
-                if approximate is not None and approximate_tokens <= remaining:
+                selected[field_name].append(item)
+                candidate_tokens = _provisional_after_tokens(
+                    ordered,
+                    selected,
+                    records + [retained_record],
+                    token_budget=token_budget,
+                    token_counter=token_counter,
+                )
+                if candidate_tokens <= token_budget:
+                    records.append(retained_record)
+                    continue
+                selected[field_name].pop()
+
+                approximate, approximate_tokens = _fit_approximate_item(
+                    item,
+                    kind,
+                    field_name,
+                    selected,
+                    records,
+                    ordered,
+                    token_budget=token_budget,
+                    token_counter=token_counter,
+                )
+                if approximate is not None:
                     selected[field_name].append(approximate)
-                    used_tokens += approximate_tokens
                     records.append(
                         ReorganizationRecord(
                             kind=kind,
@@ -241,91 +289,36 @@ def reorganize_capsules(
                             required=False,
                         )
                     )
-                else:
-                    records.append(
-                        ReorganizationRecord(
-                            kind=kind,
-                            item_id=item_id,
-                            source_capsule_id=capsule.capsule_id,
-                            status=ReorganizationStatus.RELEASED,
-                            before_tokens=before_item_tokens,
-                            after_tokens=0,
-                            required=False,
-                        )
+                    continue
+                records.append(
+                    ReorganizationRecord(
+                        kind=kind,
+                        item_id=item_id,
+                        source_capsule_id=capsule.capsule_id,
+                        status=ReorganizationStatus.RELEASED,
+                        before_tokens=before_item_tokens,
+                        after_tokens=0,
+                        required=False,
                     )
-
-    # A narrative field is required by the domain envelope, but it is not a
-    # summary channel.  Preserve only a fixed structural marker and account
-    # for all source prose as released rather than inventing replacement prose.
-    for capsule in ordered:
-        summary_tokens = _text_tokens(capsule.narrative_summary)
-        records.append(
-            ReorganizationRecord(
-                kind="narrative_summary",
-                item_id=f"{capsule.capsule_id}:narrative_summary",
-                source_capsule_id=capsule.capsule_id,
-                status=ReorganizationStatus.RELEASED,
-                before_tokens=summary_tokens,
-                after_tokens=0,
-                required=False,
-            )
-        )
+                )
 
     records_tuple = tuple(records)
-    capsule_id = _new_capsule_id(ordered, token_budget, records_tuple)
-    all_source_event_ids = tuple(
-        sorted({event_id for capsule in ordered for event_id in capsule.source_event_ids})
+    result_capsule = _build_capsule(
+        ordered,
+        selected,
+        records_tuple,
+        token_budget=token_budget,
+        token_counter=token_counter,
     )
-    represented_source_event_ids = tuple(
-        sorted(
-            {
-                event_id
-                for field_name, values in selected.items()
-                for item in values
-                for event_id in getattr(item, "source_event_ids", ())
-            }
+    used_tokens = _count_text(token_counter, _capsule_surface(result_capsule))
+    if used_tokens > token_budget:
+        raise ReorganizationBudgetError(
+            required_tokens=used_tokens,
+            budget=token_budget,
         )
-    )
-    source_coverage = (
-        len(set(represented_source_event_ids)) / len(set(all_source_event_ids))
-        if all_source_event_ids
-        else 1.0
-    )
+    result_capsule = result_capsule.model_copy(update={"token_cost": used_tokens})
     release_count = sum(record.status is ReorganizationStatus.RELEASED for record in records_tuple)
     loss_count = sum(record.status is not ReorganizationStatus.RETAINED for record in records_tuple)
-    result_capsule = ContextCapsuleEnvelope(
-        capsule_id=capsule_id,
-        schema_version="2.1.0",
-        level=max((item.level for item in ordered), key=_LEVEL_ORDER.__getitem__),
-        session_key=session_key,
-        covered_event_start=min(item.covered_event_start for item in ordered),
-        covered_event_end=max(item.covered_event_end for item in ordered),
-        source_event_ids=all_source_event_ids,
-        goals=tuple(selected["goals"]),
-        constraints=tuple(selected["constraints"]),
-        decisions=tuple(selected["decisions"]),
-        progress=tuple(selected["progress"]),
-        open_loops=tuple(selected["open_loops"]),
-        preferences=tuple(selected["preferences"]),
-        entities=tuple(selected["entities"]),
-        emotional_context=tuple(selected["emotional_context"]),
-        exact_anchors=tuple(selected["exact_anchors"]),
-        dependencies=tuple(selected["dependencies"]),
-        narrative_summary="reorganized capsule",
-        token_cost=used_tokens,
-        quality=CapsuleQuality(
-            mechanical_passed=True,
-            source_coverage=source_coverage,
-            anchor_recall=1.0,
-            unsupported_critical_claims=0,
-            coverage_gap=sum(
-                record.status is ReorganizationStatus.RELEASED
-                and record.kind != "narrative_summary"
-                for record in records_tuple
-            ),
-        ),
-        created_at=max(item.created_at for item in ordered),
-    )
     return ReorganizationResult(
         capsule=result_capsule,
         records=records_tuple,
@@ -348,6 +341,28 @@ def _validate_inputs(
         raise ValueError("capsules must not be empty")
     if any(type(item) is not ContextCapsuleEnvelope for item in source):
         raise TypeError("capsules must contain ContextCapsuleEnvelope values")
+    item_fields = (
+        "goals",
+        "constraints",
+        "decisions",
+        "progress",
+        "open_loops",
+        "preferences",
+        "entities",
+        "emotional_context",
+        "exact_anchors",
+        "dependencies",
+    )
+    for capsule in source:
+        valid_event_ids = set(capsule.source_event_ids)
+        for field_name in item_fields:
+            for item in getattr(capsule, field_name):
+                item_event_ids = getattr(item, "source_event_ids", ())
+                if not set(item_event_ids).issubset(valid_event_ids):
+                    raise ValueError(
+                        f"{field_name} item source_event_ids must be contained in "
+                        "capsule source_event_ids"
+                    )
     return source
 
 
@@ -359,28 +374,48 @@ def _item_id(item: object) -> str:
     raise TypeError(f"unsupported capsule item: {type(item).__name__}")
 
 
-def _text_tokens(text: str) -> int:
-    return max(1, ceil(len(text) / 4))
+def _validate_counter(counter: object) -> None:
+    if not callable(getattr(counter, "count_text", None)):
+        raise TypeError("counter must expose callable count_text(text)")
 
 
-def _item_tokens(kind: str, item: object) -> int:
-    if isinstance(item, CapsuleClaim):
-        return _text_tokens(item.text)
-    if isinstance(item, Decision):
-        return _text_tokens(
-            item.text
-            + item.rationale
-            + "".join(item.alternatives)
-            + "".join(item.supersedes)
-            + item.rejected_because
-        )
-    if isinstance(item, Entity):
-        return _text_tokens(item.kind + item.canonical_name + "".join(item.aliases))
-    if isinstance(item, CapsuleAnchor):
-        return _text_tokens(item.exact_text)
-    if isinstance(item, Dependency):
-        return _text_tokens(item.kind + item.target_id)
-    raise TypeError(f"unsupported {kind} item: {type(item).__name__}")
+def _count_text(counter: TokenCounter, text: str) -> int:
+    try:
+        value = counter.count_text(text)
+    except Exception as error:  # noqa: BLE001 - fail closed at the boundary.
+        raise ValueError("token counter failed") from error
+    if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+        raise ValueError("token counter must return a non-negative integer")
+    return value
+
+
+def _canonical_json(value: object) -> str:
+    return json.dumps(
+        value,
+        ensure_ascii=False,
+        sort_keys=True,
+        separators=(",", ":"),
+        allow_nan=False,
+    )
+
+
+def _capsule_surface(capsule: ContextCapsuleEnvelope) -> str:
+    """Canonical counted surface excluding recursive ``token_cost``."""
+
+    return _canonical_json(capsule.model_dump(mode="json", exclude={"token_cost"}))
+
+
+def _item_surface(item: object) -> str:
+    model_dump = getattr(item, "model_dump", None)
+    if not callable(model_dump):
+        raise TypeError(f"unsupported capsule item: {type(item).__name__}")
+    return _canonical_json(model_dump(mode="json"))
+
+
+def _item_tokens(counter: TokenCounter, kind: str, item: object) -> int:
+    if not isinstance(item, (CapsuleClaim, Decision, Entity, CapsuleAnchor, Dependency)):
+        raise TypeError(f"unsupported {kind} item: {type(item).__name__}")
+    return _count_text(counter, _item_surface(item))
 
 
 def _truncate(text: str, max_chars: int) -> str:
@@ -391,10 +426,9 @@ def _truncate(text: str, max_chars: int) -> str:
     return text[: max_chars - 1] + "…"
 
 
-def _approximate_item(item: _T, kind: str, remaining_tokens: int) -> _T | None:
-    if remaining_tokens < _text_tokens("x" * _MIN_APPROXIMATE_CHARS):
+def _approximate_item(item: _T, kind: str, max_chars: int) -> _T | None:
+    if max_chars < _MIN_APPROXIMATE_CHARS:
         return None
-    max_chars = max(_MIN_APPROXIMATE_CHARS, remaining_tokens * 4)
     if isinstance(item, CapsuleClaim):
         return item.model_copy(update={"text": _truncate(item.text, max_chars)})  # type: ignore[return-value]
     if isinstance(item, Decision):
@@ -418,6 +452,147 @@ def _approximate_item(item: _T, kind: str, remaining_tokens: int) -> _T | None:
     return None
 
 
+def _fit_approximate_item(
+    item: _T,
+    kind: str,
+    field_name: str,
+    selected: dict[str, list[Any]],
+    records: list[ReorganizationRecord],
+    capsules: tuple[ContextCapsuleEnvelope, ...],
+    *,
+    token_budget: int,
+    token_counter: TokenCounter,
+) -> tuple[_T | None, int]:
+    """Find the longest deterministic approximation that fits exactly."""
+
+    max_chars = max(
+        (
+            len(getattr(item, "text", "")),
+            len(getattr(item, "rationale", "")),
+            len(getattr(item, "canonical_name", "")),
+        ),
+        default=0,
+    )
+    low = _MIN_APPROXIMATE_CHARS
+    high = max_chars - 1
+    best: tuple[_T, int] | None = None
+    item_id = _item_id(item)
+    source_capsule_id = next(
+        capsule.capsule_id
+        for capsule in capsules
+        if any(item_id == _item_id(candidate) for candidate in getattr(capsule, field_name))
+    )
+    while low <= high:
+        candidate_chars = (low + high) // 2
+        candidate = _approximate_item(item, kind, candidate_chars)
+        if candidate is None or candidate == item:
+            high = candidate_chars - 1
+            continue
+        after_tokens = _item_tokens(token_counter, kind, candidate)
+        candidate_selected = {name: list(values) for name, values in selected.items()}
+        candidate_selected[field_name].append(candidate)
+        candidate_record = ReorganizationRecord(
+            kind=kind,
+            item_id=item_id,
+            source_capsule_id=source_capsule_id,
+            status=ReorganizationStatus.APPROXIMATE,
+            before_tokens=_item_tokens(token_counter, kind, item),
+            after_tokens=after_tokens,
+            required=False,
+        )
+        candidate_tokens = _provisional_after_tokens(
+            capsules,
+            candidate_selected,
+            records + [candidate_record],
+            token_budget=token_budget,
+            token_counter=token_counter,
+        )
+        if candidate_tokens <= token_budget:
+            best = (candidate, after_tokens)
+            low = candidate_chars + 1
+        else:
+            high = candidate_chars - 1
+    return best if best is not None else (None, 0)
+
+
+def _provisional_after_tokens(
+    capsules: tuple[ContextCapsuleEnvelope, ...],
+    selected: dict[str, list[Any]],
+    records: tuple[ReorganizationRecord, ...] | list[ReorganizationRecord],
+    *,
+    token_budget: int,
+    token_counter: TokenCounter,
+) -> int:
+    provisional = _build_capsule(
+        capsules,
+        selected,
+        tuple(records),
+        token_budget=token_budget,
+        token_counter=token_counter,
+    )
+    return _count_text(token_counter, _capsule_surface(provisional))
+
+
+def _build_capsule(
+    capsules: tuple[ContextCapsuleEnvelope, ...],
+    selected: dict[str, list[Any]],
+    records: tuple[ReorganizationRecord, ...],
+    *,
+    token_budget: int,
+    token_counter: TokenCounter,
+) -> ContextCapsuleEnvelope:
+    del token_counter  # The counted surface is applied by the caller.
+    session_key = capsules[0].session_key
+    all_source_event_ids = tuple(
+        sorted({event_id for capsule in capsules for event_id in capsule.source_event_ids})
+    )
+    represented_source_event_ids = {
+        event_id
+        for values in selected.values()
+        for item in values
+        for event_id in getattr(item, "source_event_ids", ())
+    }
+    source_coverage = (
+        min(1.0, len(represented_source_event_ids) / len(set(all_source_event_ids)))
+        if all_source_event_ids
+        else 1.0
+    )
+    release_count = sum(
+        record.status is ReorganizationStatus.RELEASED and record.kind != "narrative_summary"
+        for record in records
+    )
+    capsule_id = _new_capsule_id(capsules, token_budget, records)
+    return ContextCapsuleEnvelope(
+        capsule_id=capsule_id,
+        schema_version="2.1.0",
+        level=max((item.level for item in capsules), key=_LEVEL_ORDER.__getitem__),
+        session_key=session_key,
+        covered_event_start=min(item.covered_event_start for item in capsules),
+        covered_event_end=max(item.covered_event_end for item in capsules),
+        source_event_ids=all_source_event_ids,
+        goals=tuple(selected["goals"]),
+        constraints=tuple(selected["constraints"]),
+        decisions=tuple(selected["decisions"]),
+        progress=tuple(selected["progress"]),
+        open_loops=tuple(selected["open_loops"]),
+        preferences=tuple(selected["preferences"]),
+        entities=tuple(selected["entities"]),
+        emotional_context=tuple(selected["emotional_context"]),
+        exact_anchors=tuple(selected["exact_anchors"]),
+        dependencies=tuple(selected["dependencies"]),
+        narrative_summary="reorganized capsule",
+        token_cost=0,
+        quality=CapsuleQuality(
+            mechanical_passed=True,
+            source_coverage=source_coverage,
+            anchor_recall=1.0,
+            unsupported_critical_claims=0,
+            coverage_gap=release_count,
+        ),
+        created_at=max(item.created_at for item in capsules),
+    )
+
+
 def _new_capsule_id(
     capsules: tuple[ContextCapsuleEnvelope, ...],
     token_budget: int,
@@ -426,7 +601,7 @@ def _new_capsule_id(
     payload = "|".join(
         (
             str(token_budget),
-            *(item.capsule_id for item in capsules),
+            _canonical_json([item.model_dump(mode="json") for item in capsules]),
             *(
                 f"{record.kind}:{record.item_id}:{record.status.value}:{record.after_tokens}"
                 for record in records
