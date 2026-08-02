@@ -1,0 +1,31 @@
+{
+  "protocol_id": "crm-capsule-stress-v2",
+  "schema_version": 2,
+  "stream_count": 24,
+  "generation_count": 12,
+  "sealed_queries_per_generation": 6,
+  "continuity_floor_bytes": 4608,
+  "budget_labels": ["8K", "4K", "2K", "1.5K", "K"],
+  "budget_multipliers": [8.0, 4.0, 2.0, 1.5, 1.0],
+  "kib_denominator_bytes": 1024,
+  "terminal_active_source_kib_bounds": [7.7, 7.9],
+  "terminal_active_source_byte_bounds": [7885, 8089],
+  "core_roles": [
+    "root_goal",
+    "current_focus",
+    "open_loop",
+    "hard_constraint",
+    "decision"
+  ],
+  "stratum_text_bytes": {
+    "core": 64,
+    "compressible_immutable_context": 49,
+    "incompressible_immutable_context": 49,
+    "mutable_ineligible_context": 64
+  },
+  "immutable_context_initial_items": 1,
+  "immutable_context_increment_per_generation": 1,
+  "mutable_ineligible_items_per_generation": 1,
+  "query_return_lag_generations": 4,
+  "seed_start": 271800
+}
