@@ -19,9 +19,13 @@ from .types import (
     SemanticAuditRequest,
 )
 from .validator import validate_candidate
+from .worker import CompactionRunResult, CompactionWorker, CompactionWorkerConfig
 
 __all__ = [
     "AuditedCandidate",
+    "CompactionRunResult",
+    "CompactionWorker",
+    "CompactionWorkerConfig",
     "CompilationCandidate",
     "CompilationRequest",
     "CompilerBackend",

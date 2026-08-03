@@ -3,6 +3,9 @@
 from . import runtime as _runtime
 from .compaction import (
     AuditedCandidate,
+    CompactionRunResult,
+    CompactionWorker,
+    CompactionWorkerConfig,
     CompilationCandidate,
     CompilationRequest,
     CompilerBackend,
@@ -133,6 +136,9 @@ __all__ = [
     "ClaimStatus",
     "CompactionJobEnvelope",
     "CompactionJobState",
+    "CompactionRunResult",
+    "CompactionWorker",
+    "CompactionWorkerConfig",
     "CompilationCandidate",
     "CompilationRequest",
     "CompilerBackend",
