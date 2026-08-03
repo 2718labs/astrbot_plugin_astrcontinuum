@@ -269,6 +269,84 @@ class SQLiteRepository:
                 connection.commit()
                 return view
 
+    def read_claimed_request_view(
+        self,
+        *,
+        job_id: str,
+        owner: str,
+        lease_epoch: int,
+        now: datetime,
+    ) -> RequestView:
+        """Read the immutable compaction input frozen by one live Job lease."""
+
+        now_text = _normalize_datetime(now)
+        with self._factory.connection(read_only=True) as connection:
+            connection.execute("BEGIN")
+            try:
+                self._require_live_fence(
+                    connection,
+                    job_id=job_id,
+                    owner=owner,
+                    lease_epoch=lease_epoch,
+                    now=now_text,
+                )
+                job = self._job_by_id(connection, job_id)
+                if job.base_snapshot_id is None:
+                    snapshot = None
+                    memberships: tuple[SnapshotCapsuleMembership, ...] = ()
+                    covered_event_end = 0
+                    if job.base_pointer_version != 0:
+                        raise RepositoryInvariantError(
+                            "empty Job base must have pointer version zero"
+                        )
+                else:
+                    snapshot, memberships = self._snapshot_bundle_by_id(
+                        connection,
+                        job.base_snapshot_id,
+                    )
+                    if snapshot.session_key != job.session_key:
+                        raise SessionIdentityConflict(
+                            "Job base Snapshot belongs to a different durable session"
+                        )
+                    if snapshot.state != SnapshotState.COMMITTED:
+                        raise RepositoryInvariantError(
+                            "Job base Snapshot is not committed"
+                        )
+                    covered_event_end = snapshot.covered_event_end
+
+                if covered_event_end > job.target_high_water_mark:
+                    raise RepositoryInvariantError(
+                        "Job base Snapshot coverage exceeds its frozen target"
+                    )
+                delta = self._events_between(
+                    connection,
+                    session_key=job.session_key,
+                    start_exclusive=covered_event_end,
+                    end_inclusive=job.target_high_water_mark,
+                )
+                expected_sequences = tuple(
+                    range(covered_event_end + 1, job.target_high_water_mark + 1)
+                )
+                if tuple(event.sequence for event in delta) != expected_sequences:
+                    raise RepositoryInvariantError(
+                        "claimed request Delta is not contiguous through the frozen target"
+                    )
+                view = RequestView(
+                    session_key=job.session_key,
+                    snapshot=snapshot,
+                    memberships=memberships,
+                    pointer_version=job.base_pointer_version,
+                    covered_event_end=covered_event_end,
+                    high_water_mark=job.target_high_water_mark,
+                    delta=delta,
+                )
+            except BaseException:
+                connection.rollback()
+                raise
+            else:
+                connection.commit()
+                return view
+
     def raise_compaction_intent(
         self,
         *,
