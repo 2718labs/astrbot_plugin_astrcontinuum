@@ -76,16 +76,26 @@ current fail-closed behavior.
 
 Before the savepoint, repository code validates each supplied record has the closed
 shape above, no duplicate source-item key, non-negative accounting, and a retained
-status for every `required` record. It must not inspect or log user content.
+status for every `required` record. It must not inspect or log user content. It also
+counts non-summary `released` records. After the unchanged permanent candidate
+validation returns, the repository overlays `QUALITY_COVERAGE_GAP` on a new immutable
+report whenever that count is non-zero. This closes the hand-built-record path without
+changing `validate_permanent()` or treating `strict_audit=false` as a quality bypass.
 
 The existing permanent candidate validation runs unchanged. Only after it succeeds,
 the savepoint performs this order:
 
-1. insert candidate Capsules and ordered Snapshot membership;
+1. insert candidate Capsules;
 2. insert the committed Snapshot;
-3. insert the optional ledger rows with the exact input ordinal;
-4. execute the existing active-pointer CAS;
-5. release the savepoint and mark the job `COMMITTED` only on CAS success.
+3. insert ordered Snapshot membership;
+4. insert the optional ledger rows with the exact input ordinal;
+5. execute the existing active-pointer CAS;
+6. release the savepoint and mark the job `COMMITTED` only on CAS success.
+
+Both membership and ledger rows immediately reference the committed Snapshot under
+SQLite foreign-key enforcement, so this order is required. Every step remains in the
+same savepoint: a ledger failure or CAS loss leaves no candidate Snapshot, membership,
+or ledger orphan.
 
 CAS loss rolls the savepoint back, including every new ledger row, then retains the
 current fenced `SUPERSEDED` behavior. A stale fence, permanent-validation rejection,
@@ -109,6 +119,10 @@ The permanent validator remains authoritative:
 - a non-summary release remains unpublishable through `QUALITY_COVERAGE_GAP`;
 - `strict_audit=false` still skips only semantic model review;
 - recording a ledger never turns a failed candidate into a publishable one.
+
+`approximate` remains an audit disposition only. It neither relaxes existing Capsule
+quality fields nor grants a new publication path; the candidate must independently
+pass every unchanged permanent validation requirement.
 
 ## Failure behavior
 
