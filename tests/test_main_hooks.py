@@ -5,7 +5,7 @@ import shutil
 import sys
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -117,6 +117,75 @@ class FakeEvent:
         return ("plain", text)
 
 
+class RecordingCompiler:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def compile(self, _request: object) -> object:
+        self.calls += 1
+        raise AssertionError("main hook must not invoke the compiler")
+
+
+class RecordingWorker:
+    instances: ClassVar[list[RecordingWorker]] = []
+    fail_construction = False
+    fail_run_once = False
+
+    def __init__(self, **kwargs: object) -> None:
+        if self.__class__.fail_construction:
+            raise RuntimeError("worker construction secret")
+        self.kwargs = kwargs
+        self.run_once_calls = 0
+        self.__class__.instances.append(self)
+
+    async def run_once(self) -> None:
+        self.run_once_calls += 1
+        if self.__class__.fail_run_once:
+            raise RuntimeError("worker run secret")
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.instances = []
+        cls.fail_construction = False
+        cls.fail_run_once = False
+
+
+class RecordingScheduler:
+    instances: ClassVar[list[RecordingScheduler]] = []
+    fail_start = False
+    fail_notify = False
+    fail_close = False
+
+    def __init__(self, callback: object) -> None:
+        self.callback = callback
+        self.start_calls = 0
+        self.notify_calls: list[str] = []
+        self.close_calls = 0
+        self.__class__.instances.append(self)
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.instances = []
+        cls.fail_start = False
+        cls.fail_notify = False
+        cls.fail_close = False
+
+    async def start(self) -> None:
+        self.start_calls += 1
+        if self.__class__.fail_start:
+            raise RuntimeError("start secret")
+
+    async def notify(self, session_key_hash: str) -> None:
+        self.notify_calls.append(session_key_hash)
+        if self.__class__.fail_notify:
+            raise RuntimeError("notify secret")
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        if self.__class__.fail_close:
+            raise RuntimeError("close secret")
+
+
 def fake_request(prompt: str = "current input") -> SimpleNamespace:
     return SimpleNamespace(
         prompt=prompt,
@@ -191,6 +260,29 @@ def load_main(
     monkeypatch.delitem(sys.modules, module_name, raising=False)
     imported = importlib.import_module(module_name)
     return imported, logger
+
+
+def install_compaction_fakes(
+    module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    RecordingWorker.reset()
+    RecordingScheduler.reset()
+    monkeypatch.setattr(module, "CompactionWorker", RecordingWorker, raising=False)
+    monkeypatch.setattr(module, "CoalescingCompactionScheduler", RecordingScheduler, raising=False)
+
+
+async def finalize_intent(module: ModuleType, plugin: object) -> tuple[FakeEvent, object]:
+    event = FakeEvent()
+    await plugin.on_llm_request(event, fake_request())
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    await plugin.on_agent_done_finalize(
+        event,
+        SimpleNamespace(messages=[]),
+        SimpleNamespace(completion_text="assistant completion"),
+    )
+    return event, state
 
 
 def test_main_imports_from_real_astrbot_plugin_package_layout(
@@ -289,11 +381,206 @@ async def test_lifecycle_command_and_llm_response_are_idempotent_and_observation
         assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 0
 
     results = [item async for item in plugin.context_status(event)]
-    assert results == [("plain", "AstrContinuum is ready.")]
-    assert event.plain_results == ["AstrContinuum is ready."]
+    assert results == [("plain", "AstrContinuum is ready; background compaction unavailable.")]
+    assert event.plain_results == ["AstrContinuum is ready; background compaction unavailable."]
 
     await plugin.terminate()
     await plugin.terminate()
     assert plugin._bridge is None
+    not_ready_event = FakeEvent()
+    assert [item async for item in plugin.context_status(not_ready_event)] == [
+        ("plain", "AstrContinuum is not ready.")
+    ]
+
     await plugin.initialize()
     assert plugin._bridge is not None
+
+
+@pytest.mark.asyncio
+async def test_default_lifecycle_persists_intent_without_constructing_compaction_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(object(), {"enabled": True})
+
+    await plugin.initialize()
+    _event, state = await finalize_intent(module, plugin)
+
+    assert plugin._worker is None
+    assert plugin._scheduler is None
+    bridge = plugin._bridge
+    assert bridge is not None
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0] == 1
+    assert state.intent_raised is True
+    assert [item async for item in plugin.context_status(FakeEvent())] == [
+        ("plain", "AstrContinuum is ready; background compaction unavailable.")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_explicit_backend_starts_once_notifies_first_intent_and_never_compiles_in_hook(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    install_compaction_fakes(module, monkeypatch)
+    backend = RecordingCompiler()
+    plugin = module.AstrContinuumPlugin(
+        object(),
+        {"enabled": True},
+        compiler_backend=backend,
+    )
+
+    await plugin.initialize()
+    await plugin.initialize()
+    event, state = await finalize_intent(module, plugin)
+    await plugin.on_agent_done_finalize(
+        event,
+        SimpleNamespace(messages=[]),
+        SimpleNamespace(completion_text="ignored"),
+    )
+
+    assert len(RecordingWorker.instances) == 1
+    assert len(RecordingScheduler.instances) == 1
+    scheduler = RecordingScheduler.instances[0]
+    assert scheduler.start_calls == 1
+    assert scheduler.notify_calls == [state.prepared.turn.session_key.session_key_hash]
+    assert backend.calls == 0
+    assert RecordingWorker.instances[0].run_once_calls == 0
+    assert [item async for item in plugin.context_status(FakeEvent())] == [
+        ("plain", "AstrContinuum is ready; background compaction active.")
+    ]
+
+
+@pytest.mark.asyncio
+async def test_scheduler_start_and_notify_fail_open_without_losing_durable_intent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, logger = load_main(monkeypatch, tmp_path)
+    install_compaction_fakes(module, monkeypatch)
+    RecordingScheduler.fail_start = True
+    plugin = module.AstrContinuumPlugin(object(), {"enabled": True}, compiler_backend=RecordingCompiler())
+
+    await plugin.initialize()
+    _event, state = await finalize_intent(module, plugin)
+
+    assert plugin._bridge is not None
+    assert plugin._worker is None
+    assert plugin._scheduler is None
+    assert state.intent_raised is True
+    assert any("COMPACTION_SCHEDULER_START_FAILED" in str(args) for _, args in logger.records)
+
+    module, logger = load_main(monkeypatch, tmp_path / "notify")
+    install_compaction_fakes(module, monkeypatch)
+    RecordingScheduler.fail_notify = True
+    plugin = module.AstrContinuumPlugin(object(), {"enabled": True}, compiler_backend=RecordingCompiler())
+    await plugin.initialize()
+    _event, state = await finalize_intent(module, plugin)
+
+    assert state.intent_raised is True
+    bridge = plugin._bridge
+    assert bridge is not None
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0] == 1
+    assert any("COMPACTION_SCHEDULER_NOTIFY_FAILED" in str(args) for _, args in logger.records)
+
+
+@pytest.mark.asyncio
+async def test_worker_setup_and_background_callback_fail_open(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, logger = load_main(monkeypatch, tmp_path)
+    install_compaction_fakes(module, monkeypatch)
+    RecordingWorker.fail_construction = True
+    plugin = module.AstrContinuumPlugin(
+        object(),
+        {"enabled": True},
+        compiler_backend=RecordingCompiler(),
+    )
+
+    await plugin.initialize()
+
+    assert plugin._bridge is not None
+    assert plugin._worker is None
+    assert plugin._scheduler is None
+    assert [item async for item in plugin.context_status(FakeEvent())] == [
+        ("plain", "AstrContinuum is ready; background compaction unavailable.")
+    ]
+    assert any("COMPACTION_SCHEDULER_START_FAILED" in str(args) for _, args in logger.records)
+
+    module, logger = load_main(monkeypatch, tmp_path / "callback")
+    install_compaction_fakes(module, monkeypatch)
+    RecordingWorker.fail_run_once = True
+    plugin = module.AstrContinuumPlugin(
+        object(),
+        {"enabled": True},
+        compiler_backend=RecordingCompiler(),
+    )
+    await plugin.initialize()
+
+    scheduler = plugin._scheduler
+    assert scheduler is not None
+    await scheduler.callback("session-key-hash")
+
+    assert any("COMPACTION_WORKER_RUN_FAILED" in str(args) for _, args in logger.records)
+
+
+@pytest.mark.asyncio
+async def test_old_scheduler_callback_never_targets_worker_from_reinitialized_lifecycle(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    install_compaction_fakes(module, monkeypatch)
+    plugin = module.AstrContinuumPlugin(
+        object(),
+        {"enabled": True},
+        compiler_backend=RecordingCompiler(),
+    )
+
+    await plugin.initialize()
+    old_scheduler = plugin._scheduler
+    old_worker = plugin._worker
+    assert old_scheduler is not None and old_worker is not None
+    await plugin.terminate()
+    await plugin.initialize()
+    new_worker = plugin._worker
+    assert new_worker is not None and new_worker is not old_worker
+
+    await old_scheduler.callback("old-session-key-hash")
+
+    assert old_worker.run_once_calls == 1
+    assert new_worker.run_once_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_terminate_detaches_scheduler_fail_open_and_reinitializes_fresh_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, logger = load_main(monkeypatch, tmp_path)
+    install_compaction_fakes(module, monkeypatch)
+    RecordingScheduler.fail_close = True
+    plugin = module.AstrContinuumPlugin(object(), {"enabled": True}, compiler_backend=RecordingCompiler())
+
+    await plugin.initialize()
+    first_scheduler = plugin._scheduler
+    await plugin.terminate()
+    await plugin.terminate()
+
+    assert first_scheduler is not None
+    assert first_scheduler.close_calls == 1
+    assert plugin._bridge is None
+    assert plugin._worker is None
+    assert plugin._scheduler is None
+    assert plugin._capability is None
+    assert any("COMPACTION_SCHEDULER_CLOSE_FAILED" in str(args) for _, args in logger.records)
+
+    RecordingScheduler.fail_close = False
+    await plugin.initialize()
+    assert plugin._scheduler is not None
+    assert plugin._scheduler is not first_scheduler

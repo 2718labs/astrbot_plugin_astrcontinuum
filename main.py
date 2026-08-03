@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, cast
 
 from astrbot.api import logger  # type: ignore[import-not-found]
@@ -22,6 +23,13 @@ if TYPE_CHECKING or not __package__:
         probe_projection_capability,
         select_projection_boundaries,
     )
+    from astrcontinuum.compaction import (
+        CompactionWorker,
+        CompactionWorkerConfig,
+        CompilerBackend,
+        SegmenterConfig,
+        SemanticAuditBackend,
+    )
     from astrcontinuum.domain import EventEnvelope
     from astrcontinuum.runtime import (
         BudgetConfig,
@@ -35,6 +43,7 @@ if TYPE_CHECKING or not __package__:
         restore,
         verify_native,
     )
+    from astrcontinuum.scheduler import CoalescingCompactionScheduler
     from astrcontinuum.storage import (
         SQLiteConnectionFactory,
         SQLiteMigrator,
@@ -52,6 +61,13 @@ else:
         probe_projection_capability,
         select_projection_boundaries,
     )
+    from .astrcontinuum.compaction import (
+        CompactionWorker,
+        CompactionWorkerConfig,
+        CompilerBackend,
+        SegmenterConfig,
+        SemanticAuditBackend,
+    )
     from .astrcontinuum.domain import EventEnvelope
     from .astrcontinuum.runtime import (
         BudgetConfig,
@@ -65,6 +81,7 @@ else:
         restore,
         verify_native,
     )
+    from .astrcontinuum.scheduler import CoalescingCompactionScheduler
     from .astrcontinuum.storage import (
         SQLiteConnectionFactory,
         SQLiteMigrator,
@@ -124,6 +141,9 @@ class AstrContinuumPlugin(Star):
         self,
         context: Context,
         config: dict[str, Any] | None = None,
+        *,
+        compiler_backend: CompilerBackend | None = None,
+        semantic_audit_backend: SemanticAuditBackend | None = None,
     ) -> None:
         super().__init__(context, config)
         self.config = config or {}
@@ -133,6 +153,10 @@ class AstrContinuumPlugin(Star):
         self._bridge: AstrBotHookBridge | None = None
         self._capability: ProjectionCapability | None = None
         self._counter = Utf8ByteTokenCounter()
+        self._compiler_backend = compiler_backend
+        self._semantic_audit_backend = semantic_audit_backend
+        self._worker: CompactionWorker | None = None
+        self._scheduler: CoalescingCompactionScheduler | None = None
 
     def _budget_config(self) -> BudgetConfig:
         defaults = BudgetConfig()
@@ -180,15 +204,94 @@ class AstrContinuumPlugin(Star):
             )
             self._capability = probe_projection_capability()
             self._initialized = True
+            if self._compiler_backend is not None:
+                scheduler: CoalescingCompactionScheduler | None = None
+                try:
+                    worker = CompactionWorker(
+                        repository=repository,
+                        compiler_backend=self._compiler_backend,
+                        counter=self._counter,
+                        config=CompactionWorkerConfig(
+                            worker_id="astrcontinuum-main",
+                            lease_duration=timedelta(seconds=30),
+                            token_ceiling=130_000,
+                            segmenter_config=SegmenterConfig(),
+                            strict_audit=self._semantic_audit_backend is not None,
+                            max_attempts=3,
+                            retry_delay=timedelta(seconds=5),
+                        ),
+                        audit_backend=self._semantic_audit_backend,
+                    )
+                    async def wake_compaction_worker(session_key_hash: str) -> None:
+                        await self._wake_compaction_worker(worker, session_key_hash)
+
+                    scheduler = CoalescingCompactionScheduler(wake_compaction_worker)
+                    await scheduler.start()
+                    self._worker = worker
+                    self._scheduler = scheduler
+                except asyncio.CancelledError:
+                    self._worker = None
+                    self._scheduler = None
+                    if scheduler is not None:
+                        await scheduler.close()
+                    raise
+                except Exception:  # noqa: BLE001 - scheduler setup is fail-open.
+                    self._worker = None
+                    self._scheduler = None
+                    if scheduler is not None:
+                        try:
+                            await scheduler.close()
+                        except Exception:  # noqa: BLE001 - cleanup is best effort.
+                            logger.warning(
+                                "AstrContinuum fail-open code=%s stage=%s",
+                                "COMPACTION_SCHEDULER_CLOSE_FAILED",
+                                "COMPACTION_SCHEDULER",
+                            )
+                    logger.warning(
+                        "AstrContinuum fail-open code=%s stage=%s",
+                        "COMPACTION_SCHEDULER_START_FAILED",
+                        "COMPACTION_SCHEDULER",
+                    )
             logger.info("AstrContinuum initialized")
 
     async def terminate(self) -> None:
         """Release request composition state idempotently."""
 
+        scheduler: CoalescingCompactionScheduler | None = None
         async with self._initialize_lock:
+            scheduler = self._scheduler
+            self._scheduler = None
+            self._worker = None
             self._bridge = None
             self._capability = None
             self._initialized = False
+        if scheduler is not None:
+            try:
+                await scheduler.close()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - termination remains fail-open.
+                logger.warning(
+                    "AstrContinuum fail-open code=%s stage=%s",
+                    "COMPACTION_SCHEDULER_CLOSE_FAILED",
+                    "COMPACTION_SCHEDULER",
+                )
+
+    async def _wake_compaction_worker(
+        self,
+        worker: CompactionWorker,
+        _session_key_hash: str,
+    ) -> None:
+        try:
+            await worker.run_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - callback errors must not kill the scheduler.
+            logger.warning(
+                "AstrContinuum fail-open code=%s stage=%s",
+                "COMPACTION_WORKER_RUN_FAILED",
+                "COMPACTION_WORKER",
+            )
 
     def _record_fault(
         self,
@@ -449,11 +552,25 @@ class AstrContinuumPlugin(Star):
                 return
         if not state.intent_raised:
             try:
-                await bridge.raise_compaction_intent(
+                job = await bridge.raise_compaction_intent(
                     state.prepared,
                     target_high_water_mark=state.assistant_event.sequence,
                 )
                 state.intent_raised = True
+                scheduler = self._scheduler
+                if job is not None and scheduler is not None:
+                    try:
+                        await scheduler.notify(job.session_key.session_key_hash)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001 - durable intent must not roll back.
+                        self._record_fault(
+                            state,
+                            _generic_fault(
+                                "COMPACTION_SCHEDULER_NOTIFY_FAILED",
+                                "COMPACTION_SCHEDULER",
+                            ),
+                        )
             except AstrBotAdapterError as error:
                 self._record_fault(state, error.fault)
             except Exception:  # noqa: BLE001 - scheduling details stay private
@@ -553,5 +670,10 @@ class AstrContinuumPlugin(Star):
 
     @filter.command("context_status")
     async def context_status(self, event: AstrMessageEvent):
-        status = "ready" if self._bridge is not None else "not ready"
+        if self._bridge is None:
+            status = "not ready"
+        elif self._worker is None or self._scheduler is None:
+            status = "ready; background compaction unavailable"
+        else:
+            status = "ready; background compaction active"
         yield event.plain_result(f"AstrContinuum is {status}.")
