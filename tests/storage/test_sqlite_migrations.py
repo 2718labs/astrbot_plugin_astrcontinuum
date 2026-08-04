@@ -421,6 +421,30 @@ def test_v1_database_upgrades_to_snapshot_reorganization_ledger_v2_idempotently(
             row["version"]
             for row in connection.execute("SELECT version FROM schema_migrations ORDER BY version")
         ]
+        session = connection.execute(
+            """
+            SELECT session_key_hash, canonical_session_key_json, next_event_sequence
+            FROM sessions
+            """
+        ).fetchone()
+        event = connection.execute(
+            """
+            SELECT event_id, session_key_hash, sequence, content, source_hook
+            FROM journal_events
+            """
+        ).fetchone()
+        capsule = connection.execute(
+            """
+            SELECT capsule_id, session_key_hash, token_cost, source_coverage
+            FROM capsules
+            """
+        ).fetchone()
+        membership = connection.execute(
+            """
+            SELECT snapshot_id, ordinal, capsule_id, slot
+            FROM snapshot_capsules
+            """
+        ).fetchone()
         snapshot_count = connection.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
         record_count = connection.execute(
             "SELECT COUNT(*) FROM snapshot_reorganization_records"
@@ -428,6 +452,10 @@ def test_v1_database_upgrades_to_snapshot_reorganization_ledger_v2_idempotently(
         user_version = connection.execute("PRAGMA user_version").fetchone()[0]
 
     assert versions == [1, 2]
+    assert tuple(session) == (SESSION_HASH, SESSION_KEY_JSON, 1)
+    assert tuple(event) == ("event-1", SESSION_HASH, 1, "hello", "ON_LLM_REQUEST")
+    assert tuple(capsule) == ("capsule-1", SESSION_HASH, 4, 1.0)
+    assert tuple(membership) == ("snapshot-1", 0, "capsule-1", "primary")
     assert snapshot_count == 1
     assert record_count == 0
     assert user_version == 2
@@ -508,6 +536,67 @@ def test_snapshot_reorganization_record_schema_enforces_contract(tmp_path: Path)
         _insert_event(connection)
         _insert_capsule_snapshot_membership(connection)
         _insert_snapshot_reorganization_record(connection)
+        _insert_snapshot_reorganization_record(
+            connection,
+            ordinal=1,
+            source_capsule_id="source-retained",
+            kind="constraint",
+            item_id="retained-boundary",
+            before_tokens=0,
+            after_tokens=0,
+            required=1,
+        )
+        _insert_snapshot_reorganization_record(
+            connection,
+            ordinal=2,
+            source_capsule_id="source-approximate",
+            kind="constraint",
+            item_id="approximate-boundary",
+            status="approximate",
+            before_tokens=0,
+            after_tokens=0,
+        )
+        _insert_snapshot_reorganization_record(
+            connection,
+            ordinal=3,
+            source_capsule_id="source-released",
+            kind="constraint",
+            item_id="released-boundary",
+            status="released",
+            after_tokens=0,
+        )
+
+        columns = (
+            "snapshot_id",
+            "ordinal",
+            "source_capsule_id",
+            "kind",
+            "item_id",
+            "status",
+            "before_tokens",
+            "after_tokens",
+            "required",
+        )
+        values: list[object] = [
+            "snapshot-1",
+            4,
+            "source-null",
+            "constraint",
+            "null-boundary",
+            "retained",
+            0,
+            0,
+            0,
+        ]
+        for index, column in enumerate(columns):
+            null_values = list(values)
+            null_values[index] = None
+            with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+                connection.execute(
+                    f"INSERT INTO snapshot_reorganization_records ({', '.join(columns)}) "
+                    f"VALUES ({', '.join('?' for _ in columns)})",
+                    tuple(null_values),
+                )
 
         for overrides in (
             {"snapshot_id": " "},
