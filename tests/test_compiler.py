@@ -882,3 +882,62 @@ async def test_rendered_context_token_overflow_is_permanently_rejected() -> None
     assert ac.PermanentFailureCode.TOKEN_CEILING_EXCEEDED in caught.value.report.failure_codes
     assert len(backend.requests) == 1
     assert counter.texts == [SECRET]
+
+
+@pytest.mark.parametrize(
+    ("case", "expected_code"),
+    [
+        ("candidate_base", "BASE_INVALID"),
+        ("bootstrap_with_capsules", "BASE_CAPSULE_MISMATCH"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_reorganize_candidate_rejects_invalid_base_admission(
+    case: str,
+    expected_code: str,
+) -> None:
+    base_capsule = capsule("base", start=1, end=1)
+    committed_base = snapshot((base_capsule,), coverage=1)
+    source_events = (event(2),)
+    delta_capsule = capsule(
+        "delta",
+        start=2,
+        end=2,
+        source_event_ids=("event-2",),
+    )
+    counter = RecordingCounter(9)
+    candidate = await compile_with(
+        base_snapshot=committed_base,
+        base_capsules=(base_capsule,),
+        source_events=source_events,
+        backend=RecordingBackend(compiler_output((base_capsule, delta_capsule))),
+        counter=counter,
+        target=2,
+    )
+
+    if case == "candidate_base":
+        supplied_snapshot: ac.SnapshotEnvelope | None = snapshot(
+            (base_capsule,),
+            coverage=1,
+            state=ac.SnapshotState.CANDIDATE,
+        )
+        supplied_capsules = (base_capsule,)
+    else:
+        supplied_snapshot = None
+        supplied_capsules = (base_capsule,)
+
+    compiler_module = importlib.import_module("astrcontinuum.compaction.compiler")
+    error_type = compiler_surface()["CompilerInvariantError"]
+    with pytest.raises(error_type) as caught:
+        compiler_module.reorganize_candidate(
+            base_snapshot=supplied_snapshot,
+            base_capsules=supplied_capsules,
+            candidate=candidate,
+            source_events=source_events,
+            target_high_water_mark=2,
+            token_ceiling=100,
+            token_budget=100,
+            counter=counter,
+        )
+
+    assert_stable_error(caught.value, expected_code)

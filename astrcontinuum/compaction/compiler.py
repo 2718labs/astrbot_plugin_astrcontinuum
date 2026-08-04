@@ -15,8 +15,15 @@ from ..domain.snapshots import (
     SnapshotState,
 )
 from ..domain.validation import PermanentValidationReport
+from ..reorganization import (
+    ReorganizationBudgetError,
+    ReorganizationInvariantError,
+    ReorganizationRecord,
+    reorganize_capsules,
+)
 from ..runtime.types import TokenCounter
 from ..storage.repository import SnapshotCapsuleMembership
+from .rendering import render_capsule
 from .segmenter import segment
 from .types import (
     CompactionFitProvenance,
@@ -107,12 +114,7 @@ async def compile_candidate(
         source_events=source_event_tuple,
         original_segments=segments,
     )
-    try:
-        token_cost = resolved_compatibility_counter.count_text(rendered_context)
-    except Exception:  # noqa: BLE001 - adapter boundary maps arbitrary failures.
-        raise CompilerInvariantError(CompilerErrorCode.TOKEN_COUNTER_FAILURE) from None
-    if isinstance(token_cost, bool) or not isinstance(token_cost, int) or token_cost < 0:
-        raise CompilerInvariantError(CompilerErrorCode.TOKEN_COUNTER_INVALID)
+    token_cost = _count_rendered_context(resolved_compatibility_counter, rendered_context)
 
     active_anchor_ids = _active_anchor_ids(candidate_capsules)
     try:
@@ -184,6 +186,116 @@ async def compile_candidate(
     )
 
 
+def reorganize_candidate(
+    *,
+    base_snapshot: SnapshotEnvelope | None,
+    base_capsules: Sequence[ContextCapsuleEnvelope],
+    candidate: CompilationCandidate,
+    source_events: Sequence[EventEnvelope],
+    target_high_water_mark: int,
+    token_ceiling: int,
+    token_budget: int,
+    counter: TokenCounter,
+) -> tuple[CompilationCandidate, tuple[ReorganizationRecord, ...]]:
+    """Rebuild one validated candidate from its deterministic reorganization."""
+
+    base_capsule_tuple = tuple(base_capsules)
+    _validate_base_admission(
+        base_snapshot=base_snapshot,
+        base_capsules=base_capsule_tuple,
+    )
+    candidate_capsules = tuple(membership.capsule for membership in candidate.memberships)
+    try:
+        result = reorganize_capsules(
+            candidate_capsules,
+            token_budget=token_budget,
+            counter=counter,
+        )
+    except (ReorganizationBudgetError, ReorganizationInvariantError, TypeError, ValueError):
+        raise CompilerInvariantError(CompilerErrorCode.REORGANIZATION_FAILED) from None
+
+    capsule = result.capsule
+    capsules = (capsule,)
+    rendered_context = render_capsule(capsule)
+    token_cost = _count_rendered_context(counter, rendered_context)
+    active_anchor_ids = _active_anchor_ids(capsules)
+    source_snapshot = candidate.snapshot
+    try:
+        snapshot = SnapshotEnvelope(
+            snapshot_id=_build_snapshot_id(
+                session_key=source_snapshot.session_key,
+                base_snapshot_id=source_snapshot.base_snapshot_id,
+                target_high_water_mark=target_high_water_mark,
+                capsules=capsules,
+                active_anchor_ids=active_anchor_ids,
+                rendered_context=rendered_context,
+                token_cost=token_cost,
+            ),
+            session_key=source_snapshot.session_key,
+            base_snapshot_id=source_snapshot.base_snapshot_id,
+            covered_event_end=target_high_water_mark,
+            source_high_water_mark=target_high_water_mark,
+            capsule_ids=(capsule.capsule_id,),
+            exact_anchor_ids=active_anchor_ids,
+            rendered_context=rendered_context,
+            token_cost=token_cost,
+            audit_outcome=source_snapshot.audit_outcome,
+            state=SnapshotState.CANDIDATE,
+            created_at=source_snapshot.created_at,
+            committed_at=None,
+        )
+        memberships = (
+            SnapshotCapsuleMembership(
+                ordinal=0,
+                slot=_MEMORY_MEMBERSHIP_SLOT,
+                capsule=capsule,
+            ),
+        )
+    except (TypeError, ValueError):
+        raise CompilerInvariantError(CompilerErrorCode.REORGANIZATION_FAILED) from None
+
+    try:
+        report = validate_candidate(
+            base_snapshot=base_snapshot,
+            base_capsules=base_capsule_tuple,
+            candidate_snapshot=snapshot,
+            candidate_capsules=capsules,
+            source_events=source_events,
+            target_high_water_mark=target_high_water_mark,
+            token_ceiling=token_ceiling,
+        )
+    except Exception:  # noqa: BLE001 - validator boundary maps arbitrary failures.
+        raise CompilerInvariantError(CompilerErrorCode.PERMANENT_VALIDATOR_FAILURE) from None
+    if not isinstance(report, PermanentValidationReport):
+        raise CompilerInvariantError(CompilerErrorCode.PERMANENT_VALIDATOR_FAILURE)
+    if not report.passed:
+        raise CompilerInvariantError(
+            CompilerErrorCode.PERMANENT_VALIDATION_FAILED,
+            report=report,
+        )
+
+    return (
+        CompilationCandidate(
+            snapshot=snapshot,
+            memberships=memberships,
+            segments=candidate.segments,
+            permanent_report=report,
+            fit_provenance=candidate.fit_provenance,
+        ),
+        result.records,
+    )
+
+
+def _count_rendered_context(counter: TokenCounter, rendered_context: str) -> int:
+    try:
+        token_cost = counter.count_text(rendered_context)
+    except Exception:  # noqa: BLE001 - adapter boundary maps arbitrary failures.
+        raise CompilerInvariantError(CompilerErrorCode.TOKEN_COUNTER_FAILURE) from None
+    if isinstance(token_cost, bool) or not isinstance(token_cost, int) or token_cost < 0:
+        raise CompilerInvariantError(CompilerErrorCode.TOKEN_COUNTER_INVALID)
+    return token_cost
+
+
 def _validate_inputs(
     *,
     base_snapshot: SnapshotEnvelope | None,
@@ -211,27 +323,13 @@ def _validate_inputs(
     if any(not isinstance(item, EventEnvelope) for item in source_events):
         raise CompilerInvariantError(CompilerErrorCode.SOURCE_EVENTS_INVALID)
 
-    if base_snapshot is None:
-        if base_capsules:
-            raise CompilerInvariantError(CompilerErrorCode.BASE_CAPSULE_MISMATCH)
-        base_coverage = 0
-        session_key = source_events[0].session_key
-    else:
-        if (
-            not isinstance(base_snapshot, SnapshotEnvelope)
-            or base_snapshot.state is not SnapshotState.COMMITTED
-            or base_snapshot.covered_event_end != base_snapshot.source_high_water_mark
-        ):
-            raise CompilerInvariantError(CompilerErrorCode.BASE_INVALID)
-        if (
-            any(not isinstance(item, ContextCapsuleEnvelope) for item in base_capsules)
-            or base_snapshot.capsule_ids != tuple(item.capsule_id for item in base_capsules)
-            or base_snapshot.exact_anchor_ids != _active_anchor_ids(base_capsules)
-            or any(item.session_key != base_snapshot.session_key for item in base_capsules)
-        ):
-            raise CompilerInvariantError(CompilerErrorCode.BASE_CAPSULE_MISMATCH)
-        base_coverage = base_snapshot.covered_event_end
-        session_key = base_snapshot.session_key
+    base_coverage = _validate_base_admission(
+        base_snapshot=base_snapshot,
+        base_capsules=base_capsules,
+    )
+    session_key = (
+        source_events[0].session_key if base_snapshot is None else base_snapshot.session_key
+    )
 
     if any(item.session_key != session_key for item in source_events):
         raise CompilerInvariantError(CompilerErrorCode.SOURCE_SESSION_MISMATCH)
@@ -246,6 +344,31 @@ def _validate_inputs(
     ):
         raise CompilerInvariantError(CompilerErrorCode.SOURCE_COVERAGE_MISMATCH)
     return session_key
+
+
+def _validate_base_admission(
+    *,
+    base_snapshot: SnapshotEnvelope | None,
+    base_capsules: Sequence[ContextCapsuleEnvelope],
+) -> int:
+    if base_snapshot is None:
+        if base_capsules:
+            raise CompilerInvariantError(CompilerErrorCode.BASE_CAPSULE_MISMATCH)
+        return 0
+    if (
+        not isinstance(base_snapshot, SnapshotEnvelope)
+        or base_snapshot.state is not SnapshotState.COMMITTED
+        or base_snapshot.covered_event_end != base_snapshot.source_high_water_mark
+    ):
+        raise CompilerInvariantError(CompilerErrorCode.BASE_INVALID)
+    if (
+        any(not isinstance(item, ContextCapsuleEnvelope) for item in base_capsules)
+        or base_snapshot.capsule_ids != tuple(item.capsule_id for item in base_capsules)
+        or base_snapshot.exact_anchor_ids != _active_anchor_ids(base_capsules)
+        or any(item.session_key != base_snapshot.session_key for item in base_capsules)
+    ):
+        raise CompilerInvariantError(CompilerErrorCode.BASE_CAPSULE_MISMATCH)
+    return base_snapshot.covered_event_end
 
 
 def _validate_backend_output(

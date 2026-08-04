@@ -21,10 +21,11 @@
 - 已接线的 worker 生命周期：领取、续租、重试、取消和 Snapshot 原子发布。
 
 **v0.3.0** 在显式 Repository 发布边界新增 migration v3 与不可变、有序的重组账本存储。
-永久质量闸门会拒绝任何非 **narrative_summary** 的 **released** 账本记录。这项能力有意保持
-为 **storage-only**：标准 **CompactionWorker** 不调用重组器，也不提供记录，因此普通后台
-压缩继续发布空账本。本里程碑不宣称重组执行、语义质量、Provider 性能、完整 AstrBot
-兼容性或面向最终用户的公开发布就绪。
+永久质量闸门会拒绝任何非 **narrative_summary** 的 **released** 账本记录。常规 Provider 绑定／
+默认 AstrBot 路径仍为 **storage-safety-only**：它不设置 **reorganization_token_budget**，并发布
+空账本。独立的注入式 compiler backend 会在围栏合成 Gate A 验证中执行候选重组与账本持久化。
+这条窄路径不宣称 Provider 接入、语义质量、Provider 性能、完整 AstrBot 兼容性或面向最终用户的
+公开发布就绪。
 
 本 Technical Preview 的评测方案、冻结证据摘要和当前/目标工作流见
 [评测](./EVALUATION.zh-CN.md)、[证据](./EVIDENCE.zh-CN.md) 与 [工作流](./WORKFLOW.zh-CN.md)。其中隔离的
@@ -32,8 +33,9 @@
 
 ## v0.3.x — 接线与运维证据
 
-- 只有在具备明确 source-item 记账、永久质量校验和聚焦回归证据后，才把重组器接入 worker。
-- 在真实部署中验证已接线 worker、lease 续租、有界取消、加密升级、备份恢复、崩溃恢复和
+- 只有在具备明确 source-item 记账、永久质量校验、聚焦回归证据与获准接入审查后，才把围栏合成
+  Gate A worker 的重组扩展到常规 Provider 绑定运行时。
+- 在真实部署中验证该常规运行时、lease 续租、有界取消、加密升级、备份恢复、崩溃恢复和
   长时间 WAL 行为。
 - 评估可选的语义审计 Provider，同时确保在线 Hook 始终不等待。
 - 提供有界的重试、取消和安全回滚管理能力。

@@ -1,9 +1,10 @@
 # v0.3.0 Technical Preview Data Flow
 
 This data-flow contract overlays the verified `v0.2.1` runtime with the `v0.3.0`
-storage-only reorganization ledger. It describes durable and wired behavior separately: normal
-background compaction uses the token-metric lane and publishes an empty reorganization ledger;
-only an explicit repository publisher can supply ledger records in this Technical Preview.
+reorganization ledger. It describes durable and wired behavior separately: ordinary
+Provider-bound/default AstrBot background compaction uses the token-metric lane and publishes an
+empty reorganization ledger, while an opt-in injected compiler backend may supply records after
+fenced synthetic Gate A reorganization with an explicit budget.
 
 ## Canonical Records
 
@@ -85,9 +86,11 @@ External Sylanne memory content never enters these flows.
    exact-anchor, same-session membership, and non-empty-output checks MUST always run. Sylanne
    memory is not an admissible Capsule source.
 6. `v0.3.0` adds an optional repository-publication argument for canonical reorganization records.
-   The standard `CompactionWorker` does not invoke `reorganize_capsules()` or supply that argument,
-   so ordinary background work publishes an empty ledger. This storage path is not an assertion
-   that reorganization is wired or evaluated in the installed plugin.
+   The ordinary Provider-bound/default AstrBot path leaves `reorganization_token_budget` unset and
+   publishes an empty ledger. An opt-in injected compiler backend may set that budget, invoke
+   `reorganize_capsules()` before audit, and supply canonical records in fenced synthetic Gate A
+   validation. That path is not an assertion of installed Provider integration, semantic quality,
+   or production readiness.
 7. With optional semantic audit enabled, the worker moves `COMPILING -> AUDITING`; otherwise it
    moves directly to `READY_TO_COMMIT`. `strict_audit=false` affects only this optional step.
 8. At `READY_TO_COMMIT`, `candidate_snapshot_id` identifies the worker-local immutable wire

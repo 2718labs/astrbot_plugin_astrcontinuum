@@ -1,6 +1,6 @@
 <svg xmlns="http://www.w3.org/2000/svg" width="1560" height="1080" viewBox="0 0 1560 1080" role="img" aria-labelledby="title desc">
-  <title id="title">AstrContinuum v0.3 当前发布链与 CRM 研究目标链</title>
-  <desc id="desc">双泳道工作流。上方实线墨绿为当前 v0.3 claim、compile、optional audit、publish/CAS 发布链；下方虚线暗红为尚未接线的 CRM 研究链。</desc>
+  <title id="title">AstrContinuum v0.3 常规发布链、Gate A 窄验证与 CRM 研究目标链</title>
+  <desc id="desc">双泳道工作流。上方实线墨绿为常规 Provider 绑定／默认 AstrBot 的 claim、compile、optional audit、publish/CAS 发布链，默认重组预算为空；暖灰说明框标出注入式围栏 Gate A 窄重组验证；下方虚线暗红为更广 CRM 研究链。</desc>
   <defs>
     <marker id="arrow-green" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#1F6B5B"/></marker>
     <marker id="arrow-red" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#A44742"/></marker>
@@ -9,8 +9,8 @@
   <rect width="1560" height="1080" fill="#ffffff"/>
   <rect x="60" y="55" width="1440" height="425" rx="24" fill="#F8FBF9" stroke="#1F6B5B" stroke-width="3"/>
   <rect x="60" y="535" width="1440" height="475" rx="24" fill="#FFF9F8" stroke="#A44742" stroke-width="3" stroke-dasharray="14 10"/>
-  <text x="108" y="115" fill="#1F6B5B" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="32" font-weight="700">当前 v0.3 Technical Preview：已实现发布链（实线）</text>
-  <text x="108" y="155" fill="#786F63" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="19">受 fencing、机械校验、永久质量闸门与 CAS 约束；标准 worker 不调用重组器。</text>
+  <text x="108" y="115" fill="#1F6B5B" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="32" font-weight="700">当前 v0.3：常规发布链 + Gate A 窄验证（实线）</text>
+  <text x="108" y="155" fill="#786F63" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="19">受 fencing、机械校验、永久质量闸门与 CAS 约束；常规 Provider 绑定运行时默认发布空账本。</text>
 
   <g font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" text-anchor="middle">
     <rect x="105" y="225" width="180" height="90" rx="16" fill="#DDD6CC" stroke="#263238" stroke-width="2"/>
@@ -41,15 +41,15 @@
     <path d="M285 270 H345"/><path d="M525 270 H585"/><path d="M795 270 H855"/><path d="M1035 270 H1095"/><path d="M1300 270 H1340"/>
   </g>
   <rect x="390" y="358" width="500" height="68" rx="12" fill="#ffffff" stroke="#DDD6CC" stroke-width="2"/>
-  <text x="640" y="386" fill="#263238" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="19" font-weight="700" text-anchor="middle">标准 CompactionWorker：reorganization records = ()</text>
-  <text x="640" y="412" fill="#786F63" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="15" text-anchor="middle">显式账本发布接口已存在；自动重组接线尚未交付</text>
+  <text x="640" y="386" fill="#263238" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="19" font-weight="700" text-anchor="middle">常规 Provider-bound worker：reorganization records = ()</text>
+  <text x="640" y="412" fill="#786F63" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="15" text-anchor="middle">Gate A：注入后端 + 显式预算才可围栏重组；仅限合成验证</text>
   <rect x="955" y="358" width="410" height="68" rx="12" fill="#ffffff" stroke="#DDD6CC" stroke-width="2"/>
   <text x="1160" y="386" fill="#263238" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="18" font-weight="700" text-anchor="middle">失败边界：CAS 冲突 → SUPERSEDED / rollback</text>
   <text x="1160" y="412" fill="#A44742" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="15" text-anchor="middle">ledger integrity → transaction rollback；pointer 不移动</text>
   <path d="M1197 315 V358" fill="none" stroke="#786F63" stroke-width="3" marker-end="url(#arrow-gray)"/>
 
-  <text x="108" y="595" fill="#A44742" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="32" font-weight="700">CRM 研究目标：待接线流程（虚线）</text>
-  <text x="108" y="635" fill="#786F63" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="19">有隔离、确定性实验记录；尚不是 v0.3 Worker 或生产能力。</text>
+  <text x="108" y="595" fill="#A44742" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="32" font-weight="700">CRM 研究目标：普通运行时与 E2E 仍待证（虚线）</text>
+  <text x="108" y="635" fill="#786F63" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="19">Gate A 定义窄重组接线验证；完整 CRM 链仍非普通运行时或生产能力。</text>
   <g font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" text-anchor="middle">
     <rect x="105" y="708" width="150" height="105" rx="16" fill="#FFF4F3" stroke="#A44742" stroke-width="2" stroke-dasharray="9 6"/>
     <text x="180" y="750" fill="#263238" font-size="20" font-weight="700">旧 Capsule</text>
@@ -84,7 +84,7 @@
   </g>
   <rect x="320" y="866" width="920" height="86" rx="14" fill="#ffffff" stroke="#DDD6CC" stroke-width="2" stroke-dasharray="9 6"/>
   <text x="780" y="902" fill="#263238" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="21" font-weight="700" text-anchor="middle">query projection 仅读新的 Capsule；释放已消费 Delta 与旧版本</text>
-  <text x="780" y="932" fill="#A44742" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="16" text-anchor="middle">Summary 仅为离线对照，不是运行时主路径或回退；虚线流程需独立接线与发布证据。</text>
+  <text x="780" y="932" fill="#A44742" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="16" text-anchor="middle">Summary 仅为离线对照，不是运行时主路径或回退；Gate B 对新鲜 Summary 的 E2E 仍 BLOCKED。</text>
   <path d="M1377 813 V866" fill="none" stroke="#A44742" stroke-width="4" stroke-dasharray="10 7" marker-end="url(#arrow-red)"/>
   <text x="780" y="1043" fill="#786F63" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="16" text-anchor="middle">RMB-inspired academic palette: dark red #A44742 · ink green #1F6B5B · warm gray #DDD6CC · ink #263238</text>
 </svg>

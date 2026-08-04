@@ -4,8 +4,10 @@ English | [简体中文](./COMPACTION_PROTOCOL.zh-CN.md)
 
 This document describes the `v0.3.0` Technical Preview. It retains the active `v0.2.1`
 compaction lane and adds a durable, opt-in reorganization ledger at the repository publication
-boundary. The ledger is storage-only in this preview: the standard `CompactionWorker` does not
-call a reorganizer or supply records, so ordinary background compaction publishes an empty ledger.
+boundary. The ordinary Provider-bound/default AstrBot path leaves
+`reorganization_token_budget` unset and publishes an empty ledger. A separately opt-in injected
+compiler backend may set an explicit budget, reorganize a candidate, and persist records in the
+fenced synthetic Gate A validation path; it is not a Provider or production integration claim.
 
 ## 1. Safety objective
 
@@ -92,8 +94,10 @@ exact-anchor, non-empty, canonical-metric, or permanent publication validation.
 The `v0.3.0` repository API can additionally accept ordered reorganization records from an
 explicit publisher. It canonicalizes them before publication; a non-`narrative_summary`
 `released` record adds `QUALITY_COVERAGE_GAP` and blocks publication even when
-`strict_audit=false`. The standard worker does not invoke this path, so it does not claim
-reorganization coverage for ordinary background work.
+`strict_audit=false`. The ordinary Provider-bound/default AstrBot path does not set the
+reorganization budget and therefore does not invoke this path. An injected compiler backend may
+set it in fenced synthetic Gate A validation; that narrow path does not claim reorganization
+coverage for ordinary background work.
 
 ## 5. Atomic publication
 
@@ -148,11 +152,11 @@ renewal, bounded cancellation, provider selection, offline tokenizer profiles wi
 BYTE fallback, encrypted canonical-token sidecars and bounded backfill, redacted retry, atomic
 publication, and content-free status/inspection telemetry.
 
-The provider-backed semantic-audit adapter remains unbound. The `v0.3.0` reorganization ledger is
-durably implemented for explicit repository publication but is not wired into the standard
-`CompactionWorker`; the latter therefore continues to publish empty ledger tuples. This Technical
-Preview is not a public `v1.0` compatibility, provider-coverage, performance, or end-user-release
-claim.
+The provider-backed semantic-audit adapter remains unbound. The ordinary Provider-bound/default
+AstrBot path continues to publish empty ledger tuples. A separate injected compiler backend can
+use `reorganize_capsules()` with an explicit budget in fenced synthetic Gate A validation before
+the same durable publication boundary. This Technical Preview is not a public `v1.0`
+compatibility, Provider-coverage, semantic-quality, performance, or end-user-release claim.
 
 See [Data flow](./DATA_FLOW.md), [Concurrency state machine](./CONCURRENCY_STATE_MACHINE.md),
 [Database schema](./DATABASE_SCHEMA.md), [reorganization-ledger ADR](./ADR-008-REORGANIZATION-LEDGER.md),

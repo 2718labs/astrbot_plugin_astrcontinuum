@@ -51,9 +51,10 @@
 
 ## 证据与发布声明边界
 
-上述阈值是未来评测与发布门槛，不是本页所声称已经达到的成绩。当前
-`CompactionWorker` 未接入 `reorganize_capsules()`；正常后台发布仍传入空的重组记录元组。
-任何 CRM、合成或离线 Summary 记录都不能替代这条生产链的端到端证据。
+上述阈值是未来评测与发布门槛，不是本页所声称已经达到的成绩。常规 Provider 绑定／默认 AstrBot
+路径不设置 `reorganization_token_budget`，仍传入空的重组记录元组。可选的注入式／围栏 Gate A
+路径可在显式预算下调用 `reorganize_capsules()`，但其合成回执只能说明接线与持久化发布行为。
+任何 CRM、合成或离线 Summary 记录都不能替代普通生产链的端到端证据，也不能建立比较胜负。
 
 可审阅的冻结研究摘要见 [EVIDENCE.zh-CN.md](EVIDENCE.zh-CN.md)。该页面明确区分合成
 R2 观测、确定性 CRM 压力记账和当前 `v0.3` 可声称范围；所有数字都标注来源哈希与非生产

@@ -4,11 +4,12 @@ English | [简体中文](./ASTRBOT_INTEGRATION.zh-CN.md)
 
 This document defines the boundary between AstrContinuum and AstrBot in the `v0.3.0` Technical
 Preview. It retains the verified `v0.2.1` wired-runtime baseline; the added reorganization ledger
-is persisted only at an explicit Repository publication boundary. It does not change the AstrBot
-hook graph or mean that the standard worker is wired to a reorganizer. This is a runtime contract,
-not a list of intended APIs. Any change to hook ownership, priority, message projection, request
-identity, or plugin lifecycle must update this document and include a real `PluginManager`
-compatibility probe.
+is persisted at an explicit Repository publication boundary. An opt-in injected compiler backend
+may exercise fenced synthetic Gate A reorganization with an explicit budget, but it does not change
+the AstrBot hook graph or make the ordinary Provider-bound worker an automatic reorganizer. This is
+a runtime contract, not a list of intended APIs. Any change to hook ownership, priority, message
+projection, request identity, or plugin lifecycle must update this document and include a real
+`PluginManager` compatibility probe.
 
 ## 1. Composition root
 
@@ -186,9 +187,11 @@ requires it. Termination cancels and awaits an active worker before clearing ser
 
 The remaining integration limitation is the optional provider-backed semantic-audit adapter.
 Mandatory exact-span validation, mechanical validation, fencing, atomic publication, offline
-token profiles, and canonical metric sidecars are active. The `v0.3.0` reorganization ledger is
-storage-only for explicit Repository publications: the standard `CompactionWorker` does not call
-a reorganizer or pass records, so it is not an AstrBot-lifecycle reorganization capability.
+token profiles, and canonical metric sidecars are active. The ordinary Provider-bound/default
+AstrBot path leaves `reorganization_token_budget` unset and passes no records. A separate
+injected compiler backend may exercise `reorganize_capsules()` in the fenced synthetic Gate A
+path; it remains outside the AstrBot lifecycle and is not a Provider, semantic-quality, or
+production capability claim.
 
 ## 10. Change checklist
 

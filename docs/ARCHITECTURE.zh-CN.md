@@ -4,7 +4,8 @@
 
 本文描述 `v0.3.0` Technical Preview 的真实架构、保证安全性的核心不变量，以及“核心已经
 实现”与“AstrBot 插件生命周期已经自动启用”之间的边界。它以已验证的 `v0.2.1` 运行时为
-基础，新增的重组账本只属于显式 Repository 发布边界，不能据此推导标准 worker 已接线。
+基础；重组账本及其可选的注入式／围栏验证通道独立于常规 Provider 绑定 AstrBot 运行时，不能据此
+推导后者已自动重组。
 
 ## 1. 范围与成熟度
 
@@ -26,10 +27,10 @@ AstrContinuum 是通过一个 `Star` 组合入口嵌入 AstrBot 的持久化上�
 计数、AstrBot 上下文窗口自动解析、规范 token 指标 sidecar 与有界补齐已经启用；Provider
 语义审计适配器不属于该已验证基线。
 
-`v0.3.0` 增加 schema migration v3 与不可变、有序的 Snapshot 重组账本。Repository 的显式
-发布调用可以提供账本记录；标准 `CompactionWorker` 当前不调用重组器，也不提供记录，因此
-正常后台压缩发布空账本。这是持久化安全边界，不是重组执行、语义质量、性能或公开发布就绪
-声明。
+`v0.3.0` 增加 schema migration v3 与不可变、有序的 Snapshot 重组账本。常规 Provider 绑定
+运行时与默认 AstrBot 组合配置不设置 `reorganization_token_budget`，所以普通后台压缩发布空
+账本。独立的注入式 compiler backend 可在围栏合成 Gate A 验证通道中显式设置预算，并在发布前重组
+候选。这是持久化安全与窄接线边界，不是 Provider 接入、语义质量、性能或公开发布就绪声明。
 
 ## 2. 架构目标
 
@@ -79,7 +80,7 @@ AstrBot 原生消息历史。所有注入内容必须标记为临时，并在之
 - 不提供用户可见的回滚或时间旅行指令；
 - 不提供 WebUI 管理页面；
 - 不提供 Provider 驱动的语义审计适配器；
-- 不把重组器接入标准 `CompactionWorker`，也不宣称普通后台压缩具备非空账本覆盖；
+- 不在常规 Provider 绑定／默认 AstrBot 运行时自动重组，也不宣称普通后台压缩具备非空账本覆盖；
 - 不宣称一个 tokenizer profile 对所有 Provider 模型都精确；
 - 不实现平台适配器特定行为，也不声明具体适配器支持；
 - 不把外部 Sylanne 记忆正文导入 AstrContinuum 持久记录。
@@ -493,9 +494,10 @@ CANCELLED
   fail-open。
 
 除上述已接线运行时外，`v0.3.0` 的 Repository 支持为显式发布调用持久化有序重组账本，并对
-非 `narrative_summary` 的 `released` 记录施加永久 `QUALITY_COVERAGE_GAP` 质量闸门。标准
-`CompactionWorker` 仍不调用重组器、不传入记录；这项存储能力不代表普通后台压缩已完成重组
-接线或效果认证。
+非 `narrative_summary` 的 `released` 记录施加永久 `QUALITY_COVERAGE_GAP` 质量闸门。常规
+Provider 绑定／默认 AstrBot 路径仍不传入记录；独立的注入式 compiler backend 可设置显式预算，
+在围栏合成 Gate A 通道中于发布前重组候选。这条窄验证通道不代表普通后台压缩已经完成 Provider
+接入或语义效果认证。
 
 ### 15.2 编译器信任边界
 

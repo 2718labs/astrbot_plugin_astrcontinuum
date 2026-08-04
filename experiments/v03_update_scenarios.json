@@ -1,0 +1,65 @@
+{
+  "schema_version": "v03-update-scenarios-v1",
+  "scenarios": [
+    {
+      "scenario_code": "UPD-01",
+      "initial_event": "Register the deployment target and preserve its exact identifier.",
+      "update_event": "Update the deployment target status after the deterministic checkpoint."
+    },
+    {
+      "scenario_code": "UPD-02",
+      "initial_event": "Record the owner decision for the migration sequence.",
+      "update_event": "Add the frozen follow-up needed before the migration can proceed."
+    },
+    {
+      "scenario_code": "UPD-03",
+      "initial_event": "Capture the interface constraint for the capsule boundary.",
+      "update_event": "Append the verified boundary adjustment without changing the prior constraint."
+    },
+    {
+      "scenario_code": "UPD-04",
+      "initial_event": "Register the dependency that must remain available during compaction.",
+      "update_event": "Record the dependency status update for the next publication window."
+    },
+    {
+      "scenario_code": "UPD-05",
+      "initial_event": "Create the initial task marker for a fenced publication job.",
+      "update_event": "Add the synthetic update marker that advances the same task."
+    },
+    {
+      "scenario_code": "UPD-06",
+      "initial_event": "Store the initial exact anchor for the audit record.",
+      "update_event": "Store the second exact anchor required by the update record."
+    },
+    {
+      "scenario_code": "UPD-07",
+      "initial_event": "Capture the initial state transition for a long-running workflow.",
+      "update_event": "Capture the next state transition with the original provenance retained."
+    },
+    {
+      "scenario_code": "UPD-08",
+      "initial_event": "Record the immutable project checkpoint before an update arrives.",
+      "update_event": "Record the checkpoint update while retaining the first checkpoint evidence."
+    },
+    {
+      "scenario_code": "UPD-09",
+      "initial_event": "Preserve a user preference as a structured synthetic claim.",
+      "update_event": "Add the later preference update without removing the original structured claim."
+    },
+    {
+      "scenario_code": "UPD-10",
+      "initial_event": "Open a bounded loop that requires a durable follow-up.",
+      "update_event": "Append the deterministic follow-up for the open loop."
+    },
+    {
+      "scenario_code": "UPD-11",
+      "initial_event": "Register an entity identifier used by the frozen experiment.",
+      "update_event": "Add the entity update and keep the original identifier visible to the gate."
+    },
+    {
+      "scenario_code": "UPD-12",
+      "initial_event": "Record the initial operational constraint for the release hand-off.",
+      "update_event": "Record the release hand-off update under the same deterministic session."
+    }
+  ]
+}

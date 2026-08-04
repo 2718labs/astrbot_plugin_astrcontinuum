@@ -1,9 +1,10 @@
 # Demonstration scenarios — not release claims
 
 This page is a future demonstration and acceptance outline. It does not prove that the listed
-scenarios are already exposed by v0.3.0. In particular, standard background compaction does not
-call a reorganization engine, there is no public rollback UI, and the Sylanne adapter is not an
-active runtime integration.
+scenarios are already exposed by v0.3.0. In particular, ordinary Provider-bound/default AstrBot
+background compaction leaves its reorganization budget unset; the separate injected/fenced Gate A
+path is synthetic validation only. There is no public rollback UI, and the Sylanne adapter is not
+an active runtime integration.
 
 ## Million-token continuity
 

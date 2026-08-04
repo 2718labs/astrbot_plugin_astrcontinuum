@@ -15,10 +15,12 @@ approximated, or released.
 This decision must preserve the existing publication boundary while documenting its current
 scope precisely. The existing candidate-conflict classifier already maps Capsule/Snapshot/
 membership insert integrity collisions and CAS loss to `SUPERSEDED`. v0.3.0 must ensure that
-ledger insert integrity failures do not join that classifier. The standard `CompactionWorker`
-does not yet create or pass reorganization records, so this ADR defines the repository and
-explicit-publisher contract rather than claiming normal background publication has non-empty
-ledger coverage.
+ledger insert integrity failures do not join that classifier. The ordinary Provider-bound worker
+and default AstrBot composition leave `reorganization_token_budget` unset and pass no
+reorganization records. An opt-in injected compiler backend may set that budget and invoke
+`reorganize_capsules()` in the fenced synthetic Gate A validation path. This ADR therefore
+keeps the repository/publication contract separate from ordinary background behavior; Gate A is
+not a Provider or production claim.
 
 ## Decision
 
@@ -72,7 +74,8 @@ kept explicit for the Technical Preview.
 - Existing databases require the checksum-verified migration plan to reach schema version 3.
 - Schema migration versions and Capsule `schema_version` are data contracts; neither is the
   package's v0.3.0 release version.
-- v0.3.0 establishes a storage-safety Technical Preview only. The standard
-  `CompactionWorker` currently sends an empty record tuple; wiring `reorganize_capsules()`
-  into it is out of scope for this milestone. The release does not assert public v1.0
-  compatibility, provider coverage, performance benchmarks, or end-user release readiness.
+- v0.3.0 keeps the ordinary Provider-bound/default AstrBot path storage-safety-only: it sends an
+  empty record tuple. The separate opt-in injected/fenced Gate A path can call
+  `reorganize_capsules()` with an explicit budget and persist its canonical records. That
+  synthetic validation path does not assert public v1.0 compatibility, Provider coverage,
+  semantic quality, performance benchmarks, or end-user release readiness.

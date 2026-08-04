@@ -5,8 +5,8 @@ English | [简体中文](./ARCHITECTURE.zh-CN.md)
 This document describes the `v0.3.0` Technical Preview architecture, the invariants that make it
 safe, and the difference between implemented core capabilities and capabilities currently
 activated by the AstrBot plugin lifecycle. It retains the verified `v0.2.1` runtime baseline;
-the new reorganization ledger belongs only to the explicit Repository publication boundary and
-does not mean that the standard worker is wired to a reorganizer.
+the reorganization ledger and its opt-in injected/fenced validation path remain separate from the
+ordinary Provider-bound AstrBot runtime and do not make it an automatic reorganizer.
 
 ## 1. Scope and maturity
 
@@ -32,10 +32,12 @@ context-limit resolution, canonical token-metric sidecars, and bounded metric ba
 active. A provider-backed semantic-audit adapter is not part of the verified baseline.
 
 `v0.3.0` adds schema migration v3 and an immutable, ordered Snapshot reorganization ledger.
-An explicit Repository publication may supply ledger entries; the standard `CompactionWorker`
-does not invoke a reorganizer or supply entries, so ordinary background compaction publishes an
-empty ledger. This is a durable-storage safety boundary, not a claim of reorganization execution,
-semantic quality, performance, or public-release readiness.
+The ordinary Provider-bound runtime and default AstrBot composition leave
+`reorganization_token_budget` unset, so ordinary background compaction publishes an empty
+ledger. A separately opt-in injected compiler backend may set an explicit budget and reorganize a
+candidate in the fenced synthetic Gate A validation path before publication. This is a
+durable-storage and narrow wiring boundary, not a claim of Provider integration, semantic quality,
+performance, or public-release readiness.
 
 ## 2. Architectural goals
 
@@ -89,8 +91,8 @@ Snapshots are never accepted as the price of availability.
 - no user-facing rollback or time-travel command;
 - no WebUI administration page;
 - no provider-backed semantic-audit adapter;
-- no standard-worker reorganization call or claim that ordinary background compaction has
-  non-empty ledger coverage;
+- no automatic reorganization in the ordinary Provider-bound/default AstrBot runtime, or claim
+  that its background compaction has non-empty ledger coverage;
 - no claim that one tokenizer profile is accurate for every provider model;
 - no platform-adapter-specific behavior or declared adapter support;
 - no import of external Sylanne memory payloads into durable AstrContinuum records.
@@ -524,9 +526,11 @@ membership, non-empty-output, or audit-envelope checks.
 
 In addition to that wired runtime, `v0.3.0` lets an explicit Repository publication persist an
 ordered reorganization ledger and applies the permanent `QUALITY_COVERAGE_GAP` quality gate to
-non-`narrative_summary` `released` entries. The standard `CompactionWorker` still does not call a
-reorganizer or pass entries. This storage capability is not evidence that ordinary background
-compaction has wired or validated reorganization behavior.
+non-`narrative_summary` `released` entries. The ordinary Provider-bound/default AstrBot path
+still passes no entries. A separately opt-in injected compiler backend can set an explicit budget
+and use the fenced synthetic Gate A path to reorganize a candidate before publication. That narrow
+validation path is not evidence that ordinary background compaction has Provider-integrated or
+semantically validated reorganization behavior.
 
 ### 15.2 Compiler trust boundary
 
