@@ -9,6 +9,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from ..domain import (
     CompactionJobEnvelope,
@@ -17,6 +18,7 @@ from ..domain import (
     EventEnvelope,
     EventRole,
     EventType,
+    PermanentFailureCode,
     PermanentValidationReport,
     SessionKey,
     SnapshotAuditOutcome,
@@ -26,6 +28,9 @@ from ..domain import (
     validate_permanent,
 )
 from .sqlite import SQLiteConnectionFactory
+
+if TYPE_CHECKING:
+    from ..reorganization import ReorganizationRecord
 
 FaultInjector = Callable[[str], None]
 
@@ -168,6 +173,33 @@ def _canonical_model_json(
     )
 
 
+def _apply_reorganization_record_quality_floor(
+    report: PermanentValidationReport,
+    records: tuple[ReorganizationRecord, ...],
+) -> PermanentValidationReport:
+    """Derive the non-configurable quality failure for released source records."""
+
+    from ..reorganization import ReorganizationStatus
+
+    non_summary_release_count = sum(
+        record.status is ReorganizationStatus.RELEASED and record.kind != "narrative_summary"
+        for record in records
+    )
+    if not non_summary_release_count:
+        return report
+
+    failures = set(report.failure_codes)
+    failures.add(PermanentFailureCode.QUALITY_COVERAGE_GAP)
+    return PermanentValidationReport(
+        passed=False,
+        failure_codes=tuple(code for code in PermanentFailureCode if code in failures),
+        source_coverage=report.source_coverage,
+        anchor_recall=report.anchor_recall,
+        coverage_gap=max(report.coverage_gap, non_summary_release_count),
+        unsupported_critical_claims=report.unsupported_critical_claims,
+    )
+
+
 class SQLiteRepository:
     """Execute the stable durable transactions over one SQLite database."""
 
@@ -268,6 +300,84 @@ class SQLiteRepository:
             else:
                 connection.commit()
                 return view
+
+    def read_snapshot_reorganization_records(
+        self,
+        snapshot_id: str,
+    ) -> tuple[ReorganizationRecord, ...]:
+        """Read the immutable audit ledger of one committed Snapshot only."""
+
+        with self._factory.connection(read_only=True) as connection:
+            connection.execute("BEGIN")
+            try:
+                snapshot_row = connection.execute(
+                    """
+                    SELECT lifecycle_state
+                    FROM snapshots
+                    WHERE snapshot_id = ?
+                    """,
+                    (snapshot_id,),
+                ).fetchone()
+                if (
+                    snapshot_row is None
+                    or snapshot_row["lifecycle_state"] != SnapshotState.COMMITTED.value
+                ):
+                    raise RepositoryInvariantError(
+                        "reorganization ledger requires a committed Snapshot"
+                    )
+                from ..reorganization import (
+                    ReorganizationInvariantError,
+                    ReorganizationRecord,
+                    ReorganizationStatus,
+                    canonicalize_reorganization_records,
+                )
+
+                rows = connection.execute(
+                    """
+                    SELECT
+                        source_capsule_id,
+                        kind,
+                        item_id,
+                        status,
+                        before_tokens,
+                        after_tokens,
+                        required
+                    FROM snapshot_reorganization_records
+                    WHERE snapshot_id = ?
+                    ORDER BY ordinal
+                    """,
+                    (snapshot_id,),
+                ).fetchall()
+                try:
+                    records_list: list[ReorganizationRecord] = []
+                    for row in rows:
+                        required = row["required"]
+                        if type(required) is not int or required not in (0, 1):
+                            raise ReorganizationInvariantError(
+                                "durable reorganization ledger required flag is invalid"
+                            )
+                        records_list.append(
+                            ReorganizationRecord(
+                                source_capsule_id=row["source_capsule_id"],
+                                kind=row["kind"],
+                                item_id=row["item_id"],
+                                status=ReorganizationStatus(row["status"]),
+                                before_tokens=row["before_tokens"],
+                                after_tokens=row["after_tokens"],
+                                required=bool(required),
+                            )
+                        )
+                    records = canonicalize_reorganization_records(tuple(records_list))
+                except (ReorganizationInvariantError, TypeError, ValueError) as error:
+                    raise RepositoryInvariantError(
+                        "durable reorganization ledger rows are invalid"
+                    ) from error
+            except BaseException:
+                connection.rollback()
+                raise
+            else:
+                connection.commit()
+                return records
 
     def read_claimed_request_view(
         self,
@@ -805,6 +915,7 @@ class SQLiteRepository:
         lease_epoch: int,
         candidate_snapshot: SnapshotEnvelope,
         memberships: Sequence[SnapshotCapsuleMembership],
+        reorganization_records: Sequence[ReorganizationRecord] = (),
         token_ceiling: int,
         now: datetime,
     ) -> PublishResult:
@@ -814,6 +925,7 @@ class SQLiteRepository:
             raise ValueError("token_ceiling must be non-negative")
         now_text = _normalize_datetime(now)
         membership_tuple = tuple(memberships)
+        record_tuple = tuple(reorganization_records)
 
         with self._factory.transaction(immediate=True) as connection:
             fence_row = self._require_live_fence(
@@ -836,6 +948,17 @@ class SQLiteRepository:
             if candidate_snapshot.session_key != job.session_key:
                 raise JobTransitionError("candidate Snapshot belongs to a different Job session")
             self._validate_candidate_memberships(candidate_snapshot, membership_tuple)
+            from ..reorganization import (
+                ReorganizationInvariantError,
+                canonicalize_reorganization_records,
+            )
+
+            try:
+                canonical_records = canonicalize_reorganization_records(record_tuple)
+            except ReorganizationInvariantError as error:
+                raise RepositoryInvariantError(
+                    "candidate reorganization records are invalid"
+                ) from error
 
             if job.base_snapshot_id is None:
                 previous_snapshot = None
@@ -863,6 +986,7 @@ class SQLiteRepository:
                 target_high_water_mark=job.target_high_water_mark,
                 token_ceiling=token_ceiling,
             )
+            report = _apply_reorganization_record_quality_floor(report, canonical_records)
             if not report.passed:
                 raise PublicationRejected(report)
 
@@ -918,6 +1042,36 @@ class SQLiteRepository:
                         conflict = True
                         break
                     self._inject("publish.after_membership")
+
+            if not conflict:
+                for ordinal, record in enumerate(canonical_records):
+                    connection.execute(
+                        """
+                        INSERT INTO snapshot_reorganization_records (
+                            snapshot_id,
+                            ordinal,
+                            source_capsule_id,
+                            kind,
+                            item_id,
+                            status,
+                            before_tokens,
+                            after_tokens,
+                            required
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+                        """,
+                        (
+                            committed_snapshot.snapshot_id,
+                            ordinal,
+                            record.source_capsule_id,
+                            record.kind,
+                            record.item_id,
+                            record.status.value,
+                            record.before_tokens,
+                            record.after_tokens,
+                            int(record.required),
+                        ),
+                    )
+                    self._inject("publish.after_ledger")
 
             if not conflict:
                 conflict = not self._cas_active_pointer(
