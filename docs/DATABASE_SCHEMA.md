@@ -4,7 +4,7 @@
 
 The persistence target is SQLite. Opaque ids are non-empty text, timestamps are UTC RFC 3339 text, booleans are integer `0` or `1`, and JSON columns contain canonical JSON validated before insert. Journal sequences and Snapshot coverage indexes start at `1`. Bootstrap `EMPTY_BASE` has logical coverage `0` but is not a Snapshot Schema envelope, database row, or active pointer.
 
-Foreign keys MUST be enabled. Write transactions and constraints are the correctness boundary; process-local locks are optional optimizations only. Enum values are uppercase stable wire values. Wire envelopes are closed objects. SQLite normalization MUST round-trip every required wire field exactly and MUST NOT expose physical lookup or JSON-storage columns as extra wire properties.
+Foreign keys MUST be enabled. Write transactions and constraints are the correctness boundary; process-local locks are optional optimizations only. Wire-envelope enum values are uppercase stable values. The v0.3.0 storage-only reorganization ledger uses its separately documented lowercase values `retained`, `approximate`, and `released`. Wire envelopes are closed objects. SQLite normalization MUST round-trip every required wire field exactly and MUST NOT expose physical lookup or JSON-storage columns as extra wire properties.
 
 Standard JSON Schema does not compare arbitrary fields across records. Permanent mechanical validators MUST enforce `covered_event_end = source_high_water_mark = compaction_jobs.target_high_water_mark` before publish; same-row arithmetic relations SHOULD also use SQLite `CHECK` constraints.
 
@@ -109,6 +109,34 @@ the Snapshot exact-anchor membership is consistent with the ordered Capsule cont
 Cross-session membership and dangling Capsule, source-event, or anchor references MUST
 be rejected.
 
+## `snapshot_reorganization_records` (migration v2)
+
+This v0.3.0 table is the immutable audit ledger for a committed Snapshot's source-item
+reorganization. It is not a replacement for Capsule provenance or Snapshot quality.
+
+| Column | Rule |
+| --- | --- |
+| `snapshot_id` | TEXT NOT NULL REFERENCES `snapshots(snapshot_id)` |
+| `ordinal` | INTEGER NOT NULL CHECK `>= 0`; preserves caller order |
+| `source_capsule_id`, `kind`, `item_id` | TEXT NOT NULL and non-empty; together identify one source item within a Snapshot |
+| `status` | TEXT NOT NULL: `retained`, `approximate`, or `released` |
+| `before_tokens`, `after_tokens` | INTEGER NOT NULL CHECK `>= 0` |
+| `required` | INTEGER NOT NULL CHECK `IN (0, 1)` |
+
+The primary key is `PRIMARY KEY(snapshot_id, ordinal)` and source identity is unique by
+`UNIQUE(snapshot_id, source_capsule_id, kind, item_id)`. Update and delete triggers make
+the rows immutable. Before the savepoint opens, repository canonicalization requires exact
+record/status/boolean types, non-empty source identity, non-negative non-boolean token
+counts, unique source identity, and `required=true` only with `status=retained`.
+
+`released` is an audit disposition, not permission to bypass the quality floor. A
+non-`narrative_summary` `released` record adds `QUALITY_COVERAGE_GAP` during permanent
+validation and prevents publication even when `strict_audit=false`. Ledger rows are
+written only after their `COMMITTED` Snapshot row exists, are ordered by `ordinal`, and
+are readable only through a committed Snapshot. Records are optional at the repository
+publication API: the standard `CompactionWorker` currently supplies none, so a committed
+Snapshot with an empty ledger is valid in v0.3.0.
+
 ## `snapshots`
 
 Snapshot wire-to-SQLite mapping is normative:
@@ -192,20 +220,26 @@ The database MUST enforce at most one nonterminal intent chain per session, for 
 | `TX_RAISE_COMPACTION_INTENT` | Create/coalesce nonterminal work and monotonically raise intent target |
 | `TX_CLAIM_JOB` | Select eligible job, increment fencing epoch, freeze target, set lease, enter `LEASED` |
 | `TX_FAIL_JOB` | Fence by owner/epoch, persist redacted error, enter `RETRY_WAIT` or `FAILED`, clear lease |
-| `TX_PUBLISH_SNAPSHOT` | Fence and mechanically validate strict coverage advance; open one savepoint; insert new candidate Capsules, committed Snapshot, and ordered membership; bootstrap CAS-create or existing-pointer CAS-update; on same-prefix uniqueness or pointer conflict roll back every new candidate row and persist `SUPERSEDED`; in either branch preserve higher intent as follow-up against winning base |
+| `TX_PUBLISH_SNAPSHOT` | Fence and mechanically validate strict coverage advance plus canonical ledger records; open one savepoint; insert new candidate Capsules, committed Snapshot, ordered membership, and ordered reorganization records; bootstrap CAS-create or existing-pointer CAS-update; the existing classifier maps Capsule/Snapshot/membership insert integrity collisions and pointer conflict to `SUPERSEDED`, rolls back every new candidate row, and preserves higher intent as follow-up against winning base; ledger insert integrity errors propagate instead |
 | `TX_RECOVER_EXPIRED_LEASES` | Requeue expired working jobs and clear owner/expiry; for expired `READY_TO_COMMIT` also clear candidate id so the next claim recompiles |
 
 `TX_PUBLISH_SNAPSHOT` MUST insert all newly compiled `capsules`, the committed Snapshot,
-and its ordered `snapshot_capsules` rows inside the same savepoint before active-pointer
-CAS. Existing immutable base Capsules may be referenced but are never rewritten.
+its ordered `snapshot_capsules` rows, and ordered `snapshot_reorganization_records` rows
+inside the same savepoint before active-pointer CAS. Existing immutable base Capsules may
+be referenced but are never rewritten. The required physical order is Capsules → Snapshot
+→ membership → ledger → CAS because membership and ledger rows both have immediate foreign
+keys to the Snapshot.
 
-If Capsule or membership validation fails, Snapshot insert violates
-`UNIQUE(session_key_hash, covered_event_end)`, bootstrap CAS-create conflicts, or
-existing-pointer CAS-update affects zero rows, publication MUST use the isolated conflict
-path. It MUST roll back to the inner savepoint so every new candidate Capsule,
-membership, and Snapshot row is removed. The outer transaction MUST retain
+If a pre-savepoint validation fails, publication rejects before writing candidate content.
+The existing candidate-conflict classifier treats a Capsule/Snapshot/membership insert
+integrity collision, `UNIQUE(session_key_hash, covered_event_end)`, bootstrap CAS-create
+conflict, or existing-pointer CAS-update affecting zero rows as the isolated conflict path.
+It MUST roll back to the inner savepoint so every new candidate Capsule, membership,
+Snapshot, and ledger row is removed. The outer transaction MUST retain
 `candidate_snapshot_id`, record the fenced job as `SUPERSEDED`, and clear its lease.
 Before commit it MUST read the winning active Snapshot and pointer version; when durable
 `intent_target_high_water_mark` exceeds winning coverage, it MUST leave or create
 `PENDING` follow-up work using that winning base. A stale fencing predicate MUST reject
-the entire attempted transition and MUST NOT record `SUPERSEDED`.
+the entire attempted transition and MUST NOT record `SUPERSEDED`. An integrity error while
+writing the ledger itself is not an expected publish conflict: it MUST propagate and roll
+back the entire outer transaction.

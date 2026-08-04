@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "astrbot-plugin-astrcontinuum"
-version = "0.1.0a0"
+version = "0.3.0"
 description = "Non-blocking infinite context runtime for AstrBot"
 readme = "README.md"
 requires-python = ">=3.10"

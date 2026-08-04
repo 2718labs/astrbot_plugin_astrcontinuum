@@ -7,9 +7,9 @@ from dataclasses import dataclass, field
 from datetime import timedelta
 from typing import TYPE_CHECKING, Any, cast
 
-from astrbot.api import logger  # type: ignore[import-not-found]
-from astrbot.api.event import AstrMessageEvent, filter  # type: ignore[import-not-found]
-from astrbot.api.star import Context, Star, StarTools, register  # type: ignore[import-not-found]
+from astrbot.api import logger  # type: ignore[import-not-found, import-untyped]
+from astrbot.api.event import AstrMessageEvent, filter  # type: ignore[import-not-found, import-untyped]
+from astrbot.api.star import Context, Star, StarTools, register  # type: ignore[import-not-found, import-untyped]
 
 if TYPE_CHECKING or not __package__:
     from astrcontinuum.adapters import (
@@ -132,7 +132,7 @@ def _contains_identity(objects: tuple[object, ...], target: object) -> bool:
     "astrbot_plugin_astrcontinuum",
     "Ayleovelle",
     "Non-blocking infinite context runtime for AstrBot",
-    "0.1.0-alpha",
+    "0.3.0",
 )
 class AstrContinuumPlugin(Star):
     """One standards-compliant Star with reversible provider projection."""

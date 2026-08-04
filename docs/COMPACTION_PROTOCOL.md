@@ -1,66 +1,31 @@
 # 非阻塞压缩协议
 
-## 状态机
+> 本页是可读的协议摘要。`docs/DATA_FLOW.md`、`docs/CONCURRENCY_STATE_MACHINE.md` 与 `docs/DATABASE_SCHEMA.md` 是规范性细节；v0.3.0 的账本规则由 `docs/ADR-008-REORGANIZATION-LEDGER.md` 补充。
+
+## Job 状态机
 
 ```text
-IDLE → QUEUED → RUNNING → CANDIDATE → COMMITTING → COMMITTED
+PENDING → LEASED → COMPILING → AUDITING? → READY_TO_COMMIT → COMMITTED
+                            └──────────────────────────────→ RETRY_WAIT / FAILED
+READY_TO_COMMIT ── same-prefix / pointer CAS conflict ────→ SUPERSEDED
 ```
 
-失败：
+`strict_audit=false` 只省略可选的 `AUDITING` 分支；机械校验、fencing 与永久质量闸门始终生效。未成功的候选不会移动 active pointer；CAS 成功后 pointer 切换到新的 committed Snapshot，而旧行仍保持 immutable、可回溯。
 
-```text
-RUNNING/CANDIDATE/COMMITTING → FAILED
-```
+## 合并与恢复
 
-旧 committed snapshot 始终保持 active。
+- 每会话只有一个非终态意图链；重复触发取更高的 `intent_target_high_water_mark`，不会改写已冻结尝试的 target。
+- 新事件继续写入 Delta。成功或 `SUPERSEDED` 后，只要意图高于获胜 Snapshot 覆盖范围，就在同一事务中保留或创建 `PENDING` follow-up。
+- 过期工作由恢复流程回到 `PENDING`，保留递增的 `lease_epoch`；从过期 `READY_TO_COMMIT` 恢复时清除 worker-local candidate id，下一位持有者必须重新编译。
 
-## Job 字段
+## 原子发布
 
-- session_id
-- base_snapshot_version
-- start_event_seq
-- end_event_seq
-- lease_owner
-- lease_expiry
-- attempt
-- provider_id
-- status
+发布先校验 owner/epoch fencing、base、coverage、成员关系与永久质量条件，再在一个 savepoint 内按以下顺序写入：
 
-## 合并策略
+1. 新 immutable Capsules；
+2. `COMMITTED` Snapshot；
+3. 有序 `snapshot_capsules` 成员关系；
+4. 若显式提供记录，则写入 v0.3.0 的有序重组账本；
+5. active-pointer compare-and-swap 与 Job 终态。
 
-- 每会话只允许一个运行中任务
-- 新事件继续写入 Delta
-- 多次通知合并为“压到最新”的意图
-- 当前任务结束后如仍超阈值，立即安排下一轮
-- 队列不为每条消息创建独立任务
-
-## 触发条件
-
-- Delta Token 超阈值
-- Delta 轮次超阈值
-- Episode 结束
-- 出现重要决定或强约束
-- 会话空闲
-- 警戒水位
-- 手动请求
-
-## 原子提交
-
-事务内：
-
-1. 校验 base version
-2. 校验 coverage 连续
-3. 写 immutable snapshot
-4. compare-and-swap active pointer
-5. 标记 job committed
-6. commit
-
-任一步失败，active pointer 不变。
-
-## 重启恢复
-
-- 过期 RUNNING lease 标记 abandoned
-- 未提交候选不可使用
-- active pointer 仍指向最后 committed snapshot
-- 根据事件序号重建 Delta
-- 恢复 worker
+标准 `CompactionWorker` 当前调用发布 API 时不提供重组记录，因此正常后台压缩的第四步为空；重组器接线尚未纳入 v0.3.0。当前实现把 Capsule、Snapshot、成员关系插入时的完整性碰撞，以及 pointer CAS 失败，归入 `SUPERSEDED` 分支，并回滚 savepoint 中的全部候选写入。账本写入本身的完整性错误不属于这个既有分类器：它必须传播并回滚整个事务，不能伪装为并发获败。任一失败都不会移动 active pointer。

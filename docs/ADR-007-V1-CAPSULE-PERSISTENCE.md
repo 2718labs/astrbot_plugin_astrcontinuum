@@ -2,6 +2,8 @@
 
 Status: accepted
 
+> Update: v0.3.0 的发布写入顺序、账本可见性和冲突分类由 ADR-008 局部修订；本 ADR 的 Capsule 持久化决策保持有效。
+
 ## Context
 
 The starter Schema represented most semantics as generic claims and identified a Capsule

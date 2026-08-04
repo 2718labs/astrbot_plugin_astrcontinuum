@@ -4,9 +4,11 @@
 
 领域模型、内存 EventStore、Snapshot + Delta、非阻塞 Scheduler、确定性 Assembler、基础测试。
 
-## Technical Preview
+## v0.3.0 Technical Preview（当前）
 
-SQLite、LLM Capsule Compiler、Exact Anchors、Loss Auditor、AstrBot hooks、CLI Inspector。
+本里程碑聚焦持久化发布安全：fenced SQLite 事务、不可变 Capsule/Snapshot、schema migration v2、供显式发布调用按 Snapshot 有序保存的重组账本，以及对非摘要 `released` 记录的永久质量闸门。账本只有在 Snapshot 已提交后才可读；CAS 冲突或崩溃不能留下孤儿账本行。标准 `CompactionWorker` 尚未接入重组器，正常后台压缩仍发布空记录集。
+
+它不等同于公开 v1.0，也不代表完整 AstrBot 兼容、Provider 矩阵、性能基准或面向最终用户的发布工件已完成。
 
 ## Public v1.0
 

@@ -2,6 +2,7 @@
 
 - Status: Accepted for Phase 0
 - Scope: request assembly and compaction inputs
+- Update: v0.3.0 的发布写入顺序、账本可见性和冲突分类由 ADR-008 局部修订；本 ADR 的其余覆盖语义保持有效。
 
 ## Definitions
 

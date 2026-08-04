@@ -2,7 +2,7 @@ name: astrbot_plugin_astrcontinuum
 display_name: AstrContinuum / 星续
 desc: "AstrBot 非阻塞长期上下文运行时：稳定快照、增量 Delta、多分辨率胶囊、精确锚点、查询感知恢复与压缩损失审计。"
 short_desc: "上下文会被压缩，对话不会断裂。"
-version: "0.1.0-alpha"
+version: "0.3.0"
 author: Ayleovelle
 license: AGPL-3.0-or-later
 repo: "https://github.com/Ayleovelle/astrbot_plugin_astrcontinuum"
