@@ -35,6 +35,8 @@ v0.3.0 是“持久化发布安全与不可变重组账本”的 Technical Previ
 6. `docs/DATABASE_SCHEMA.md`
 7. `docs/ADR-008-REORGANIZATION-LEDGER.md`
 8. `docs/EVALUATION.md`
+9. `docs/EVIDENCE.md`
+10. `docs/WORKFLOW.md`
 
 ## 边界
 

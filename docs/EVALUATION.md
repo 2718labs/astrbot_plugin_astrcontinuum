@@ -1,4 +1,9 @@
-# 评测方案
+# 评测方案与证据边界
+
+> 本页定义场景、指标与发布阈值。它本身不是实验结果；当前 v0.3
+> Technical Preview 没有获准的真实语义模型／Provider 评测结果。已冻结的
+> 隔离研究摘要、数据清单和图见 [docs/EVIDENCE.md](EVIDENCE.md)，当前
+> 生产链与 CRM 研究目标链见 [docs/WORKFLOW.md](WORKFLOW.md)。
 
 ## 三类保证
 
@@ -41,3 +46,14 @@
 - unsupported critical claims = 0
 - crash scenarios remain usable
 - long-history token reduction >= 75%
+
+## 证据与发布声明边界
+
+上述阈值是未来评测／发布门槛，不是本页声称已经达成的成绩。当前
+CompactionWorker 未接入 reorganize_capsules()，正常后台发布仍传入空的
+重组记录元组；任何 CRM、合成或离线 Summary 记录都不能替代这条生产链的
+端到端证据。
+
+可审阅的冻结研究摘要在 [docs/EVIDENCE.md](EVIDENCE.md)：它明确区分
+合成 R2 观测、确定性 CRM 压力记账与当前 v0.3 可声称范围。所有数字均
+标注来源哈希和非生产边界。

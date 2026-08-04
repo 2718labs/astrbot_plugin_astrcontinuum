@@ -10,6 +10,11 @@
 
 它不等同于公开 v1.0，也不代表完整 AstrBot 兼容、Provider 矩阵、性能基准或面向最终用户的发布工件已完成。
 
+本预览的评测方案、冻结研究摘要和当前／目标工作流分别见
+[docs/EVALUATION.md](EVALUATION.md)、[docs/EVIDENCE.md](EVIDENCE.md)
+与 [docs/WORKFLOW.md](WORKFLOW.md)。其中的隔离合成／确定性记录不构成
+生产语义质量、Provider 性能或公开发布就绪声明。
+
 ## Public v1.0
 
 Multi-resolution Context Tree、Query-Aware Reconstruction、Source Trace、Web Inspector、Sylanne Adapter、百万 Token demo、故障并发测试和发布文档。
