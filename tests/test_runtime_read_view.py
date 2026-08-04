@@ -10,8 +10,20 @@ from typing import Any
 import pytest
 
 import astrcontinuum as ac
+from astrcontinuum.storage import CanonicalMetricObservation
+from astrcontinuum.tokenization import CANONICAL_O200K
 
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
+TEST_KEY = bytes(range(32))
+
+
+def storage_keys() -> ac.ResolvedKeyMaterial:
+    return ac.ResolvedKeyMaterial(
+        active=ac.KeyMaterial.from_raw(TEST_KEY),
+        previous=None,
+        source=ac.KeySource.ENVIRONMENT,
+        local_degraded=False,
+    )
 
 
 def session_key(session_id: str = "session-1") -> ac.SessionKey:
@@ -258,10 +270,15 @@ def test_read_facade_rejects_committed_pointer_or_delta_identity_mismatch() -> N
         assert "PRIVATE-EVENT" not in str(caught.value)
 
 
-def repository(data_dir: Path) -> ac.SQLiteRepository:
+def repository(
+    data_dir: Path,
+) -> tuple[ac.SQLiteRepository, ac.SecureCodec]:
     factory = ac.SQLiteConnectionFactory(data_dir, busy_timeout_ms=5_000)
-    ac.SQLiteMigrator(factory).migrate()
-    return ac.SQLiteRepository(factory)
+    activation = ac.activate_storage_security(factory, storage_keys())
+    return (
+        ac.SQLiteRepository(factory, codec=activation.codec),
+        activation.codec,
+    )
 
 
 def canonical_json(value: Any) -> str:
@@ -272,16 +289,44 @@ def canonical_json(value: Any) -> str:
     )
 
 
-def seed_active_snapshot(store: ac.SQLiteRepository, key: ac.SessionKey) -> None:
+def seed_active_snapshot(
+    store: ac.SQLiteRepository,
+    codec: ac.SecureCodec,
+    key: ac.SessionKey,
+) -> None:
     item = capsule(key)
     snapshot = committed_snapshot(key)
     timestamp = "2026-07-26T12:00:00.000000Z"
+    protected_capsule = codec.encrypt_object_json(
+        "capsules",
+        "canonical_capsule_json",
+        item.capsule_id,
+        canonical_json(item),
+    )
+    protected_anchor_ids = codec.encrypt_array_json(
+        "snapshots",
+        "exact_anchor_ids_json",
+        snapshot.snapshot_id,
+        json.dumps(list(snapshot.exact_anchor_ids), separators=(",", ":")),
+    )
+    protected_rendered_context = codec.encrypt_text(
+        "snapshots",
+        "rendered_context",
+        snapshot.snapshot_id,
+        snapshot.rendered_context,
+    )
+    protected_audit_outcome = codec.encrypt_object_json(
+        "snapshots",
+        "audit_outcome",
+        snapshot.snapshot_id,
+        canonical_json(snapshot.audit_outcome),
+    )
     with store.factory.transaction(immediate=True) as connection:
         connection.execute(
             """
             INSERT INTO capsules (
                 capsule_id, session_key_hash, level, covered_event_start,
-                covered_event_end, canonical_capsule_json, token_cost,
+                covered_event_end, canonical_capsule_json, token_cost_envelope,
                 source_coverage, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
@@ -291,8 +336,13 @@ def seed_active_snapshot(store: ac.SQLiteRepository, key: ac.SessionKey) -> None
                 item.level.value,
                 item.covered_event_start,
                 item.covered_event_end,
-                canonical_json(item),
-                item.token_cost,
+                protected_capsule,
+                codec.encrypt_non_negative_int(
+                    "capsules",
+                    "token_cost",
+                    item.capsule_id,
+                    item.token_cost,
+                ),
                 item.quality.source_coverage,
                 timestamp,
             ),
@@ -302,7 +352,8 @@ def seed_active_snapshot(store: ac.SQLiteRepository, key: ac.SessionKey) -> None
             INSERT INTO snapshots (
                 snapshot_id, session_key_hash, base_snapshot_id, covered_event_end,
                 source_high_water_mark, exact_anchor_ids_json, rendered_context,
-                token_cost, audit_outcome, lifecycle_state, created_at, committed_at
+                token_cost_envelope, audit_outcome, lifecycle_state, created_at,
+                committed_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMMITTED', ?, ?)
             """,
             (
@@ -311,10 +362,15 @@ def seed_active_snapshot(store: ac.SQLiteRepository, key: ac.SessionKey) -> None
                 snapshot.base_snapshot_id,
                 snapshot.covered_event_end,
                 snapshot.source_high_water_mark,
-                json.dumps(list(snapshot.exact_anchor_ids), separators=(",", ":")),
-                snapshot.rendered_context,
-                snapshot.token_cost,
-                canonical_json(snapshot.audit_outcome),
+                protected_anchor_ids,
+                protected_rendered_context,
+                codec.encrypt_non_negative_int(
+                    "snapshots",
+                    "token_cost",
+                    snapshot.snapshot_id,
+                    snapshot.token_cost,
+                ),
+                protected_audit_outcome,
                 timestamp,
                 timestamp,
             ),
@@ -365,7 +421,7 @@ def durable_fingerprint(store: ac.SQLiteRepository) -> tuple[tuple[object, ...],
 def test_file_backed_read_facade_preserves_all_durable_runtime_state(
     tmp_path: Path,
 ) -> None:
-    store = repository(tmp_path)
+    store, codec = repository(tmp_path)
     key = session_key()
     for sequence in (1, 2):
         store.capture_user_event(
@@ -374,9 +430,10 @@ def test_file_backed_read_facade_preserves_all_durable_runtime_state(
             content=f"message {sequence}",
             idempotency_key=f"request-{sequence}",
             token_count=2,
+            canonical=CanonicalMetricObservation(CANONICAL_O200K.profile_id, None),
             created_at=NOW,
         )
-    seed_active_snapshot(store, key)
+    seed_active_snapshot(store, codec, key)
     pending = store.raise_compaction_intent(
         job_id="job-1",
         session_key=key,

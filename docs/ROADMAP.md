@@ -1,28 +1,65 @@
-# 路线图
+# Roadmap
 
-## Internal Alpha
+English | [简体中文](./ROADMAP.zh-CN.md)
 
-领域模型、内存 EventStore、Snapshot + Delta、非阻塞 Scheduler、确定性 Assembler、基础测试。
+The roadmap is directional, not a compatibility promise. Maturity claims belong in the README,
+architecture document, changelog, and verification evidence for a concrete commit.
 
-## v0.3.0 Technical Preview（当前）
+## v0.3.0 Technical Preview — current integration baseline
 
-本里程碑聚焦持久化发布安全：fenced SQLite 事务、不可变 Capsule/Snapshot、schema migration v2、供显式发布调用按 Snapshot 有序保存的重组账本，以及对非摘要 `released` 记录的永久质量闸门。账本只有在 Snapshot 已提交后才可读；CAS 冲突或崩溃不能留下孤儿账本行。标准 `CompactionWorker` 尚未接入重组器，正常后台压缩仍发布空记录集。
+This milestone overlays the verified `v0.2.1` runtime baseline with a narrowly scoped `v0.3.0`
+storage-safety contract. The retained runtime baseline includes:
 
-它不等同于公开 v1.0，也不代表完整 AstrBot 兼容、Provider 矩阵、性能基准或面向最终用户的发布工件已完成。
+- authenticated at-rest encryption, key creation, rotation, recovery, and transactional upgrade;
+- pinned offline `cl100k_base` and `o200k_base` assets with request-level BYTE fallback;
+- separate canonical, live-request, and compaction token lanes with encrypted metric sidecars and
+  bounded backfill;
+- public AstrBot Provider context-window resolution with a conservative automatic fallback;
+- content-free status and inspection evidence;
+- a deterministic, allowlisted `<16 MiB` archive contract and real AstrBot `4.24.0` and `4.26.7`
+  probes; and
+- the wired worker lifecycle: claim, renewal, retry, cancellation, and atomic Snapshot
+  publication.
 
-本预览的评测方案、冻结研究摘要和当前／目标工作流分别见
-[docs/EVALUATION.md](EVALUATION.md)、[docs/EVIDENCE.md](EVIDENCE.md)
-与 [docs/WORKFLOW.md](WORKFLOW.md)。其中的隔离合成／确定性记录不构成
-生产语义质量、Provider 性能或公开发布就绪声明。
+`v0.3.0` adds migration v3 and immutable ordered reorganization-ledger storage at the explicit
+repository-publication boundary. The permanent quality floor rejects every non-
+`narrative_summary` `released` ledger record. This is deliberately **storage-only**: the standard
+`CompactionWorker` does not call the reorganizer or supply records, so ordinary background
+compaction continues to publish an empty ledger. The milestone does not assert reorganization
+execution, semantic quality, Provider performance, full AstrBot compatibility, or public
+end-user release readiness.
 
-## Public v1.0
+The Technical Preview's evaluation plan, frozen evidence summary, and current/target workflow are
+documented in [Evaluation](./EVALUATION.md), [Evidence](./EVIDENCE.md), and
+[Workflow](./WORKFLOW.md). Their isolated synthetic and deterministic records are not production
+semantic-quality, Provider-performance, or public-release-readiness evidence.
 
-Multi-resolution Context Tree、Query-Aware Reconstruction、Source Trace、Web Inspector、Sylanne Adapter、百万 Token demo、故障并发测试和发布文档。
+## v0.3.x — wiring and operational evidence
 
-## v1.x
+- Wire reorganization into the worker only with explicit source-item accounting, permanent-quality
+  validation, and focused regression evidence.
+- Exercise the wired worker, lease renewal, bounded cancellation, encrypted upgrade,
+  backup/restore, crash recovery, and long-running WAL behavior on real deployments.
+- Evaluate an optional semantic-audit Provider without blocking live hooks.
+- Provide bounded administration for retry, cancellation, and safe rollback.
+- Add adapter-specific evidence and declare only platforms actually verified.
+- Expand multi-version and long-context probe automation without publishing Provider secrets or
+  message content.
 
-混合检索、Provider adapters、Tool artifact store、更精确 tokenizer、多语言评测、用户可编辑 Context Policy。
+## v1.0 — production contract
 
-## v2
+- Stable migrations and documented upgrade and rollback policy.
+- Demonstrated non-blocking behavior, crash atomicity, and cross-session isolation under load.
+- Multi-resolution context reconstruction with source trace.
+- Reproducible multi-provider long-context evaluation with explicit tokenizer profiles.
+- Operator-facing backup, retention, privacy, and recovery controls.
+- AstrBot-market submission only after repository, security, documentation, and compatibility
+  gates pass.
 
-学习型选择器、专用 Context Codec、跨会话项目上下文、多 Agent Context Bus。
+## Later exploration
+
+- Hybrid retrieval and tool-artifact storage.
+- User-editable context policies.
+- Cross-session project context with explicit authority boundaries.
+- Multi-agent context exchange.
+- Learned selectors or specialized context codecs, only when deterministic fallbacks remain.

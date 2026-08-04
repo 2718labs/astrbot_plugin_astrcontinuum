@@ -1,25 +1,29 @@
-# Sylanne 适配边界
+# Sylanne adapter boundary
 
-Sylanne 已拥有分层记忆、召回、状态注入和关系系统。AstrContinuum 不复制这些能力。
+Sylanne may own layered memory, retrieval, state injection, and relationship systems.
+AstrContinuum does not duplicate those capabilities.
 
 ```text
-Sylanne：长期意义、关系、人格、生活记忆
-AstrContinuum：当前调用工作集、上下文压缩、状态恢复、Token 预算
+Sylanne: long-term meaning, relationships, persona, life memory
+AstrContinuum: current-call working set, durable context boundary, request assembly, token budget
 ```
 
-适配器只读能力：
+The conceptual read-only boundary may include:
 
-- 获取长期记忆召回
-- 获取重要性提示
-- 获取隐私级别
-- 获取已格式化状态片段
-- 获取来源与置信度
+- long-term memory retrieval;
+- importance hints;
+- privacy level;
+- formatted state fragments;
+- provenance and confidence.
 
-必须避免：
+It must avoid:
 
-- 重复注入相同记忆
-- 暴露 internal/private 内容
-- 将 Sylanne 记忆复制进 AstrContinuum 永久事实库
-- 依赖 Sylanne 私有存储结构
+- injecting the same memory twice;
+- exposing internal or private content;
+- copying Sylanne memory into AstrContinuum's permanent fact store;
+- depending on Sylanne private storage layouts.
 
-Sylanne 不存在或不兼容时，静默降级 standalone，主流程不受影响。
+Current status: the local adapter is a compatibility boundary only. It returns no retrieved memory
+or importance hint and is not wired into the normal AstrContinuum runtime. Do not describe it as
+an available integration. If a verified adapter is introduced later, absence or incompatibility
+must fail open to the standalone path without interrupting the main request flow.

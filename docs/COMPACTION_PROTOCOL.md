@@ -1,31 +1,159 @@
-# 非阻塞压缩协议
+# Non-blocking compaction protocol
 
-> 本页是可读的协议摘要。`docs/DATA_FLOW.md`、`docs/CONCURRENCY_STATE_MACHINE.md` 与 `docs/DATABASE_SCHEMA.md` 是规范性细节；v0.3.0 的账本规则由 `docs/ADR-008-REORGANIZATION-LEDGER.md` 补充。
+English | [简体中文](./COMPACTION_PROTOCOL.zh-CN.md)
 
-## Job 状态机
+This document describes the `v0.3.0` Technical Preview. It retains the active `v0.2.1`
+compaction lane and adds a durable, opt-in reorganization ledger at the repository publication
+boundary. The ledger is storage-only in this preview: the standard `CompactionWorker` does not
+call a reorganizer or supply records, so ordinary background compaction publishes an empty ledger.
 
-```text
-PENDING → LEASED → COMPILING → AUDITING? → READY_TO_COMMIT → COMMITTED
-                            └──────────────────────────────→ RETRY_WAIT / FAILED
-READY_TO_COMMIT ── same-prefix / pointer CAS conflict ────→ SUPERSEDED
+## 1. Safety objective
+
+Compaction may fail, retry, lose a race, or stop with the process without blocking a live request
+or exposing candidate content. The active committed Snapshot remains valid until a newer candidate
+passes permanent validation and wins atomic publication. Compaction never deletes raw Journal
+events.
+
+## 2. Durable state machine
+
+```mermaid
+stateDiagram-v2
+    [*] --> PENDING
+    PENDING --> LEASED: claim
+    RETRY_WAIT --> LEASED: retry due
+    LEASED --> COMPILING
+    COMPILING --> AUDITING: semantic audit enabled
+    COMPILING --> READY_TO_COMMIT: mechanical checks pass
+    AUDITING --> READY_TO_COMMIT: audit passes
+    LEASED --> RETRY_WAIT: retryable failure
+    COMPILING --> RETRY_WAIT: retryable failure
+    AUDITING --> RETRY_WAIT: retryable failure
+    READY_TO_COMMIT --> RETRY_WAIT: retryable failure
+    LEASED --> FAILED: fatal or exhausted
+    COMPILING --> FAILED: fatal or exhausted
+    AUDITING --> FAILED: fatal or exhausted
+    READY_TO_COMMIT --> FAILED: fatal or exhausted
+    READY_TO_COMMIT --> COMMITTED: publication wins
+    READY_TO_COMMIT --> SUPERSEDED: eligible conflict or CAS race lost
+    PENDING --> CANCELLED: administration
+    RETRY_WAIT --> CANCELLED: administration
 ```
 
-`strict_audit=false` 只省略可选的 `AUDITING` 分支；机械校验、fencing 与永久质量闸门始终生效。未成功的候选不会移动 active pointer；CAS 成功后 pointer 切换到新的 committed Snapshot，而旧行仍保持 immutable、可回溯。
+Expired working states recover to `PENDING`. Recovery clears the lease but does not decrease its
+fencing epoch, mutate Journal rows, or change the active pointer. An expired `READY_TO_COMMIT` job
+also drops its candidate identifier so the next worker recompiles.
 
-## 合并与恢复
+## 3. Intent, claims, and fencing
 
-- 每会话只有一个非终态意图链；重复触发取更高的 `intent_target_high_water_mark`，不会改写已冻结尝试的 target。
-- 新事件继续写入 Delta。成功或 `SUPERSEDED` 后，只要意图高于获胜 Snapshot 覆盖范围，就在同一事务中保留或创建 `PENDING` follow-up。
-- 过期工作由恢复流程回到 `PENDING`，保留递增的 `lease_epoch`；从过期 `READY_TO_COMMIT` 恢复时清除 worker-local candidate id，下一位持有者必须重新编译。
+Each session has at most one actionable job. Raising intent never lowers its requested high-water
+mark and coalesces duplicate or lower notifications. A worker claim freezes:
 
-## 原子发布
+- the committed base Snapshot and pointer version;
+- target high-water mark;
+- lease owner and expiry;
+- monotonically increasing fencing epoch; and
+- incremented attempt.
 
-发布先校验 owner/epoch fencing、base、coverage、成员关系与永久质量条件，再在一个 savepoint 内按以下顺序写入：
+Every working-state update includes owner and epoch in its predicate. A stale or expired worker
+changes zero durable rows. An in-process lock is only an optimization; the database fence is
+authoritative.
 
-1. 新 immutable Capsules；
-2. `COMMITTED` Snapshot；
-3. 有序 `snapshot_capsules` 成员关系；
-4. 若显式提供记录，则写入 v0.3.0 的有序重组账本；
-5. active-pointer compare-and-swap 与 Job 终态。
+The frozen compile interval is:
 
-标准 `CompactionWorker` 当前调用发布 API 时不提供重组记录，因此正常后台压缩的第四步为空；重组器接线尚未纳入 v0.3.0。当前实现把 Capsule、Snapshot、成员关系插入时的完整性碰撞，以及 pointer CAS 失败，归入 `SUPERSEDED` 分支，并回滚 savepoint 中的全部候选写入。账本写入本身的完整性错误不属于这个既有分类器：它必须传播并回滚整个事务，不能伪装为并发获败。任一失败都不会移动 active pointer。
+```text
+active/logical coverage + 1 .. target high-water
+```
+
+Gaps, overlaps, stale bases, and coverage beyond the frozen target are rejected. If newer intent
+remains after `COMMITTED` or `SUPERSEDED`, follow-up `PENDING` work starts from the winning active
+pointer.
+
+## 4. Candidate pipeline
+
+The worker reads one committed base plus contiguous Delta and:
+
+1. processes at most one bounded, stable-order batch of missing `canonical-o200k-v1` metrics;
+2. reads the expected active Snapshot, contiguous Delta ending at the frozen target, and the
+   required canonical Event metrics;
+3. segments bounded role-labelled evidence;
+4. asks the selected provider for event ids and exact source spans only;
+5. rejects missing acknowledgements, extra fields, unknown ids, and non-verbatim text;
+6. compiles immutable structured Capsules and renders them deterministically;
+7. verifies identity, coverage, provenance, dependencies, exact anchors, closed envelopes, and
+   canonical metric completeness;
+8. optionally runs semantic loss audit;
+9. creates a candidate Snapshot covering exactly the frozen target; and
+10. enters `READY_TO_COMMIT` only after mandatory checks pass.
+
+Missing or unavailable canonical metrics defer the job without consuming an ordinary failure
+attempt. Disabling optional semantic audit never disables structural, identity, coverage,
+exact-anchor, non-empty, canonical-metric, or permanent publication validation.
+
+The `v0.3.0` repository API can additionally accept ordered reorganization records from an
+explicit publisher. It canonicalizes them before publication; a non-`narrative_summary`
+`released` record adds `QUALITY_COVERAGE_GAP` and blocks publication even when
+`strict_audit=false`. The standard worker does not invoke this path, so it does not claim
+reorganization coverage for ordinary background work.
+
+## 5. Atomic publication
+
+Candidate content is published under a savepoint inside the fenced outer transaction:
+
+1. re-read the active pointer and base version;
+2. insert new immutable Capsules;
+3. insert the committed-form Snapshot;
+4. insert ordered Snapshot/Capsule membership;
+5. insert ordered reorganization-ledger records only when an explicit publisher supplied them;
+6. write the canonical metrics for every new Capsule and the Snapshot, deleting matching
+   backfill intents; and
+7. compare-and-swap the active pointer, mark the job `COMMITTED`, clear the lease, and commit.
+
+Readers therefore observe either the complete old committed view or the complete new committed
+view, never partial candidate state. The ledger reader accepts only committed Snapshots; candidate
+or rolled-back rows are not visible.
+
+The existing `SUPERSEDED` classifier is deliberately narrow: eligible Capsule, Snapshot, or
+membership insert conflicts and active-pointer CAS loss roll the savepoint back. Ledger-write
+integrity failures are not relabelled as `SUPERSEDED`; they propagate and roll back the outer
+transaction. Canonical-metric failures likewise cannot publish a partial candidate. No failure
+moves the active pointer.
+
+## 6. Failure classes
+
+- **Retryable:** transient SQLite contention or bounded compiler, auditor, or callback failure.
+  Persist a redacted error tuple and back off in `RETRY_WAIT`.
+- **Metric deferral:** missing or unavailable canonical metrics leave or preserve content-free
+  backfill work and defer compilation without substituting an incompatible unit system.
+- **Fatal:** invalid closed envelope, impossible identity or coverage, policy rejection, or
+  exhausted attempts. Persist `FAILED`.
+- **Superseded:** another valid publisher wins an eligible uniqueness conflict or active-pointer
+  CAS. This is a race outcome, not data corruption.
+- **Crash or lease expiry:** startup recovery returns work to `PENDING`; committed data is
+  unchanged.
+
+Diagnostics contain a stage, code, and redacted message. Conversation content and arbitrary
+provider object representations are forbidden.
+
+## 7. Separation from live requests
+
+`on_llm_request` reads only committed state and captured high-water `H`; it never waits for a
+job. New events continue into the Delta during compilation. Emergency assembly may shrink the
+request view but cannot mutate Journal, Snapshot, coverage, job state, canonical metrics, or the
+reorganization ledger.
+
+## 8. Current activation boundary
+
+The installed preview includes the `Star`-owned claim loop, frozen compaction reads, lease
+renewal, bounded cancellation, provider selection, offline tokenizer profiles with request-level
+BYTE fallback, encrypted canonical-token sidecars and bounded backfill, redacted retry, atomic
+publication, and content-free status/inspection telemetry.
+
+The provider-backed semantic-audit adapter remains unbound. The `v0.3.0` reorganization ledger is
+durably implemented for explicit repository publication but is not wired into the standard
+`CompactionWorker`; the latter therefore continues to publish empty ledger tuples. This Technical
+Preview is not a public `v1.0` compatibility, provider-coverage, performance, or end-user-release
+claim.
+
+See [Data flow](./DATA_FLOW.md), [Concurrency state machine](./CONCURRENCY_STATE_MACHINE.md),
+[Database schema](./DATABASE_SCHEMA.md), [reorganization-ledger ADR](./ADR-008-REORGANIZATION-LEDGER.md),
+and [test matrix](./TEST_MATRIX.md).

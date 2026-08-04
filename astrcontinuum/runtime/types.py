@@ -5,7 +5,7 @@ from dataclasses import dataclass, field
 from enum import Enum
 from typing import Protocol
 
-from ..domain import SessionKey
+from ..domain import EventType, SessionKey
 from ..storage import RequestView
 
 
@@ -192,6 +192,9 @@ class CandidateBlock:
     required: bool
     capsule_id: str | None
     event_sequence: int | None
+    event_type: EventType | None = None
+    tool_name: str | None = None
+    required_selection_complete: bool = True
 
     def __post_init__(self) -> None:
         if not self.block_id:
@@ -208,6 +211,18 @@ class CandidateBlock:
             raise ValueError("reason must be non-empty")
         if self.event_sequence is not None and self.event_sequence < 1:
             raise ValueError("event_sequence must be positive")
+        if self.event_type is not None and (
+            not isinstance(self.event_type, EventType) or self.kind is not CandidateKind.RAW_EVENT
+        ):
+            raise ValueError("event_type is valid only for raw event candidates")
+        if self.tool_name is not None and (
+            not isinstance(self.tool_name, str)
+            or not self.tool_name
+            or self.event_type not in {EventType.TOOL_CALL, EventType.TOOL_RESULT}
+        ):
+            raise ValueError("tool_name requires a tool raw event")
+        if not isinstance(self.required_selection_complete, bool):
+            raise TypeError("required_selection_complete must be a boolean")
 
 
 class TokenCounter(Protocol):
@@ -233,6 +248,26 @@ class BudgetErrorCode(str, Enum):
     TOKEN_COUNTER_FAILURE = "TOKEN_COUNTER_FAILURE"
     REQUIRED_INPUT_EXCEEDS_BUDGET = "REQUIRED_INPUT_EXCEEDS_BUDGET"
     INTERNAL_BUDGET_INVARIANT = "INTERNAL_BUDGET_INVARIANT"
+
+
+@dataclass(frozen=True, slots=True)
+class BudgetSafetyConfig:
+    """Provider-independent request budget safety defaults."""
+
+    target_input_budget: int = 130_000
+    hard_input_ceiling: int = 150_000
+    reserved_output_and_tools: int = 32_000
+    safety_margin: int = 2_000
+
+    def __post_init__(self) -> None:
+        for field_name in ("target_input_budget", "hard_input_ceiling"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 1:
+                raise ValueError(f"{field_name} must be a positive integer")
+        for field_name in ("reserved_output_and_tools", "safety_margin"):
+            value = getattr(self, field_name)
+            if isinstance(value, bool) or not isinstance(value, int) or value < 0:
+                raise ValueError(f"{field_name} must be a non-negative integer")
 
 
 @dataclass(frozen=True, slots=True)

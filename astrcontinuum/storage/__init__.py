@@ -1,5 +1,13 @@
 """Durable SQLite foundations for AstrContinuum."""
 
+from .crypto import (
+    SecureCodec,
+    SecurityErrorCode,
+    StorageSecurityError,
+    encode_key_text,
+    key_id_for,
+    parse_key_text,
+)
 from .migrations import (
     MIGRATIONS,
     Migration,
@@ -13,6 +21,7 @@ from .repository import (
     EventIdentityConflict,
     IdempotencyConflict,
     JobTransitionError,
+    MetricBackfillArtifact,
     PublicationRejected,
     PublishOutcome,
     PublishResult,
@@ -25,11 +34,30 @@ from .repository import (
     SQLiteRepository,
     StaleLeaseError,
 )
+from .security import (
+    GeneratedKeyFile,
+    KeyMaterial,
+    KeySource,
+    ResolvedKeyMaterial,
+    StorageMaintenanceState,
+    StorageSecurityActivation,
+    activate_storage_security,
+    fingerprint_key_file,
+    generate_key_file,
+    resolve_key_material,
+)
 from .sqlite import (
     DATABASE_FILENAME,
     DEFAULT_BUSY_TIMEOUT_MS,
     MAX_BUSY_TIMEOUT_MS,
     SQLiteConnectionFactory,
+)
+from .token_metrics import (
+    ArtifactKind,
+    CanonicalMetricObservation,
+    TokenMetric,
+    TokenMetricConflict,
+    TokenMetricStore,
 )
 
 __all__ = [
@@ -37,9 +65,15 @@ __all__ = [
     "DEFAULT_BUSY_TIMEOUT_MS",
     "MAX_BUSY_TIMEOUT_MS",
     "MIGRATIONS",
+    "ArtifactKind",
+    "CanonicalMetricObservation",
     "EventIdentityConflict",
+    "GeneratedKeyFile",
     "IdempotencyConflict",
     "JobTransitionError",
+    "KeyMaterial",
+    "KeySource",
+    "MetricBackfillArtifact",
     "Migration",
     "MigrationApplyError",
     "MigrationChecksumError",
@@ -52,10 +86,26 @@ __all__ = [
     "RepositoryError",
     "RepositoryInvariantError",
     "RequestView",
+    "ResolvedKeyMaterial",
     "SQLiteConnectionFactory",
     "SQLiteMigrator",
     "SQLiteRepository",
+    "SecureCodec",
+    "SecurityErrorCode",
     "SessionIdentityConflict",
     "SnapshotCapsuleMembership",
     "StaleLeaseError",
+    "StorageMaintenanceState",
+    "StorageSecurityActivation",
+    "StorageSecurityError",
+    "TokenMetric",
+    "TokenMetricConflict",
+    "TokenMetricStore",
+    "activate_storage_security",
+    "encode_key_text",
+    "fingerprint_key_file",
+    "generate_key_file",
+    "key_id_for",
+    "parse_key_text",
+    "resolve_key_material",
 ]

@@ -1,9 +1,19 @@
 from __future__ import annotations
 
+import json
 from collections.abc import Iterable
+from dataclasses import replace
 
-from ..domain import AnchorStatus, CapsuleLevel, ContextCapsuleEnvelope, SemanticStatus
+from ..domain import (
+    AnchorStatus,
+    CapsuleLevel,
+    ContextCapsuleEnvelope,
+    EventEnvelope,
+    EventType,
+    SemanticStatus,
+)
 from ..storage import RequestView
+from .tool_loop import durable_event_units
 from .types import (
     RUNTIME_SLOT_PRIORITY,
     CandidateBlock,
@@ -91,11 +101,93 @@ def _task_text(capsule: ContextCapsuleEnvelope, config: RetrievalConfig) -> str:
     return "\n".join(sections)
 
 
+def _raw_event_text(event: object) -> str:
+    event_type = getattr(getattr(event, "event_type", None), "value", "UNKNOWN_EVENT")
+    role = getattr(getattr(event, "role", None), "value", "UNKNOWN_ROLE")
+    event_id = getattr(event, "event_id", "unknown-event")
+    content = getattr(event, "content", "")
+    return f"[{event_type}/{role} {event_id}]\n{content}"
+
+
+def _raw_tool_name(event: EventEnvelope) -> str | None:
+    expected_kind = {
+        EventType.TOOL_CALL: "call",
+        EventType.TOOL_RESULT: "result",
+    }.get(event.event_type)
+    if expected_kind is None:
+        return None
+    try:
+        value = json.loads(event.content)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        return None
+    if not isinstance(value, dict) or value.get("kind") != expected_kind:
+        return None
+    tool = value.get("tool")
+    return tool if isinstance(tool, str) and tool else None
+
+
 def _candidate_sort_key(candidate: CandidateBlock) -> tuple[int, float, int, str]:
     slot_rank = _SLOT_RANK[candidate.slot]
     if candidate.slot == RuntimeSlot.RAW_DELTA:
         return (slot_rank, 0.0, candidate.event_sequence or 0, candidate.block_id)
     return (slot_rank, -candidate.score, 0, candidate.block_id)
+
+
+def required_candidates_complete(
+    view: RequestView,
+    candidates: Iterable[CandidateBlock],
+    *,
+    satisfied_event_ids: Iterable[str] = (),
+) -> bool:
+    """Prove that every required source in the immutable view has a candidate."""
+
+    satisfied = set(satisfied_event_ids)
+    expected: set[str] = set()
+    for membership in view.memberships:
+        capsule = membership.capsule
+        expected.update(
+            f"goal:{capsule.capsule_id}:{claim.claim_id}"
+            for claim in capsule.goals
+            if claim.status is SemanticStatus.ACTIVE
+        )
+        expected.update(
+            f"constraint:{capsule.capsule_id}:{claim.claim_id}"
+            for claim in capsule.constraints
+            if claim.status is SemanticStatus.ACTIVE
+        )
+        expected.update(
+            f"anchor:{capsule.capsule_id}:{anchor.anchor_id}"
+            for anchor in capsule.exact_anchors
+            if anchor.status is AnchorStatus.ACTIVE
+        )
+    expected_event_ids = {event.event_id for event in view.delta if event.event_id not in satisfied}
+    present = {candidate.block_id for candidate in candidates}
+    raw_event_ids = {
+        event_id
+        for candidate in candidates
+        if candidate.kind is CandidateKind.RAW_EVENT
+        for event_id in candidate.source_event_ids
+    }
+    return expected.issubset(present) and expected_event_ids.issubset(raw_event_ids)
+
+
+def _bounded_raw_units(
+    units: tuple[tuple[EventEnvelope, ...], ...],
+    *,
+    max_delta_events: int,
+) -> tuple[tuple[EventEnvelope, ...], ...]:
+    if max_delta_events < 1:
+        return ()
+    selected: list[tuple[EventEnvelope, ...]] = []
+    selected_events = 0
+    for unit in reversed(units):
+        unit_events = len(unit)
+        if selected and selected_events + unit_events > max_delta_events:
+            break
+        selected.append(unit)
+        selected_events += unit_events
+    selected.reverse()
+    return tuple(selected)
 
 
 def select_candidates(
@@ -165,16 +257,25 @@ def select_candidates(
             ):
                 break
 
-    for item in view.delta[-config.max_delta_events :] if config.max_delta_events else ():
+    durable_units = durable_event_units(view.delta)
+    raw_units = (
+        _bounded_raw_units(durable_units, max_delta_events=config.max_delta_events)
+        if durable_units is not None
+        else ()
+    )
+    for unit in raw_units:
+        item = unit[0]
+        raw_text = "\n\n".join(_raw_event_text(event) for event in unit)
+        is_singleton = len(unit) == 1
         if not add(
             CandidateBlock(
                 block_id=f"event:{item.event_id}",
                 slot=RuntimeSlot.RAW_DELTA,
                 kind=CandidateKind.RAW_EVENT,
-                text=item.content,
-                source_event_ids=(item.event_id,),
+                text=raw_text,
+                source_event_ids=tuple(event.event_id for event in unit),
                 score=_score(
-                    item.content,
+                    raw_text,
                     base_weight=config.raw_delta_weight,
                     query=normalized_query,
                     config=config,
@@ -183,6 +284,8 @@ def select_candidates(
                 required=True,
                 capsule_id=None,
                 event_sequence=item.sequence,
+                event_type=item.event_type if is_singleton else None,
+                tool_name=_raw_tool_name(item) if is_singleton else None,
             )
         ):
             break
@@ -362,4 +465,7 @@ def select_candidates(
         ):
             break
 
-    return tuple(sorted(selected, key=_candidate_sort_key))
+    ordered = tuple(sorted(selected, key=_candidate_sort_key))
+    if not required_candidates_complete(view, ordered):
+        return tuple(replace(candidate, required_selection_complete=False) for candidate in ordered)
+    return ordered

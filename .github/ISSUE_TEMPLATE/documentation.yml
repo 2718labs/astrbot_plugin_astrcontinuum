@@ -1,0 +1,32 @@
+name: Documentation / 文档问题
+description: Report unclear, missing, or inconsistent documentation. / 报告不清楚、缺失或中英不一致的文档。
+title: "[Docs] "
+labels:
+  - documentation
+body:
+  - type: input
+    id: location
+    attributes:
+      label: Document and section / 文档与章节
+      placeholder: README.md > Compatibility
+    validations:
+      required: true
+
+  - type: textarea
+    id: issue
+    attributes:
+      label: What is unclear or incorrect? / 哪部分不清楚或不正确？
+    validations:
+      required: true
+
+  - type: textarea
+    id: suggestion
+    attributes:
+      label: Suggested improvement / 修改建议
+
+  - type: checkboxes
+    id: languages
+    attributes:
+      label: Language consistency / 语言一致性
+      options:
+        - label: I checked whether the linked English/Chinese counterpart has the same problem. / 我已检查中英文对应文档是否存在同一问题。

@@ -1,42 +1,119 @@
 {
   "enabled": {
-    "description": "启用 AstrContinuum",
+    "description": "启用 AstrContinuum 长对话保护",
+    "hint": "只改变发给大模型的临时上下文，不会删除或改写 AstrBot 保存的对话历史。可用 /context_status 查看是否生效。",
+    "obvious_hint": true,
     "type": "bool",
     "default": true
   },
+  "thinking_compat_openai_provider_ids": {
+    "description": "额外 OpenAI 兼容 Provider ID（高级）",
+    "hint": "仅填写已确认使用 OpenAI Chat Completions 协议的第三方 Provider ID。仅当实际模型名为 Claude 时，AstrContinuum 才会为本次出站调用构造临时兼容副本，不会改写历史；原生 Anthropic/Gemini Provider 不适用。",
+    "obvious_hint": true,
+    "type": "list",
+    "default": []
+  },
+  "context_engine_mode": {
+    "description": "上下文引擎运行方式",
+    "hint": "主动模式只会在结果通过完整校验后替换确定性回退结果；影子模式会计算并记录无内容指标，但实际仍发送确定性回退结果；关闭模式完全不运行图引擎，只使用确定性路径。管理员可用 /context_status 查看当前模式和最近结果，用 /context_inspect 查看当前会话的无内容归约证据。",
+    "obvious_hint": true,
+    "type": "string",
+    "options": [
+      "active",
+      "shadow",
+      "off"
+    ],
+    "labels": [
+      "主动（校验通过才使用）",
+      "影子（只测量，不替换）",
+      "关闭（仅确定性路径）"
+    ],
+    "default": "active"
+  },
+  "encryption_key_source": {
+    "description": "数据库加密密钥管理方式",
+    "hint": "新安装默认由服务器在 AstrBot 持久 data 卷的插件数据目录中自动生成并复用密钥，不需要在 WebUI 中配置密钥正文。这样能防止单独泄漏数据库文件后被直接解密，但整个 data 卷泄漏不受此模式保护。需要让密钥与 data 卷高隔离时，可通过外部密钥管理系统注入 ASTRCONTINUUM_MASTER_KEY 环境变量，也可填写外部密钥文件绝对路径。不要把密钥粘贴到 WebUI、聊天、日志或命令行参数。",
+    "obvious_hint": true,
+    "type": "string",
+    "options": [
+      "local",
+      "file",
+      "environment"
+    ],
+    "labels": [
+      "自动管理（推荐）",
+      "服务器密钥文件（高级）",
+      "环境变量（高级）"
+    ],
+    "default": "local"
+  },
+  "encryption_key_file": {
+    "description": "当前加密密钥文件的绝对路径（仅外部文件模式）",
+    "hint": "填写服务器内可读的当前密钥文件绝对路径，不要粘贴密钥内容。请先停止 AstrBot，再运行 python -m astrcontinuum.keyctl generate --output <外部密钥文件绝对路径>；文件必须位于插件数据目录之外。使用环境变量或自动管理模式时保持为空。",
+    "obvious_hint": true,
+    "type": "string",
+    "condition": {
+      "encryption_key_source": "file"
+    },
+    "default": ""
+  },
+  "encryption_previous_key_file": {
+    "description": "旧加密密钥文件的绝对路径（仅换钥时）",
+    "hint": "换钥时先停止 AstrBot：把新密钥设为当前密钥，并在这里填写服务器内可读、仍能解锁数据库的旧密钥文件绝对路径，然后启动或重载。确认 /context_status 显示数据保护为 ACTIVE、新密钥标识已生效且维护完成后，清空旧密钥文件路径并再次重载。环境变量模式对应 ASTRCONTINUUM_PREVIOUS_KEY。不要在 WebUI、聊天、日志或命令参数中粘贴任何密钥。",
+    "obvious_hint": true,
+    "type": "string",
+    "condition": {
+      "encryption_key_source": "file"
+    },
+    "default": ""
+  },
   "model_context_limit": {
-    "description": "模型总上下文窗口 Token",
+    "description": "主模型上下文窗口（0 为自动）",
+    "hint": "保持 0 即可通过 AstrBot 公共模型元数据自动识别；信息不可用时保守使用上限 128000 Token。通常无需修改，可用 /context_status 查看实际窗口与来源。",
+    "obvious_hint": true,
     "type": "int",
-    "default": 200000
+    "default": 0
   },
   "target_input_budget": {
-    "description": "普通请求目标输入 Token",
+    "description": "归约后希望保留的输入量",
+    "hint": "Checkpoint、近期原文和精确证据会优先装进这个预算。通常无需修改。",
     "type": "int",
     "default": 130000
   },
   "hard_input_ceiling": {
-    "description": "硬输入上限 Token",
+    "description": "归约后输入的安全上限",
+    "hint": "受控请求视图不会主动超过这个值，并会为回复和工具留出空间。通常无需修改。",
     "type": "int",
     "default": 150000
   },
-  "delta_trigger_tokens": {
-    "description": "Delta 达到多少 Token 后安排后台压缩",
-    "type": "int",
-    "default": 12000
+  "compaction_start_ratio": {
+    "description": "提前生成 Checkpoint 的时机",
+    "hint": "上下文预计占满可用窗口的 75% 时，在后台开始归约。聊天不会等待，通常无需修改。",
+    "type": "float",
+    "default": 0.75,
+    "slider": {
+      "min": 0.5,
+      "max": 0.9,
+      "step": 0.01
+    }
   },
-  "delta_trigger_turns": {
-    "description": "Delta 达到多少轮后安排后台压缩",
-    "type": "int",
-    "default": 24
+  "provider_view_switch_ratio": {
+    "description": "切换到受控请求视图的时机",
+    "hint": "上下文预计占满可用窗口的 80% 时，改用受控请求视图。通常无需修改。",
+    "type": "float",
+    "default": 0.8,
+    "slider": {
+      "min": 0.55,
+      "max": 0.95,
+      "step": 0.01
+    }
   },
-  "strict_audit": {
-    "description": "候选快照必须通过严格损失审计",
-    "type": "bool",
-    "default": true
-  },
-  "enable_sylanne_adapter": {
-    "description": "检测并只读接入 Sylanne 长期记忆",
-    "type": "bool",
-    "default": true
+  "compaction_provider_id": {
+    "description": "后台归约模型（留空则跟随当前对话模型）",
+    "hint": "留空会自动跟随当前对话模型。想节省成本时，再选择 MiniMax 等小模型；选择其他模型会发送归约内容，请先确认其数据与隐私策略。",
+    "obvious_hint": true,
+    "type": "string",
+    "default": "",
+    "_special": "select_provider"
   }
 }

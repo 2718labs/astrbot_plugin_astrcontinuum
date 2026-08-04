@@ -1,45 +1,85 @@
-# AstrContinuum / 星续
+# AstrContinuum
 
-**Non-blocking Infinite Context Runtime for AstrBot**
+English | [简体中文](./README.zh-CN.md)
 
-> 上下文会被压缩，对话不会断裂。
+[![Version](https://img.shields.io/badge/version-v0.3.0-A44742)](./CHANGELOG.md)
+[![AstrBot](https://img.shields.io/badge/AstrBot-%3E%3D4.24.2%2C%3C5.0.0-1F6B5B)](https://github.com/AstrBotDevs/AstrBot)
+[![License](https://img.shields.io/badge/license-AGPL--3.0--or--later-263238)](./LICENSE)
+[![CI](https://github.com/2718labs/astrbot_plugin_astrcontinuum/actions/workflows/ci.yml/badge.svg)](https://github.com/2718labs/astrbot_plugin_astrcontinuum/actions/workflows/ci.yml)
 
-AstrContinuum 面向持续聊天与长期 Agent 任务。它将无限增长的历史编译为稳定状态、多分辨率胶囊、精确锚点、未压缩增量和可回溯证据，再按当前请求动态装配进有限窗口。
+**A durable, non-blocking long-context runtime for AstrBot.** AstrContinuum keeps authoritative conversation events in a SQLite journal, reads a committed Snapshot plus a contiguous Delta, and projects only its own temporary context into the provider request before restoring AstrBot's native objects by identity.
 
-## v0.3.0 技术预览定位
+> **v0.3.0 Technical Preview.** This release adds an immutable reorganization ledger to the durable publication boundary. The normal `CompactionWorker` does not call a reorganization engine and therefore publishes an empty ledger in ordinary operation. CRM/reorganization integration, user-facing rollback, and broad performance certification remain future work.
 
-v0.3.0 是“持久化发布安全与不可变重组账本”的 Technical Preview：它提供受 fencing 保护的 SQLite 发布、不可变 Capsule/Snapshot，以及供显式发布调用写入的重组审计账本；传入的非摘要 `released` 记录始终受永久质量闸门约束。
+## What is available now
 
-标准 `CompactionWorker` 当前未产生或传入重组记录，因此正常后台压缩可以发布空账本；把重组器接入该 worker 是后续工作，不是本预览的已交付能力。它不是公开 v1.0，也不声明完整 AstrBot 兼容矩阵、百万 Token 性能验收或全部 Provider 行为。数据迁移版本和 Capsule `schema_version` 是独立契约，不能由包版本推导；升级已有数据库时必须运行迁移计划。
+| Area | Current boundary |
+| --- | --- |
+| Durable authority | Append-only Journal, immutable Capsules/Snapshots, SQLite transactions, fencing, and compare-and-swap publication. |
+| Request path | Snapshot-plus-Delta reads, deterministic bounded assembly, and temporary provider-only projection with exact restoration. |
+| Compaction | Durable intent and background worker lifecycle; exact-source candidate validation before publication. |
+| Token and storage baseline | Offline token profiles, context-window fallback, encrypted durable values, and bounded metric backfill. |
+| v0.3 ledger | An immutable, storage-only audit ledger written only when an explicit publisher supplies records. |
 
-## 核心能力
+The durable core and the AstrBot composition root are deliberately separate. “Implemented in the core” is not automatically a promise that a capability is exposed as an AstrBot command or background runtime behavior.
 
-- Shadow Compaction：后台影子压缩，主聊天从不等待
-- Stable Snapshot + Delta：稳定快照与未压缩增量叠加
-- Multi-Resolution Context Tree：原文、微胶囊、情节、任务、全局状态
-- Exact Anchors：名称、数字、路径、代码、强约束等不可丢失
-- Query-Aware Reconstruction：按当前问题恢复必要历史
-- Loss Auditor：候选快照通过审计后才提交
-- Time Travel：快照查看、差异与回滚
-- Standalone + Sylanne Adapter：独立运行，可选利用 Sylanne 长期记忆
+## Experimental evidence, kept separate
 
-## 开发入口
+The chart below is an **isolated, deterministic CRM experiment**, not a production benchmark, semantic-quality result, or evidence that reorganization is wired into v0.3. It is included so that the released documentation has a traceable visual reference without hiding its boundary.
 
-依次阅读：
+<img src="./docs/assets/evidence-r2-outcomes-rmb.svg" width="720" alt="Outcome rates for an isolated deterministic experiment; this is not a v0.3 production claim.">
 
-1. `START_HERE.md`
-2. `CODEX_MASTER_PROMPT.md`
-3. `docs/ARCHITECTURE.md`
-4. `docs/DATA_FLOW.md`
-5. `docs/CONCURRENCY_STATE_MACHINE.md`
-6. `docs/DATABASE_SCHEMA.md`
-7. `docs/ADR-008-REORGANIZATION-LEDGER.md`
-8. `docs/EVALUATION.md`
-9. `docs/EVIDENCE.md`
-10. `docs/WORKFLOW.md`
+Source provenance, hashes, revisions, exclusions, and the companion workflow are recorded in [Evidence](./docs/EVIDENCE.md) / [证据说明](./docs/EVIDENCE.zh-CN.md) and [Workflow](./docs/WORKFLOW.md) / [工作流](./docs/WORKFLOW.zh-CN.md).
 
-## 边界
+## Installation
 
-Sylanne 管理“长期什么仍然有意义”。
+Clone this repository into AstrBot's plugin directory, then restart AstrBot or reload the plugin from WebUI.
 
-AstrContinuum 管理“这一轮模型具体看到什么”。
+```bash
+cd AstrBot/data/plugins
+git clone https://github.com/2718labs/astrbot_plugin_astrcontinuum
+```
+
+The declared compatibility range is **AstrBot `>=4.24.2,<5.0.0`**. A local AstrBot load remains a release gate because static tests cannot prove dynamic hook registration or provider-message behavior.
+
+## Operations at a glance
+
+- `/context_status` provides content-free administrator health and aggregate status.
+- `/context_inspect` provides content-free evidence for the current session.
+- No public command exposes compaction, reorganization, rollback, key management, or destructive database administration.
+- Conversation-derived durable values are encrypted; keep external key material outside the plugin data directory and out of source control.
+
+For configuration, privacy, recovery, and failure behavior, follow the [configuration reference](./docs/CONFIGURATION.md), [AstrBot integration](./docs/ASTRBOT_INTEGRATION.md), and [the database schema](./docs/DATABASE_SCHEMA.md), not this overview.
+
+## Documentation
+
+| Topic | English | 简体中文 |
+| --- | --- | --- |
+| Architecture and runtime boundaries | [Architecture](./docs/ARCHITECTURE.md) | [架构](./docs/ARCHITECTURE.zh-CN.md) |
+| Configuration and key-management boundaries | [Configuration](./docs/CONFIGURATION.md) | [配置参考](./docs/CONFIGURATION.zh-CN.md) |
+| AstrBot hook ownership and operations | [AstrBot integration](./docs/ASTRBOT_INTEGRATION.md) | [AstrBot 集成](./docs/ASTRBOT_INTEGRATION.zh-CN.md) |
+| Compaction and v0.3 publication boundary | [Compaction protocol](./docs/COMPACTION_PROTOCOL.md) | [压缩协议](./docs/COMPACTION_PROTOCOL.zh-CN.md) |
+| Data movement | [Data flow](./docs/DATA_FLOW.md) | [数据流](./docs/DATA_FLOW.zh-CN.md) |
+| Evidence boundary | [Evidence](./docs/EVIDENCE.md) | [证据说明](./docs/EVIDENCE.zh-CN.md) |
+| Release workflow | [Workflow](./docs/WORKFLOW.md) | [工作流](./docs/WORKFLOW.zh-CN.md) |
+| Delivery limits and next gates | [Roadmap](./docs/ROADMAP.md) | [路线图](./docs/ROADMAP.zh-CN.md) |
+| Durable tables and transactions | [Database schema](./docs/DATABASE_SCHEMA.md) | [数据库模式](./docs/DATABASE_SCHEMA.zh-CN.md) |
+| Verification scope | [Test matrix](./docs/TEST_MATRIX.md) | [测试矩阵](./docs/TEST_MATRIX.zh-CN.md) |
+
+## Development and verification
+
+```bash
+uv sync --extra dev
+uv run ruff check .
+uv run ruff format --check .
+uv run mypy astrcontinuum main.py
+uv run pytest -q
+```
+
+Do not add local Atlas indexes, caches, task packages, or machine-specific artifacts to a release commit. Use [CONTRIBUTING.md](./CONTRIBUTING.md) for contribution and verification expectations, and [SECURITY.md](./SECURITY.md) for security reports.
+
+## License
+
+Copyright © 2026 Ayleovelle.
+
+Licensed under the [GNU Affero General Public License v3.0 or later](./LICENSE).

@@ -1,4 +1,5 @@
 import pytest
+
 from astrcontinuum.in_memory import InMemoryEventStore
 from astrcontinuum.models import ContextEvent
 

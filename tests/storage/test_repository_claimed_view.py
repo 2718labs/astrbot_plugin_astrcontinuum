@@ -7,6 +7,8 @@ from pathlib import Path
 import pytest
 
 import astrcontinuum as ac
+from astrcontinuum.storage import CanonicalMetricObservation
+from tests.storage.security_testkit import secure_repository, storage_test_codec
 
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
 LEASE_END = NOW + timedelta(minutes=5)
@@ -26,8 +28,7 @@ def session_key() -> ac.SessionKey:
 
 def repository(data_dir: Path) -> ac.SQLiteRepository:
     factory = ac.SQLiteConnectionFactory(data_dir, busy_timeout_ms=5_000)
-    ac.SQLiteMigrator(factory).migrate()
-    return ac.SQLiteRepository(factory)
+    return secure_repository(factory)
 
 
 def capture(store: ac.SQLiteRepository, sequence: int, key: ac.SessionKey) -> ac.EventEnvelope:
@@ -37,6 +38,10 @@ def capture(store: ac.SQLiteRepository, sequence: int, key: ac.SessionKey) -> ac
         content=f"message {sequence}",
         idempotency_key=f"request-{sequence}",
         token_count=2,
+        canonical=CanonicalMetricObservation(
+            tokenizer_profile_id="canonical-o200k-v1",
+            token_count=2,
+        ),
         created_at=NOW,
     )
 
@@ -54,7 +59,13 @@ def claim(store: ac.SQLiteRepository, key: ac.SessionKey) -> ac.CompactionJobEnv
         lease_expires_at=LEASE_END,
     )
     assert job is not None
-    return job
+    return store.transition_job(
+        job_id=job.job_id,
+        owner="worker-1",
+        lease_epoch=job.lease_epoch,
+        to_state=ac.CompactionJobState.COMPILING,
+        now=NOW + timedelta(seconds=1),
+    )
 
 
 def seed_committed_snapshot(
@@ -66,6 +77,7 @@ def seed_committed_snapshot(
     base_snapshot_id: str | None,
     pointer_version: int,
 ) -> ac.SnapshotEnvelope:
+    codec = storage_test_codec()
     capsule = ac.ContextCapsuleEnvelope(
         capsule_id=f"capsule-{number}",
         schema_version="1.0.0",
@@ -137,7 +149,7 @@ def seed_committed_snapshot(
             """
             INSERT INTO capsules (
                 capsule_id, session_key_hash, level, covered_event_start,
-                covered_event_end, canonical_capsule_json, token_cost,
+                covered_event_end, canonical_capsule_json, token_cost_envelope,
                 source_coverage, created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
             """,
@@ -147,8 +159,18 @@ def seed_committed_snapshot(
                 capsule.level.value,
                 capsule.covered_event_start,
                 capsule.covered_event_end,
-                json.dumps(capsule.model_dump(mode="json"), separators=(",", ":")),
-                capsule.token_cost,
+                codec.encrypt_object_json(
+                    "capsules",
+                    "canonical_capsule_json",
+                    capsule.capsule_id,
+                    json.dumps(capsule.model_dump(mode="json"), separators=(",", ":")),
+                ),
+                codec.encrypt_non_negative_int(
+                    "capsules",
+                    "token_cost",
+                    capsule.capsule_id,
+                    capsule.token_cost,
+                ),
                 capsule.quality.source_coverage,
                 timestamp,
             ),
@@ -158,7 +180,7 @@ def seed_committed_snapshot(
             INSERT INTO snapshots (
                 snapshot_id, session_key_hash, base_snapshot_id, covered_event_end,
                 source_high_water_mark, exact_anchor_ids_json, rendered_context,
-                token_cost, audit_outcome, lifecycle_state, created_at, committed_at
+                token_cost_envelope, audit_outcome, lifecycle_state, created_at, committed_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 'COMMITTED', ?, ?)
             """,
             (
@@ -167,10 +189,32 @@ def seed_committed_snapshot(
                 snapshot.base_snapshot_id,
                 snapshot.covered_event_end,
                 snapshot.source_high_water_mark,
-                json.dumps(list(snapshot.exact_anchor_ids), separators=(",", ":")),
-                snapshot.rendered_context,
-                snapshot.token_cost,
-                json.dumps(snapshot.audit_outcome.model_dump(mode="json"), separators=(",", ":")),
+                codec.encrypt_array_json(
+                    "snapshots",
+                    "exact_anchor_ids_json",
+                    snapshot.snapshot_id,
+                    json.dumps(list(snapshot.exact_anchor_ids), separators=(",", ":")),
+                ),
+                codec.encrypt_text(
+                    "snapshots",
+                    "rendered_context",
+                    snapshot.snapshot_id,
+                    snapshot.rendered_context,
+                ),
+                codec.encrypt_non_negative_int(
+                    "snapshots",
+                    "token_cost",
+                    snapshot.snapshot_id,
+                    snapshot.token_cost,
+                ),
+                codec.encrypt_object_json(
+                    "snapshots",
+                    "audit_outcome",
+                    snapshot.snapshot_id,
+                    json.dumps(
+                        snapshot.audit_outcome.model_dump(mode="json"), separators=(",", ":")
+                    ),
+                ),
                 timestamp,
                 timestamp,
             ),

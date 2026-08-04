@@ -5,9 +5,7 @@ from pathlib import Path
 
 
 def test_metadata_declares_the_conservative_verified_astrbot_floor() -> None:
-    metadata = (Path(__file__).resolve().parents[1] / "metadata.yaml").read_text(
-        encoding="utf-8"
-    )
+    metadata = (Path(__file__).resolve().parents[1] / "metadata.yaml").read_text(encoding="utf-8")
     match = re.search(r'^astrbot_version:\s*"(?P<value>[^"]+)"\s*$', metadata, re.MULTILINE)
 
     assert match is not None
@@ -15,9 +13,7 @@ def test_metadata_declares_the_conservative_verified_astrbot_floor() -> None:
 
 
 def test_metadata_points_to_the_maintained_repository() -> None:
-    metadata = (Path(__file__).resolve().parents[1] / "metadata.yaml").read_text(
-        encoding="utf-8"
-    )
+    metadata = (Path(__file__).resolve().parents[1] / "metadata.yaml").read_text(encoding="utf-8")
     match = re.search(r'^repo:\s*"(?P<value>[^"]+)"\s*$', metadata, re.MULTILINE)
 
     assert match is not None

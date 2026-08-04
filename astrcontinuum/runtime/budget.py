@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass
 from typing import NoReturn
 
@@ -52,7 +52,11 @@ def _non_negative_cost(value: object, code: BudgetErrorCode) -> int:
 def _count_text(counter: TokenCounter, text: str) -> int:
     try:
         value = counter.count_text(text)
-    except Exception:  # noqa: BLE001 - counter errors must cross a content-free boundary
+    except Exception as error:
+        from ..tokenization.types import TokenizerError
+
+        if isinstance(error, TokenizerError):
+            raise
         raise BudgetInvariantError(BudgetErrorCode.TOKEN_COUNTER_FAILURE) from None
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         _invalid(BudgetErrorCode.TOKEN_COUNTER_INVALID)
@@ -95,24 +99,17 @@ def _projection_text(candidates: Iterable[CandidateBlock]) -> str:
     return _SEPARATOR.join(candidate.text for candidate in candidates)
 
 
-def _projection_cost(
-    candidates: Iterable[CandidateBlock],
-    counter: TokenCounter,
-) -> int:
-    return _count_text(counter, _projection_text(candidates))
-
-
 def _rejection(
     candidate: CandidateBlock,
     *,
-    counter: TokenCounter,
+    block_token_counts: Mapping[str, int],
     reason: str,
 ) -> BlockRejection:
     return BlockRejection(
         block_id=candidate.block_id,
         slot=candidate.slot,
         source_event_ids=candidate.source_event_ids,
-        token_cost=_count_text(counter, candidate.text),
+        token_cost=block_token_counts[candidate.block_id],
         score=candidate.score,
         reason=reason,
     )
@@ -120,71 +117,158 @@ def _rejection(
 
 def _deduplicate(
     candidates: Iterable[CandidateBlock],
-    counter: TokenCounter,
-) -> tuple[tuple[CandidateBlock, ...], tuple[BlockRejection, ...]]:
+) -> tuple[tuple[CandidateBlock, ...], tuple[CandidateBlock, ...]]:
     unique: list[CandidateBlock] = []
-    duplicates: list[BlockRejection] = []
+    duplicates: list[CandidateBlock] = []
     seen: set[str] = set()
     for candidate in _ordered(candidates):
         if candidate.block_id in seen:
-            duplicates.append(
-                _rejection(
-                    candidate,
-                    counter=counter,
-                    reason="DUPLICATE_BLOCK_ID",
-                )
-            )
+            duplicates.append(candidate)
             continue
         seen.add(candidate.block_id)
         unique.append(candidate)
     return tuple(unique), tuple(duplicates)
 
 
-def _normal_selection(
+def canonical_candidates(
+    candidates: Iterable[CandidateBlock],
+) -> tuple[CandidateBlock, ...]:
+    """Return the deterministic candidate universe used by assembly."""
+
+    unique, _duplicates = _deduplicate(candidates)
+    return unique
+
+
+def count_candidate_blocks(
+    candidates: tuple[CandidateBlock, ...],
+    counter: TokenCounter,
+) -> dict[str, int]:
+    """Count each unique candidate text exactly once into a content-free map."""
+
+    counts: dict[str, int] = {}
+    for candidate in candidates:
+        if candidate.block_id in counts:
+            _invalid(BudgetErrorCode.INTERNAL_BUDGET_INVARIANT)
+        counts[candidate.block_id] = _count_text(counter, candidate.text)
+    return counts
+
+
+def _validated_block_token_counts(
     candidates: tuple[CandidateBlock, ...],
     *,
     counter: TokenCounter,
+    provided: Mapping[str, int] | None,
+) -> dict[str, int]:
+    if provided is None:
+        return count_candidate_blocks(candidates, counter)
+    if not isinstance(provided, Mapping):
+        _invalid(BudgetErrorCode.TOKEN_COUNTER_INVALID)
+    counts: dict[str, int] = {}
+    for candidate in candidates:
+        if candidate.block_id not in provided:
+            _invalid(BudgetErrorCode.TOKEN_COUNTER_INVALID)
+        counts[candidate.block_id] = _non_negative_cost(
+            provided[candidate.block_id],
+            BudgetErrorCode.TOKEN_COUNTER_INVALID,
+        )
+    return counts
+
+
+def _estimated_projection_cost(
+    candidates: tuple[CandidateBlock, ...],
+    *,
+    block_token_counts: Mapping[str, int],
+    separator_cost: int,
+) -> int:
+    if not candidates:
+        return 0
+    return sum(block_token_counts[item.block_id] for item in candidates) + (
+        separator_cost * (len(candidates) - 1)
+    )
+
+
+def _dependency_groups(
+    candidates: tuple[CandidateBlock, ...],
+) -> tuple[tuple[CandidateBlock, ...], ...]:
+    # This lazy import avoids a package-initialization cycle: context_graph.live
+    # imports this module while the runtime package is being initialized.
+    from ..context_graph.closure import dependency_groups
+
+    return dependency_groups(candidates)
+
+
+def _removable_dependency_groups(
+    candidates: tuple[CandidateBlock, ...],
+) -> tuple[tuple[CandidateBlock, ...], ...]:
+    from ..context_graph.closure import removable_dependency_groups
+
+    return removable_dependency_groups(candidates)
+
+
+def _normal_selection(
+    candidates: tuple[CandidateBlock, ...],
+    *,
+    block_token_counts: Mapping[str, int],
+    separator_cost: int,
     b_ac: int,
 ) -> tuple[
     tuple[CandidateBlock, ...],
     tuple[BlockRejection, ...],
     bool,
 ]:
-    selected: list[CandidateBlock] = []
+    dependency_groups = _dependency_groups(candidates)
+    group_by_id = {candidate.block_id: group for group in dependency_groups for candidate in group}
+    selected_ids: set[str] = set()
+    selected_cost = 0
+    selected_count = 0
     rejected: list[BlockRejection] = []
+    handled_ids: set[str] = set()
     required_missing = False
     for candidate in candidates:
-        proposed = (*selected, candidate)
-        if _projection_cost(proposed, counter) <= b_ac:
-            selected.append(candidate)
+        if candidate.block_id in handled_ids:
             continue
-        rejected.append(
+        group = group_by_id.get(candidate.block_id, (candidate,))
+        handled_ids.update(item.block_id for item in group)
+        additional_cost = sum(block_token_counts[item.block_id] for item in group)
+        additional_cost += separator_cost * (len(group) - 1)
+        if selected_count:
+            additional_cost += separator_cost
+        if selected_cost + additional_cost <= b_ac:
+            selected_ids.update(item.block_id for item in group)
+            selected_cost += additional_cost
+            selected_count += len(group)
+            continue
+        rejected.extend(
             _rejection(
-                candidate,
-                counter=counter,
+                item,
+                block_token_counts=block_token_counts,
                 reason="INSUFFICIENT_AC_BUDGET",
             )
+            for item in group
         )
-        required_missing = required_missing or candidate.required
-    return tuple(selected), tuple(rejected), required_missing
+        required_missing = required_missing or any(item.required for item in group)
+    return (
+        tuple(item for item in candidates if item.block_id in selected_ids),
+        tuple(rejected),
+        required_missing,
+    )
 
 
 def _contiguous_raw_tail(
     candidates: tuple[CandidateBlock, ...],
 ) -> tuple[CandidateBlock, ...]:
-    ordered = tuple(
-        sorted(
-            (candidate for candidate in candidates if candidate.event_sequence is not None),
-            key=lambda candidate: (candidate.event_sequence or 0, candidate.block_id),
-        )
-    )
+    ordered = tuple(candidate for candidate in candidates if candidate.event_sequence is not None)
     if not ordered:
         return ()
     start = len(ordered) - 1
     while start > 0:
         previous = ordered[start - 1].event_sequence
         current = ordered[start].event_sequence
-        if previous is None or current is None or previous + 1 != current:
+        if (
+            previous is None
+            or current is None
+            or previous + len(ordered[start - 1].source_event_ids) != current
+        ):
             break
         start -= 1
     return ordered[start:]
@@ -194,71 +278,208 @@ def _longest_raw_suffix(
     critical: tuple[CandidateBlock, ...],
     raw_tail: tuple[CandidateBlock, ...],
     *,
-    counter: TokenCounter,
+    block_token_counts: Mapping[str, int],
+    separator_cost: int,
     b_ac: int,
 ) -> tuple[CandidateBlock, ...]:
-    for start in range(len(raw_tail) + 1):
-        suffix = raw_tail[start:]
-        proposed = _ordered((*critical, *suffix))
-        if _projection_cost(proposed, counter) <= b_ac:
-            return suffix
+    # Retrieval has already made every full durable continuation one raw block.
+    # Do not reconstruct callback-order pairs here: that would reintroduce a
+    # split point for parallel, duplicate, or multi-wave tool rounds.
+    units = [(candidate,) for candidate in raw_tail]
+
+    suffix_costs = [0] * (len(units) + 1)
+    suffix_counts = [0] * (len(units) + 1)
+    for unit_index in range(len(units) - 1, -1, -1):
+        suffix_costs[unit_index] = suffix_costs[unit_index + 1] + sum(
+            block_token_counts[item.block_id] for item in units[unit_index]
+        )
+        suffix_counts[unit_index] = suffix_counts[unit_index + 1] + len(units[unit_index])
+    critical_cost = sum(block_token_counts[item.block_id] for item in critical)
+    critical_count = len(critical)
+    for start in range(len(units) + 1):
+        total_count = critical_count + suffix_counts[start]
+        estimated = critical_cost + suffix_costs[start]
+        if total_count:
+            estimated += separator_cost * (total_count - 1)
+        if estimated <= b_ac:
+            return tuple(block for unit in units[start:] for block in unit)
     return ()
 
 
 def _emergency_selection(
     candidates: tuple[CandidateBlock, ...],
     *,
-    counter: TokenCounter,
+    block_token_counts: Mapping[str, int],
+    separator_cost: int,
     b_ac: int,
 ) -> tuple[tuple[CandidateBlock, ...], tuple[BlockRejection, ...]]:
-    selected: list[CandidateBlock] = []
+    dependency_groups = _dependency_groups(candidates)
+    group_by_id = {candidate.block_id: group for group in dependency_groups for candidate in group}
+    selected_ids: set[str] = set()
+    selected_cost = 0
+    selected_count = 0
     rejected: list[BlockRejection] = []
+    handled_ids: set[str] = set()
     raw_slots = (RuntimeSlot.RAW_DELTA, RuntimeSlot.RECENT_RAW)
     for slot in RUNTIME_SLOT_PRIORITY:
-        slot_candidates = tuple(candidate for candidate in candidates if candidate.slot == slot)
+        slot_candidates = tuple(
+            candidate
+            for candidate in candidates
+            if candidate.slot == slot and candidate.block_id not in handled_ids
+        )
         if slot in raw_slots:
+            atomic_groups: list[tuple[CandidateBlock, ...]] = []
+            atomic_group_ids: set[str] = set()
+            for candidate in slot_candidates:
+                group = group_by_id.get(candidate.block_id, (candidate,))
+                if len(group) == 1 or candidate.block_id in atomic_group_ids:
+                    continue
+                atomic_groups.append(group)
+                atomic_group_ids.update(item.block_id for item in group)
+            for group in atomic_groups:
+                handled_ids.update(item.block_id for item in group)
+                if not any(item.required for item in group):
+                    rejected.extend(
+                        _rejection(
+                            item,
+                            block_token_counts=block_token_counts,
+                            reason="EMERGENCY_OPTIONAL_OMITTED",
+                        )
+                        for item in group
+                    )
+                    continue
+                additional_cost = sum(block_token_counts[item.block_id] for item in group)
+                additional_cost += separator_cost * (len(group) - 1)
+                if selected_count:
+                    additional_cost += separator_cost
+                if selected_cost + additional_cost <= b_ac:
+                    selected_ids.update(item.block_id for item in group)
+                    selected_cost += additional_cost
+                    selected_count += len(group)
+                    continue
+                rejected.extend(
+                    _rejection(
+                        item,
+                        block_token_counts=block_token_counts,
+                        reason="EMERGENCY_REQUIRED_NOT_FIT",
+                    )
+                    for item in group
+                )
+            slot_candidates = tuple(
+                candidate for candidate in slot_candidates if candidate.block_id not in handled_ids
+            )
             raw_tail = _contiguous_raw_tail(slot_candidates)
             selected_raw = _longest_raw_suffix(
-                tuple(selected),
+                tuple(item for item in candidates if item.block_id in selected_ids),
                 raw_tail,
-                counter=counter,
+                block_token_counts=block_token_counts,
+                separator_cost=separator_cost,
                 b_ac=b_ac,
             )
             selected_raw_ids = {candidate.block_id for candidate in selected_raw}
-            selected.extend(selected_raw)
+            for candidate in selected_raw:
+                if selected_count:
+                    selected_cost += separator_cost
+                selected_cost += block_token_counts[candidate.block_id]
+                selected_count += 1
+                selected_ids.add(candidate.block_id)
+            handled_ids.update(candidate.block_id for candidate in slot_candidates)
             for candidate in slot_candidates:
                 if candidate.block_id not in selected_raw_ids:
                     rejected.append(
                         _rejection(
                             candidate,
-                            counter=counter,
+                            block_token_counts=block_token_counts,
                             reason="EMERGENCY_RAW_PREFIX_OMITTED",
                         )
                     )
             continue
 
         for candidate in slot_candidates:
-            if not candidate.required:
-                rejected.append(
+            if candidate.block_id in handled_ids:
+                continue
+            group = group_by_id.get(candidate.block_id, (candidate,))
+            handled_ids.update(item.block_id for item in group)
+            if not any(item.required for item in group):
+                rejected.extend(
                     _rejection(
-                        candidate,
-                        counter=counter,
+                        item,
+                        block_token_counts=block_token_counts,
                         reason="EMERGENCY_OPTIONAL_OMITTED",
                     )
+                    for item in group
                 )
                 continue
-            proposed = _ordered((*selected, candidate))
-            if _projection_cost(proposed, counter) <= b_ac:
-                selected.append(candidate)
+            additional_cost = sum(block_token_counts[item.block_id] for item in group)
+            additional_cost += separator_cost * (len(group) - 1)
+            if selected_count:
+                additional_cost += separator_cost
+            if selected_cost + additional_cost <= b_ac:
+                selected_ids.update(item.block_id for item in group)
+                selected_cost += additional_cost
+                selected_count += len(group)
                 continue
-            rejected.append(
+            rejected.extend(
                 _rejection(
-                    candidate,
-                    counter=counter,
+                    item,
+                    block_token_counts=block_token_counts,
                     reason="EMERGENCY_REQUIRED_NOT_FIT",
                 )
+                for item in group
             )
-    return _ordered(selected), tuple(rejected)
+    return (
+        tuple(item for item in candidates if item.block_id in selected_ids),
+        tuple(rejected),
+    )
+
+
+def _lowest_priority_optional_group(
+    selected: tuple[CandidateBlock, ...],
+) -> tuple[CandidateBlock, ...] | None:
+    groups = _removable_dependency_groups(selected)
+    if not groups:
+        return None
+    positions = {candidate.block_id: index for index, candidate in enumerate(selected)}
+    return max(
+        groups,
+        key=lambda group: (
+            min(positions[item.block_id] for item in group),
+            tuple(item.block_id for item in group),
+        ),
+    )
+
+
+def _exact_final_selection(
+    selected: tuple[CandidateBlock, ...],
+    *,
+    counter: TokenCounter,
+    block_token_counts: Mapping[str, int],
+    b_ac: int,
+) -> tuple[
+    tuple[CandidateBlock, ...],
+    str,
+    int,
+    tuple[BlockRejection, ...],
+]:
+    removed: list[BlockRejection] = []
+    while True:
+        projected_text = _projection_text(selected)
+        exact_cost = _count_text(counter, projected_text)
+        if exact_cost <= b_ac:
+            return selected, projected_text, exact_cost, tuple(removed)
+        group = _lowest_priority_optional_group(selected)
+        if group is None:
+            _invalid(BudgetErrorCode.REQUIRED_INPUT_EXCEEDS_BUDGET)
+        removed_ids = {item.block_id for item in group}
+        removed.extend(
+            _rejection(
+                item,
+                block_token_counts=block_token_counts,
+                reason="EXACT_BUDGET_COMPONENT_REMOVED",
+            )
+            for item in group
+        )
+        selected = tuple(item for item in selected if item.block_id not in removed_ids)
 
 
 def _rejection_sort_key(rejection: BlockRejection) -> tuple[object, ...]:
@@ -276,7 +497,8 @@ def _trace(
     rejections: tuple[BlockRejection, ...],
     *,
     mode: AssemblyMode,
-    counter: TokenCounter,
+    block_token_counts: Mapping[str, int],
+    exact_projection_cost: int,
     b_input: int,
     current_input_cost: int,
     fixed_required_cost: int,
@@ -290,7 +512,7 @@ def _trace(
             block_id=candidate.block_id,
             slot=candidate.slot,
             source_event_ids=candidate.source_event_ids,
-            token_cost=_count_text(counter, candidate.text),
+            token_cost=block_token_counts[candidate.block_id],
             score=candidate.score,
             reason=("SELECTED_NORMAL" if mode == AssemblyMode.NORMAL else "SELECTED_EMERGENCY"),
         )
@@ -301,7 +523,7 @@ def _trace(
         cost = sum(item.token_cost for item in selections if item.slot == slot)
         if cost:
             slot_costs.append((slot, cost))
-    ac_selected_cost = _projection_cost(selected, counter)
+    ac_selected_cost = exact_projection_cost
     projection_overhead_cost = ac_selected_cost - sum(item.token_cost for item in selections)
     total_input_cost = opaque_token_cost + b_required + ac_selected_cost
     if total_input_cost > b_input:
@@ -337,6 +559,7 @@ def assemble(
     fixed_required_cost: int,
     counter: TokenCounter,
     config: BudgetConfig,
+    block_token_counts: Mapping[str, int] | None = None,
 ) -> AssemblyResult:
     """Assemble one deterministic AC-owned projection within the exact input budget."""
 
@@ -361,17 +584,36 @@ def assemble(
     if opaque_cost + b_required > b_input:
         _invalid(BudgetErrorCode.REQUIRED_INPUT_EXCEEDS_BUDGET)
 
-    unique, duplicate_rejections = _deduplicate(candidates, counter)
-    normal_selected, normal_rejections, required_missing = _normal_selection(
+    unique, duplicate_candidates = _deduplicate(candidates)
+    counts = _validated_block_token_counts(
         unique,
         counter=counter,
+        provided=block_token_counts,
+    )
+    separator_cost = _count_text(counter, _SEPARATOR)
+    duplicate_rejections = tuple(
+        BlockRejection(
+            block_id=candidate.block_id,
+            slot=candidate.slot,
+            source_event_ids=candidate.source_event_ids,
+            token_cost=_count_text(counter, candidate.text),
+            score=candidate.score,
+            reason="DUPLICATE_BLOCK_ID",
+        )
+        for candidate in duplicate_candidates
+    )
+    normal_selected, normal_rejections, required_missing = _normal_selection(
+        unique,
+        block_token_counts=counts,
+        separator_cost=separator_cost,
         b_ac=b_ac,
     )
     if required_missing:
         mode = AssemblyMode.EMERGENCY_ASSEMBLY
         selected, emergency_rejections = _emergency_selection(
             unique,
-            counter=counter,
+            block_token_counts=counts,
+            separator_cost=separator_cost,
             b_ac=b_ac,
         )
         rejections = (*duplicate_rejections, *emergency_rejections)
@@ -380,13 +622,25 @@ def assemble(
         selected = normal_selected
         rejections = (*duplicate_rejections, *normal_rejections)
 
-    selected = _ordered(selected)
+    required_ids = {item.block_id for item in unique if item.required}
+    selected_ids = {item.block_id for item in selected}
+    if not required_ids.issubset(selected_ids):
+        _invalid(BudgetErrorCode.REQUIRED_INPUT_EXCEEDS_BUDGET)
+
+    selected, projected_text, exact_projection_cost, exact_rejections = _exact_final_selection(
+        selected,
+        counter=counter,
+        block_token_counts=counts,
+        b_ac=b_ac,
+    )
+    rejections = (*rejections, *exact_rejections)
     trace = _trace(
         view,
         selected,
         tuple(rejections),
         mode=mode,
-        counter=counter,
+        block_token_counts=counts,
+        exact_projection_cost=exact_projection_cost,
         b_input=b_input,
         current_input_cost=current_input_cost,
         fixed_required_cost=fixed_cost,
@@ -396,7 +650,7 @@ def assemble(
         b_ac=b_ac,
     )
     return AssemblyResult(
-        projected_text=_projection_text(selected),
+        projected_text=projected_text,
         selected_blocks=selected,
         trace=trace,
     )

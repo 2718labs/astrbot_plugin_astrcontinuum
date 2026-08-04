@@ -1,6 +1,8 @@
 import asyncio
 import time
+
 import pytest
+
 from astrcontinuum.scheduler import CoalescingCompactionScheduler
 
 

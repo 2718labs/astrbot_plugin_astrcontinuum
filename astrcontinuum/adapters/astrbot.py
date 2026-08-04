@@ -4,15 +4,20 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
-import importlib
 import json
 import math
+from collections import OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
-from typing import NoReturn
+from typing import NoReturn, cast
 
+from ..context_graph import (
+    ContextEngineMode,
+    LiveContextTrace,
+    assemble_live_context,
+)
 from ..domain import (
     CompactionJobEnvelope,
     EventEnvelope,
@@ -26,20 +31,36 @@ from ..runtime import (
     CandidateBlock,
     RetrievalConfig,
     TokenCounter,
+    ToolLoopAssessment,
+    ToolLoopState,
     Utf8ByteTokenCounter,
-    assemble,
+    evaluate_tool_loop,
     read_request_view,
     select_candidates,
 )
-from ..storage import RequestView, SQLiteRepository
+from ..storage import CanonicalMetricObservation, RequestView, SQLiteRepository
+from ..tokenization import (
+    BYTE_FALLBACK,
+    CANONICAL_O200K,
+    HostBudgetView,
+    PreparedBudgetInput,
+    RequestBudgetOutcome,
+    RequestBudgetProfile,
+    RequestBudgetWorkload,
+    TokenizerError,
+    TokenizerErrorCode,
+    TokenizerProfile,
+    TokenizerRegistry,
+    run_request_budget,
+)
 
-_MESSAGE_MODULE = "astrbot.core.agent.message"
 _NO_RESULT = object()
 _MISSING = object()
 _MAX_VALUE_DEPTH = 4
 _MAX_COLLECTION_ITEMS = 16
 _MAX_STRING_CHARACTERS = 512
 _MIN_METADATA_BYTES = 128
+_MAX_CONTEXT_TRACE_SESSIONS = 256
 
 
 class AdapterStage(str, Enum):
@@ -123,14 +144,12 @@ class DeterministicEventIdentity:
     idempotency_key: str
 
 
-@dataclass(frozen=True, slots=True)
-class ProjectionCapability:
-    """Request-independent probe result for the isolated internal message API."""
+@dataclass(frozen=True, slots=True, repr=False)
+class ProjectionFactory:
+    """Request-local constructors derived from the current Hook user message."""
 
-    available: bool
-    message_type: Callable[..., object] | None = field(default=None, repr=False)
-    text_part_type: Callable[..., object] | None = field(default=None, repr=False)
-    fault: AdapterFault | None = None
+    message_type: Callable[..., object] = field(repr=False)
+    text_part_type: Callable[..., object] = field(repr=False)
 
 
 @dataclass(frozen=True, slots=True)
@@ -141,7 +160,7 @@ class ProjectionBuild:
     fault: AdapterFault | None
 
 
-@dataclass(frozen=True, slots=True)
+@dataclass(frozen=True, slots=True, repr=False)
 class PreparedRequest:
     """Request-local durable view and AC-owned fallback candidates."""
 
@@ -150,6 +169,61 @@ class PreparedRequest:
     user_event: EventEnvelope = field(repr=False)
     view: RequestView = field(repr=False)
     candidates: tuple[CandidateBlock, ...] = field(repr=False)
+    trusted_token_usage: int | None
+    budget_profile: RequestBudgetProfile
+
+
+class _LazyTokenCounter:
+    """Construct one request counter lazily inside the coarse worker call."""
+
+    __slots__ = ("_counter", "_provider", "profile")
+
+    def __init__(
+        self,
+        provider: Callable[[TokenizerProfile], TokenCounter],
+        profile: TokenizerProfile,
+    ) -> None:
+        self._provider = provider
+        self.profile = profile
+        self._counter: TokenCounter | None = None
+
+    def count_text(self, text: str) -> int:
+        counter = self._counter
+        if counter is None:
+            try:
+                candidate = self._provider(self.profile)
+            except TokenizerError:
+                raise
+            except Exception:  # noqa: BLE001 - construction details stay private
+                raise TokenizerError(TokenizerErrorCode.TOKENIZER_CONSTRUCTION_FAILED) from None
+            try:
+                candidate_profile = getattr(candidate, "profile", _MISSING)
+            except Exception:  # noqa: BLE001 - provider counter details stay private
+                raise TokenizerError(TokenizerErrorCode.TOKENIZER_CONSTRUCTION_FAILED) from None
+            if (
+                not isinstance(candidate_profile, TokenizerProfile)
+                or candidate_profile != self.profile
+            ):
+                raise TokenizerError(TokenizerErrorCode.TOKENIZER_CONSTRUCTION_FAILED)
+            if not callable(getattr(candidate, "count_text", None)):
+                raise TokenizerError(TokenizerErrorCode.TOKENIZER_CONSTRUCTION_FAILED)
+            counter = candidate
+            self._counter = counter
+        return counter.count_text(text)
+
+
+class _ProfiledByteFallbackCounter:
+    """Bind the compatibility counter to the explicit fallback profile."""
+
+    __slots__ = ("_counter",)
+
+    profile = BYTE_FALLBACK
+
+    def __init__(self) -> None:
+        self._counter = Utf8ByteTokenCounter()
+
+    def count_text(self, text: str) -> int:
+        return self._counter.count_text(text)
 
 
 def _raise(
@@ -183,12 +257,19 @@ def _fault(
 
 
 def _safe_call(target: object, method_name: str) -> object:
-    method = getattr(target, method_name, None)
+    method = _safe_attribute(target, method_name)
     if not callable(method):
         return _MISSING
     try:
         return method()
     except Exception:  # noqa: BLE001 - host failures cross a redacted boundary
+        return _MISSING
+
+
+def _safe_attribute(target: object, name: str) -> object:
+    try:
+        return getattr(target, name)
+    except Exception:  # noqa: BLE001 - host properties cross a redacted boundary
         return _MISSING
 
 
@@ -225,20 +306,17 @@ def _host_datetime(value: object) -> datetime | None:
         return None
 
 
-def extract_host_turn_identity(event: object, request: object) -> HostTurnIdentity:
-    """Extract the exact seven-field SessionKey and stable host delivery identity."""
+def extract_host_session_key(event: object, conversation: object) -> SessionKey:
+    """Extract one exact seven-field SessionKey from documented AstrBot objects."""
 
     message_obj = getattr(event, "message_obj", _MISSING)
-    conversation = getattr(request, "conversation", _MISSING)
     raw_group_id = _safe_call(event, "get_group_id")
-    raw_message_type = _safe_call(event, "get_message_type")
     values = {
         "platform_instance_id": _required_text(_safe_call(event, "get_platform_id")),
-        "message_type": _message_type_text(raw_message_type),
-        "session_id": _required_text(_safe_call(event, "get_session_id")),
+        "message_type": _message_type_text(getattr(message_obj, "type", _MISSING)),
+        "session_id": _required_text(getattr(message_obj, "session_id", _MISSING)),
         "user_id": _required_text(_safe_call(event, "get_sender_id")),
         "conversation_id": _required_text(getattr(conversation, "cid", _MISSING)),
-        "host_message_id": _required_text(getattr(message_obj, "message_id", _MISSING)),
     }
     group_id = _optional_text(raw_group_id)
     if group_id is _MISSING:
@@ -257,6 +335,47 @@ def extract_host_turn_identity(event: object, request: object) -> HostTurnIdenti
             missing_field_count=missing_count,
         )
 
+    platform_instance_id = values["platform_instance_id"]
+    message_type = values["message_type"]
+    session_id = values["session_id"]
+    user_id = values["user_id"]
+    conversation_id = values["conversation_id"]
+    if (
+        platform_instance_id is None
+        or message_type is None
+        or session_id is None
+        or user_id is None
+        or conversation_id is None
+    ):
+        _raise(
+            AdapterErrorCode.HOST_IDENTITY_MISSING,
+            AdapterStage.IDENTITY,
+            missing_field_count=1,
+        )
+    return SessionKey(
+        platform_instance_id=platform_instance_id,
+        message_type=message_type,
+        session_id=session_id,
+        group_id=group_id if isinstance(group_id, str) else None,
+        user_id=user_id,
+        conversation_id=conversation_id,
+        persona_id=persona_id if isinstance(persona_id, str) else None,
+    )
+
+
+def extract_host_turn_identity(event: object, request: object) -> HostTurnIdentity:
+    """Extract the exact seven-field SessionKey and stable host delivery identity."""
+
+    message_obj = getattr(event, "message_obj", _MISSING)
+    conversation = getattr(request, "conversation", _MISSING)
+    session_key = extract_host_session_key(event, conversation)
+    host_message_id = _required_text(getattr(message_obj, "message_id", _MISSING))
+    if host_message_id is None:
+        _raise(
+            AdapterErrorCode.HOST_IDENTITY_MISSING,
+            AdapterStage.IDENTITY,
+            missing_field_count=1,
+        )
     created_at = _host_datetime(getattr(message_obj, "timestamp", _MISSING))
     if created_at is None:
         _raise(
@@ -264,36 +383,8 @@ def extract_host_turn_identity(event: object, request: object) -> HostTurnIdenti
             AdapterStage.IDENTITY,
             missing_field_count=1,
         )
-
-    platform_instance_id = values["platform_instance_id"]
-    message_type = values["message_type"]
-    session_id = values["session_id"]
-    user_id = values["user_id"]
-    conversation_id = values["conversation_id"]
-    host_message_id = values["host_message_id"]
-    if (
-        platform_instance_id is None
-        or message_type is None
-        or session_id is None
-        or user_id is None
-        or conversation_id is None
-        or host_message_id is None
-    ):
-        _raise(
-            AdapterErrorCode.HOST_IDENTITY_MISSING,
-            AdapterStage.IDENTITY,
-            missing_field_count=1,
-        )
     return HostTurnIdentity(
-        session_key=SessionKey(
-            platform_instance_id=platform_instance_id,
-            message_type=message_type,
-            session_id=session_id,
-            group_id=group_id if isinstance(group_id, str) else None,
-            user_id=user_id,
-            conversation_id=conversation_id,
-            persona_id=persona_id if isinstance(persona_id, str) else None,
-        ),
+        session_key=session_key,
         host_message_id=host_message_id,
         created_at=created_at,
         request_identity=id(request),
@@ -453,47 +544,50 @@ def canonical_tool_metadata(
     return fallback
 
 
-def probe_projection_capability(
-    importer: Callable[[str], object] = importlib.import_module,
-) -> ProjectionCapability:
-    """Probe only the frozen internal Message/TextPart exception."""
+def projection_factory_from_user_message(
+    user_message: object,
+) -> ProjectionFactory:
+    """Derive fresh projection constructors from one current Hook object."""
 
-    try:
-        module = importer(_MESSAGE_MODULE)
-    except Exception:  # noqa: BLE001 - import details must not cross the boundary
-        fault = _fault(
-            AdapterErrorCode.PROJECTION_IMPORT_UNAVAILABLE,
-            AdapterStage.PROJECTION,
-        )
-        return ProjectionCapability(available=False, fault=fault)
-    message_type = getattr(module, "Message", None)
-    text_part_type = getattr(module, "TextPart", None)
-    mark_as_temp = getattr(text_part_type, "mark_as_temp", None)
-    if not callable(message_type) or not callable(text_part_type) or not callable(mark_as_temp):
-        fault = _fault(
+    content = _safe_attribute(user_message, "content")
+    if not isinstance(content, (list, tuple)):
+        _raise(
             AdapterErrorCode.PROJECTION_API_UNAVAILABLE,
             AdapterStage.PROJECTION,
         )
-        return ProjectionCapability(available=False, fault=fault)
-    return ProjectionCapability(
-        available=True,
-        message_type=message_type,
-        text_part_type=text_part_type,
+    text_part = None
+    for part in content:
+        discriminator = _safe_attribute(part, "type")
+        if type(discriminator) is not str or discriminator != "text":
+            continue
+        if isinstance(_safe_attribute(part, "text"), str):
+            text_part = part
+            break
+    if text_part is None:
+        _raise(
+            AdapterErrorCode.PROJECTION_API_UNAVAILABLE,
+            AdapterStage.PROJECTION,
+        )
+    return ProjectionFactory(
+        message_type=type(user_message),
+        text_part_type=type(text_part),
     )
 
 
 def build_projection_objects(
     text: str,
-    capability: ProjectionCapability,
+    factory: ProjectionFactory,
 ) -> ProjectionBuild:
     """Build one provider-only user Message or return a redacted fail-open fault."""
 
-    if not capability.available:
-        fault = capability.fault or _fault(
-            AdapterErrorCode.PROJECTION_API_UNAVAILABLE,
-            AdapterStage.PROJECTION,
+    if not isinstance(factory, ProjectionFactory):
+        return ProjectionBuild(
+            objects=(),
+            fault=_fault(
+                AdapterErrorCode.PROJECTION_API_UNAVAILABLE,
+                AdapterStage.PROJECTION,
+            ),
         )
-        return ProjectionBuild(objects=(), fault=fault)
     if not isinstance(text, str):
         return ProjectionBuild(
             objects=(),
@@ -506,20 +600,42 @@ def build_projection_objects(
     if not text:
         return ProjectionBuild(objects=(), fault=None)
     try:
-        if capability.text_part_type is None or capability.message_type is None:
-            raise TypeError
-        part = capability.text_part_type(text=text)
+        part = factory.text_part_type(text=text)
         marker = getattr(part, "mark_as_temp", None)
         if not callable(marker):
             raise TypeError
         marked = marker()
         if marked is not None:
             part = marked
-        if getattr(part, "_no_save", False) is not True:
+        part_type = _safe_attribute(part, "type")
+        part_text = _safe_attribute(part, "text")
+        if (
+            type(part_type) is not str
+            or part_type != "text"
+            or type(part_text) is not str
+            or part_text != text
+            or _safe_attribute(part, "_no_save") is not True
+        ):
             raise TypeError
-        message = capability.message_type(role="user", content=[part])
+        message = factory.message_type(role="user", content=[part])
         message.__setattr__("_no_save", True)
-        if getattr(message, "_no_save", False) is not True:
+        message_role = _safe_attribute(message, "role")
+        message_content = _safe_attribute(message, "content")
+        final_part_type = _safe_attribute(part, "type")
+        final_part_text = _safe_attribute(part, "text")
+        if (
+            type(message_role) is not str
+            or message_role != "user"
+            or not isinstance(message_content, (list, tuple))
+            or len(message_content) != 1
+            or message_content[0] is not part
+            or _safe_attribute(message, "_no_save") is not True
+            or type(final_part_type) is not str
+            or final_part_type != "text"
+            or type(final_part_text) is not str
+            or final_part_text != text
+            or _safe_attribute(part, "_no_save") is not True
+        ):
             raise TypeError
     except Exception:  # noqa: BLE001 - construction details and content stay private
         return ProjectionBuild(
@@ -534,11 +650,17 @@ def build_projection_objects(
 
 
 def _content_texts(message: object) -> tuple[str, ...]:
-    content = (
-        message.get("content", None)
-        if isinstance(message, Mapping)
-        else getattr(message, "content", None)
-    )
+    try:
+        content = (
+            message.get("content", None)
+            if isinstance(message, Mapping)
+            else getattr(message, "content", None)
+        )
+    except Exception:  # noqa: BLE001 - host property details stay private
+        _raise(
+            AdapterErrorCode.OPAQUE_TOKEN_COUNT_INVALID,
+            AdapterStage.OPAQUE_COST,
+        )
     if isinstance(content, str):
         return (content,)
     if not isinstance(content, (list, tuple)):
@@ -548,12 +670,18 @@ def _content_texts(message: object) -> tuple[str, ...]:
         if isinstance(part, str):
             texts.append(part)
             continue
-        for attribute in ("text", "think", "image_url", "audio_url"):
-            value = (
-                part.get(attribute, None)
-                if isinstance(part, Mapping)
-                else getattr(part, attribute, None)
-            )
+        for attribute in ("text", "image_url", "audio_url"):
+            try:
+                value = (
+                    part.get(attribute, None)
+                    if isinstance(part, Mapping)
+                    else getattr(part, attribute, None)
+                )
+            except Exception:  # noqa: BLE001 - host property details stay private
+                _raise(
+                    AdapterErrorCode.OPAQUE_TOKEN_COUNT_INVALID,
+                    AdapterStage.OPAQUE_COST,
+                )
             if isinstance(value, str):
                 texts.append(value)
     return tuple(texts)
@@ -617,26 +745,61 @@ class AstrBotHookBridge:
         repository: SQLiteRepository,
         *,
         retrieval_config: RetrievalConfig | None = None,
-        budget_config: BudgetConfig | None = None,
-        counter: TokenCounter | None = None,
+        counter_provider: Callable[[TokenizerProfile], TokenCounter] | None = None,
+        request_runner: Callable[..., RequestBudgetOutcome] | None = None,
+        context_engine_mode: ContextEngineMode = ContextEngineMode.OFF,
     ) -> None:
+        if not isinstance(context_engine_mode, ContextEngineMode):
+            raise TypeError("context_engine_mode must be a ContextEngineMode")
         self._repository = repository
         self._retrieval_config = retrieval_config or RetrievalConfig()
-        self._budget_config = budget_config or BudgetConfig()
-        self._counter = counter or Utf8ByteTokenCounter()
+        registry = TokenizerRegistry()
+        self._counter_provider = counter_provider or registry.counter_for
+        self._request_runner = request_runner or run_request_budget
+        self._compatibility_counter = Utf8ByteTokenCounter()
+        self._context_engine_mode = context_engine_mode
+        self._last_context_trace: LiveContextTrace | None = None
+        self._context_traces: OrderedDict[str, LiveContextTrace] = OrderedDict()
 
     @property
     def repository(self) -> SQLiteRepository:
         return self._repository
 
-    def _content_cost(self, content: str) -> int:
+    @property
+    def context_engine_mode(self) -> ContextEngineMode:
+        return self._context_engine_mode
+
+    @property
+    def last_context_trace(self) -> LiveContextTrace | None:
+        return self._last_context_trace
+
+    def inspect_context_trace(self, session_key: SessionKey) -> LiveContextTrace | None:
+        """Return bounded, content-free diagnostics without reading the Journal."""
+
+        if not isinstance(session_key, SessionKey):
+            raise TypeError("session_key must be a SessionKey")
+        return self._context_traces.get(session_key.session_key_hash)
+
+    def _remember_context_trace(
+        self,
+        session_key: SessionKey,
+        trace: LiveContextTrace,
+    ) -> None:
+        session_hash = session_key.session_key_hash
+        self._context_traces[session_hash] = trace
+        self._context_traces.move_to_end(session_hash)
+        while len(self._context_traces) > _MAX_CONTEXT_TRACE_SESSIONS:
+            self._context_traces.popitem(last=False)
+        self._last_context_trace = trace
+
+    def _compatibility_cost(self, content: str) -> int:
         if not isinstance(content, str):
             _raise(
                 AdapterErrorCode.JOURNAL_CONTENT_INVALID,
                 AdapterStage.IDENTITY,
             )
         try:
-            value = self._counter.count_text(content)
+            value = self._compatibility_counter.count_text(content)
         except Exception:  # noqa: BLE001 - counter details stay private
             _raise(
                 AdapterErrorCode.OPAQUE_TOKEN_COUNT_INVALID,
@@ -649,7 +812,50 @@ class AstrBotHookBridge:
             )
         return value
 
-    async def prepare_request(self, event: object, request: object) -> PreparedRequest:
+    async def read_tool_loop_state(self, session_key: SessionKey) -> ToolLoopAssessment:
+        """Read the durable Journal-only tool protocol without host sidecars."""
+
+        view = await asyncio.to_thread(read_request_view, self._repository, session_key)
+        return evaluate_tool_loop(view.delta)
+
+    def _canonical_observation(self, content: str) -> CanonicalMetricObservation:
+        count: int | None = None
+        try:
+            counter = self._counter_provider(CANONICAL_O200K)
+            counter_profile = getattr(counter, "profile", _MISSING)
+            if (
+                not isinstance(counter_profile, TokenizerProfile)
+                or counter_profile != CANONICAL_O200K
+            ):
+                raise TokenizerError(TokenizerErrorCode.TOKENIZER_CONSTRUCTION_FAILED)
+            value = counter.count_text(content)
+            if not isinstance(value, bool) and isinstance(value, int) and value >= 0:
+                count = value
+        except Exception:  # noqa: BLE001 - canonical failures become one backfill intent
+            count = None
+        return CanonicalMetricObservation(CANONICAL_O200K.profile_id, count)
+
+    def _capture_with_metrics(
+        self,
+        capture: Callable[..., EventEnvelope],
+        *,
+        content: str,
+        **kwargs: object,
+    ) -> EventEnvelope:
+        return capture(
+            content=content,
+            token_count=self._compatibility_cost(content),
+            canonical=self._canonical_observation(content),
+            **kwargs,
+        )
+
+    async def prepare_request(
+        self,
+        event: object,
+        request: object,
+        *,
+        budget_profile: RequestBudgetProfile,
+    ) -> PreparedRequest | None:
         """Capture the sole user event, read one view, and prepare fallback candidates."""
 
         turn = extract_host_turn_identity(event, request)
@@ -659,14 +865,24 @@ class AstrBotHookBridge:
                 AdapterErrorCode.JOURNAL_CONTENT_INVALID,
                 AdapterStage.IDENTITY,
             )
+        # Authenticate the existing current-session view before the first live write.
+        # This prevents already-corrupted durable content from being followed by a new
+        # Journal event before the composition root can lock the storage boundary.
+        initial_view = await asyncio.to_thread(
+            read_request_view,
+            self._repository,
+            turn.session_key,
+        )
+        if evaluate_tool_loop(initial_view.delta).state is not ToolLoopState.STABLE:
+            return None
         identity = deterministic_event_identity(turn, SourceHook.ON_LLM_REQUEST)
         user_event = await asyncio.to_thread(
+            self._capture_with_metrics,
             self._repository.capture_user_event,
             event_id=identity.event_id,
             session_key=turn.session_key,
             content=current_input,
             idempotency_key=identity.idempotency_key,
-            token_count=self._content_cost(current_input),
             created_at=turn.created_at,
         )
         view = await asyncio.to_thread(
@@ -683,32 +899,87 @@ class AstrBotHookBridge:
             )
             if user_event.event_id not in candidate.source_event_ids
         )
+        conversation = getattr(request, "conversation", None)
+        raw_usage = getattr(conversation, "token_usage", None)
+        trusted_token_usage = (
+            raw_usage
+            if isinstance(raw_usage, int) and not isinstance(raw_usage, bool) and raw_usage > 0
+            else None
+        )
         return PreparedRequest(
             turn=turn,
             current_input=current_input,
             user_event=user_event,
             view=view,
             candidates=candidates,
+            trusted_token_usage=trusted_token_usage,
+            budget_profile=budget_profile,
         )
 
-    def assemble_prepared(
+    async def evaluate_prepared(
         self,
         prepared: PreparedRequest,
         *,
-        opaque_token_cost: int,
-        fixed_required_cost: int,
-    ) -> AssemblyResult:
-        """Apply canonical budget arithmetic after foreign projections have run."""
+        host_budget_view: HostBudgetView,
+    ) -> RequestBudgetOutcome:
+        """Run pressure, counting, graph selection, and verification in one thread."""
 
-        return assemble(
-            prepared.view,
-            prepared.candidates,
-            current_input=prepared.current_input,
-            opaque_token_cost=opaque_token_cost,
-            fixed_required_cost=fixed_required_cost,
-            counter=self._counter,
-            config=self._budget_config,
+        workload = RequestBudgetWorkload(
+            prepared=PreparedBudgetInput(
+                current_input=prepared.current_input,
+                view=prepared.view,
+                candidates=prepared.candidates,
+                trusted_token_usage=prepared.trusted_token_usage,
+            ),
+            host=host_budget_view,
+            profile=prepared.budget_profile,
         )
+        trace_slot: list[LiveContextTrace] = []
+
+        def assembly_runner(
+            view: RequestView,
+            candidates: tuple[CandidateBlock, ...],
+            *,
+            current_input: str,
+            opaque_token_cost: int,
+            fixed_required_cost: int,
+            counter: TokenCounter,
+            config: BudgetConfig,
+            block_token_counts: Mapping[str, int],
+        ) -> AssemblyResult:
+            assembly, trace = assemble_live_context(
+                view,
+                candidates,
+                current_input=current_input,
+                opaque_token_cost=opaque_token_cost,
+                fixed_required_cost=fixed_required_cost,
+                counter=counter,
+                budget_config=config,
+                block_token_counts=block_token_counts,
+                mode=self._context_engine_mode,
+            )
+            trace_slot[:] = [trace]
+            return assembly
+
+        outcome = await asyncio.to_thread(
+            self._request_runner,
+            workload,
+            primary=_LazyTokenCounter(
+                self._counter_provider,
+                prepared.budget_profile.tokenizer_profile,
+            ),
+            fallback=_LazyTokenCounter(
+                lambda _profile: _ProfiledByteFallbackCounter(),
+                BYTE_FALLBACK,
+            ),
+            assembly_runner=assembly_runner,
+        )
+        if outcome.mutation_allowed and trace_slot:
+            self._remember_context_trace(
+                prepared.turn.session_key,
+                trace_slot[-1],
+            )
+        return cast(RequestBudgetOutcome, outcome)
 
     async def capture_assistant(
         self,
@@ -722,12 +993,12 @@ class AstrBotHookBridge:
             SourceHook.ON_AGENT_DONE,
         )
         return await asyncio.to_thread(
+            self._capture_with_metrics,
             self._repository.capture_assistant_event,
             event_id=identity.event_id,
             session_key=prepared.turn.session_key,
             content=content,
             idempotency_key=identity.idempotency_key,
-            token_count=self._content_cost(content),
             created_at=prepared.turn.created_at,
         )
 
@@ -790,13 +1061,13 @@ class AstrBotHookBridge:
             canonical_metadata=metadata,
         )
         return await asyncio.to_thread(
+            self._capture_with_metrics,
             self._repository.capture_tool_event,
             event_id=identity.event_id,
             session_key=prepared.turn.session_key,
             event_type=event_type,
             content=metadata,
             idempotency_key=identity.idempotency_key,
-            token_count=self._content_cost(metadata),
             created_at=prepared.turn.created_at,
         )
 

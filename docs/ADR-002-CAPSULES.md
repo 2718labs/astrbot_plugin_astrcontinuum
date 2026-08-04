@@ -1,7 +1,9 @@
-# ADR-002：结构化 Capsule，而非单一散文摘要
+# ADR-002: Structured Capsules Rather Than a Single Prose Summary
 
-状态：Accepted
+Status: Accepted
 
-摘要只作为导航字段。目标、约束、决定、开放事项、实体、锚点和来源必须结构化。
+The summary is a navigation field only. Goals, constraints, decisions, open loops, entities,
+anchors, and provenance MUST be structured.
 
-原因：反复摘要会漂移，无法可靠处理决定覆盖、来源审计和依赖恢复。
+Rationale: repeated summarization drifts and cannot reliably support decision supersession,
+source audit, or dependency recovery.

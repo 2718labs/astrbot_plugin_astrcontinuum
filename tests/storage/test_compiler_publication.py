@@ -6,6 +6,9 @@ from pathlib import Path
 import pytest
 
 import astrcontinuum as ac
+from astrcontinuum.storage import ArtifactKind, CanonicalMetricObservation, TokenMetric
+from astrcontinuum.tokenization import CANONICAL_O200K
+from tests.storage.security_testkit import secure_repository
 
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
 TOKEN_CEILING = 10_000
@@ -57,8 +60,7 @@ def session_key() -> ac.SessionKey:
 
 def repository(data_dir: Path) -> ac.SQLiteRepository:
     factory = ac.SQLiteConnectionFactory(data_dir, busy_timeout_ms=5_000)
-    ac.SQLiteMigrator(factory).migrate()
-    return ac.SQLiteRepository(factory)
+    return secure_repository(factory)
 
 
 def capture(store: ac.SQLiteRepository, sequence: int) -> ac.EventEnvelope:
@@ -68,6 +70,7 @@ def capture(store: ac.SQLiteRepository, sequence: int) -> ac.EventEnvelope:
         content=f"message {sequence}",
         idempotency_key=f"request-{sequence}",
         token_count=2,
+        canonical=CanonicalMetricObservation(CANONICAL_O200K.profile_id, None),
         created_at=NOW + timedelta(seconds=sequence),
     )
 
@@ -164,6 +167,7 @@ async def compile_view(
         base_snapshot=view.snapshot,
         base_capsules=view.capsules,
         source_events=view.delta,
+        event_token_counts={event.event_id: event.token_count for event in view.delta},
         target_high_water_mark=view.high_water_mark,
         token_ceiling=TOKEN_CEILING,
         backend=backend,
@@ -194,6 +198,23 @@ def publish_candidate(
         lease_epoch=ready.lease_epoch,
         candidate_snapshot=candidate.snapshot,
         memberships=candidate.memberships,
+        canonical_metrics=(
+            *(
+                TokenMetric(
+                    ArtifactKind.CAPSULE,
+                    membership.capsule_id,
+                    CANONICAL_O200K.profile_id,
+                    membership.capsule.token_cost + 100,
+                )
+                for membership in candidate.memberships
+            ),
+            TokenMetric(
+                ArtifactKind.SNAPSHOT,
+                candidate.snapshot.snapshot_id,
+                CANONICAL_O200K.profile_id,
+                candidate.snapshot.token_cost + 200,
+            ),
+        ),
         token_ceiling=TOKEN_CEILING,
         now=now + timedelta(seconds=1),
     )

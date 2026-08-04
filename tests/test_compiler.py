@@ -221,12 +221,18 @@ async def compile_with(
     now: object = NOW,
     segmenter_config: ac.SegmenterConfig | None = None,
     preferred_end_sequences: tuple[int, ...] = (),
+    event_token_counts: dict[str, int] | None = None,
 ) -> Any:
     compile_candidate = compiler_surface()["compile_candidate"]
     return await compile_candidate(
         base_snapshot=base_snapshot,
         base_capsules=base_capsules,
         source_events=source_events,
+        event_token_counts=(
+            event_token_counts
+            if event_token_counts is not None
+            else {event.event_id: event.token_count for event in source_events}
+        ),
         target_high_water_mark=target,
         token_ceiling=token_ceiling,
         backend=backend,
@@ -324,6 +330,47 @@ async def test_bootstrap_compiles_complete_request_into_frozen_candidate() -> No
         output.rendered_context = "changed"
     with pytest.raises(FrozenInstanceError):
         candidate.segments = ()
+
+
+@pytest.mark.asyncio
+async def test_compiler_segments_with_explicit_event_metrics_and_rejects_missing_mapping() -> None:
+    events = tuple(event(sequence) for sequence in range(1, 4))
+    output_capsule = capsule(
+        source_event_ids=tuple(item.event_id for item in events),
+        end=3,
+        goals=(claim("goal-current", "event-3"),),
+    )
+    backend = RecordingBackend(compiler_output((output_capsule,), "canonical result"))
+    config = ac.SegmenterConfig(
+        max_events_per_segment=10,
+        max_tokens_per_segment=5,
+    )
+
+    candidate = await compile_with(
+        source_events=events,
+        backend=backend,
+        counter=RecordingCounter(9),
+        target=3,
+        event_token_counts={
+            event_item.event_id: count for event_item, count in zip(events, (4, 4, 1), strict=True)
+        },
+        segmenter_config=config,
+    )
+
+    assert tuple(
+        (segment.start_sequence, segment.end_sequence, segment.token_cost)
+        for segment in candidate.segments
+    ) == ((1, 1, 4), (2, 3, 5))
+
+    with pytest.raises(ValueError, match="^TOKEN_METRIC_MISSING$"):
+        await compile_with(
+            source_events=events,
+            backend=backend,
+            counter=RecordingCounter(9),
+            target=3,
+            event_token_counts={events[0].event_id: 2},
+            segmenter_config=config,
+        )
 
 
 @pytest.mark.asyncio

@@ -1,4 +1,4 @@
-# Phase 0 Test Matrix
+# v0.3.0 Test Matrix
 
 ## Test Levels
 
@@ -6,6 +6,8 @@
 - Integration: real SQLite transactions, constraints, fencing, and concurrent connections.
 - Crash recovery: process loss at transaction/state boundaries and startup requeue.
 - AstrBot smoke: verified host hooks and adapter capabilities on supported AstrBot versions.
+- Release: dependency/version/docs/archive contracts, isolated validators, and deterministic
+  package reproduction.
 
 Every normative test MUST assert durable rows and state, not only return values or logs.
 
@@ -23,6 +25,10 @@ Every normative test MUST assert durable rows and state, not only return values 
 | INV-008 | Compile from active Snapshot plus contiguous Delta; reject missing middle event, wrong first/last sequence, stale base, dropped exact anchor, dropped prior semantics, and coverage beyond target. | Unit + integration |
 | INV-009 | Parameterize `strict_audit`; assert structural, identity, coverage, exact-anchor, and non-empty checks always execute, while only optional model audit is skipped when false. | Unit |
 | INV-010 | Run competing claims and expired-worker publication; assert monotonic epochs and stale rejection. Raise intent during active work; assert follow-up `PENDING` work after both `COMMITTED` and `SUPERSEDED` outcomes whenever intent exceeds winning active coverage. | Integration + crash recovery |
+| INV-011 | Freeze one request profile; count host input, candidates, atomic tool call/result pairs, and final projection in that profile. Inject construction/count failure at every stage; assert all primary results are discarded and the entire request is replayed in `utf8-byte-v1` with no mixed units. | Unit + integration |
+| INV-012 | Resolve `MANUAL`, matching public AstrBot Provider metadata, missing metadata, invalid metadata, and request/provider model mismatch. Assert only `AUTO_ASTRBOT`, `AUTO_SAFE_FALLBACK=128000`, or `MANUAL` is emitted and no Provider request is sent. | Unit + AstrBot smoke |
+| INV-013 | For Events, Capsules, and Snapshots, assert encrypted canonical sidecar identity, logical CAS, atomic artifact publication, bounded backfill, crash recovery, and immutable compatibility byte counts. Missing canonical metrics must defer compaction without borrowing live counts. | Integration + crash recovery |
+| INV-014 | Load only size/SHA-256-pinned bundled tokenizer assets with network and mutable caches disabled. Assert unknown-model reference policy and integer basis-point multiplier behavior. | Unit + release |
 
 ## State and Failure Transitions
 
@@ -36,6 +42,7 @@ Every normative test MUST assert durable rows and state, not only return values 
 | `AUDITING -> READY_TO_COMMIT` | Accepted audit records outcome and candidate id; rejection cannot enter ready state. | Unit + integration |
 | working -> `RETRY_WAIT` | Retryable compiler/auditor/callback/worker exception persists stage/code/redacted message, backoff, and clears lease. Scheduler processes another job. | Integration |
 | working -> `FAILED` | Fatal or exhausted exception persists terminal error and clears lease; scheduler remains alive. | Integration |
+| canonical metric unavailable -> `RETRY_WAIT` | Preserve attempt budget, persist stable content-free code, retain/recreate backfill intent, and never publish with incomplete metrics. | Integration + crash recovery |
 | `READY_TO_COMMIT -> COMMITTED` | Snapshot insert, pointer CAS, job commit, and lease clear are atomic; committed timestamp and candidate id are present. Snapshot audit has mechanical true, semantic `NOT_RUN` or `PASSED`, and no failures. | Integration + crash recovery |
 | `READY_TO_COMMIT -> SUPERSEDED` | Exercise same-prefix Snapshot uniqueness, competing bootstrap create, and existing-pointer update conflicts. Each rolls back only the losing Snapshot insert through savepoint/equivalent; the outer transaction persists `SUPERSEDED`, retains candidate id, clears lease, and leaves the winner unchanged. If intent exceeds winning coverage, assert `PENDING` follow-up uses the winning base/version. | Integration |
 | `PENDING`/`RETRY_WAIT -> CANCELLED` | Explicit administration succeeds; working/terminal cancellation is rejected. | Unit + integration |
@@ -71,18 +78,28 @@ The event-enum test fixture MUST accept exactly `USER_MESSAGE/USER/ON_LLM_REQUES
 | Follow-up scheduling | Commit target `43` while intent is `44`; assert coverage `43` and durable follow-up target `44`. Then force CAS conflict against a winner covering `42` with intent `44`; assert losing job is `SUPERSEDED` and follow-up target `44` uses the winner's Snapshot/version. | Integration + crash recovery |
 | Read high-water | Append above captured `H`; assert exclusion from current view and inclusion in next view. | Integration |
 | Dependency roles | Static check asserts host runtime requirements are in root `requirements.txt` and local-only tools are in `pyproject.toml`. | Unit/static |
+| Token metric encryption | Authenticate `(artifact_kind, artifact_id, profile_id)` as the record key; reject swapped/corrupt envelopes and logical count conflicts without exposing artifact text. | Integration + security |
+| Capture metric atomicity | Inject failure after Event insert and after metric/intent handling; assert event plus metric-or-intent commit together or neither commits. | Integration + crash recovery |
+| Publication metric atomicity | Require one canonical metric for every candidate Capsule and Snapshot; inject failures and CAS races and assert no losing metric row survives the publication savepoint. | Integration + crash recovery |
+| Backfill atomicity | Read stable batches of at most the configured bound, recheck session ownership, and atomically write metrics/delete intents. Assert retry after every injected crash boundary. | Integration + crash recovery |
+| Offline asset contract | Assert exact `cl100k_base`/`o200k_base` size and SHA-256, Git binary attributes, no network/cache writes, and `tiktoken>=0.12,<0.14` agreement across project manifests. | Unit + release |
+| Release archive | Build twice and compare bytes; assert one top-level plugin directory, sorted fixed timestamps, strict allowlist, pinned assets, no traversal/sensitive/cache paths, version agreement, and size below 16 MiB. | Release |
 
 ## AstrBot Compatibility Smoke Matrix
 
 | Case | Required assertion |
 | --- | --- |
-| v4.24.2 lower-bound load | Plugin and isolated adapter load; `TextPart`, `extra_user_content_parts`, and `mark_as_temp` probes pass. This remains required until v4.24.1 is separately validated. |
-| v4.24.5 verified sample | Unique writer hooks, tool hooks, duplicate idempotency, and temporary context injection work. |
-| v4.26.7 verified sample | The same checks pass. This is evidence through the version, not a maximum compatibility cap. |
+| v4.24.2 declared lower-bound release probe | Required before a release decision: `scripts/probe_astrbot.py` loads the Star, observes exactly eight hooks, uses real public Provider/ProviderRequest/get_using_provider objects, resolves the model/window, counts with the bundled asset offline, and sends zero LLM requests. The host's own `StarMetadata.pages` fallback warning is not an AstrContinuum failure. |
+| v4.24.0 historical probe | A prior probe is retained as historical evidence only. It is below the currently declared compatibility floor and MUST NOT be presented as a release support claim. |
+| v4.26.7 newest verified sample | The same probe passes. This is evidence through the sampled version, not a maximum compatibility cap or proof for every intervening/future build. |
 | Missing `TextPart` import | Adapter records a redacted compatibility error and host request proceeds without enhanced context. No fabricated Journal success or coverage change occurs. |
 | Missing `extra_user_content_parts` or `mark_as_temp` | Same fail-open behavior; core persistence and scheduling remain operational. |
 | `on_llm_response` observation | Metrics may be emitted, but Journal row count and coverage are unchanged. |
 
 ## Completion Gate
 
-Phase 0 verification MUST retain the input index trace, pre-write checkpoint, output index trace, and a verification artifact bound to the output snapshot. A passing Markdown/static check alone MUST NOT override a failed invariant, transition, SQLite concurrency, crash-recovery, or required AstrBot smoke test.
+Completion requires the frozen Ruff/format/mypy/full-pytest gate, Python 3.10–3.13 and Windows
+3.12 CI matrix, release-contract tests, both AstrBot probes, the vendored 2718lab validator on
+the tracked tree and unpacked archive, and a deterministic archive verification report. A
+passing Markdown/static check alone MUST NOT override a failed invariant, transition, SQLite
+concurrency, crash-recovery, host probe, or package gate.

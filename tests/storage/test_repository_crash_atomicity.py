@@ -8,9 +8,12 @@ from typing import Any
 import pytest
 
 import astrcontinuum as ac
+from astrcontinuum.storage import ArtifactKind, CanonicalMetricObservation, TokenMetric
+from tests.storage.security_testkit import activate_test_storage, secure_repository
 
 NOW = datetime(2026, 7, 26, 12, 0, tzinfo=timezone.utc)
 LEASE_END = NOW + timedelta(minutes=10)
+CANONICAL_PROFILE_ID = "canonical-o200k-v1"
 
 
 class InjectedCrash(RuntimeError):
@@ -31,17 +34,26 @@ def session_key() -> ac.SessionKey:
 
 def migrated_factory(data_dir: Path) -> ac.SQLiteConnectionFactory:
     factory = ac.SQLiteConnectionFactory(data_dir, busy_timeout_ms=5_000)
-    ac.SQLiteMigrator(factory).migrate()
+    activate_test_storage(factory)
     return factory
 
 
-def capture(store: ac.SQLiteRepository, sequence: int) -> ac.EventEnvelope:
+def capture(
+    store: ac.SQLiteRepository,
+    sequence: int,
+    *,
+    canonical_count: int | None = 17,
+) -> ac.EventEnvelope:
     return store.capture_user_event(
         event_id=f"event-{sequence}",
         session_key=session_key(),
         content=f"message {sequence}",
         idempotency_key=f"request-{sequence}",
         token_count=2,
+        canonical=CanonicalMetricObservation(
+            tokenizer_profile_id=CANONICAL_PROFILE_ID,
+            token_count=canonical_count,
+        ),
         created_at=NOW,
     )
 
@@ -215,6 +227,23 @@ def publish(
         candidate_snapshot=snapshot,
         memberships=memberships,
         reorganization_records=reorganization_records,
+        canonical_metrics=(
+            *(
+                TokenMetric(
+                    ArtifactKind.CAPSULE,
+                    membership.capsule_id,
+                    CANONICAL_PROFILE_ID,
+                    membership.capsule.token_cost + 100,
+                )
+                for membership in memberships
+            ),
+            TokenMetric(
+                ArtifactKind.SNAPSHOT,
+                snapshot.snapshot_id,
+                CANONICAL_PROFILE_ID,
+                snapshot.token_cost + 200,
+            ),
+        ),
         token_ceiling=1_000,
         now=NOW + timedelta(minutes=1),
     )
@@ -252,12 +281,20 @@ def assert_candidate_writes_absent(
         assert connection.execute("SELECT count(*) FROM snapshots").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM snapshot_capsules").fetchone()[0] == 0
         assert (
-            connection.execute(
-                "SELECT count(*) FROM snapshot_reorganization_records"
-            ).fetchone()[0]
+            connection.execute("SELECT count(*) FROM snapshot_reorganization_records").fetchone()[0]
             == 0
         )
         assert connection.execute("SELECT count(*) FROM active_snapshots").fetchone()[0] == 0
+        assert (
+            connection.execute(
+                """
+                SELECT count(*)
+                FROM token_metrics
+                WHERE artifact_kind IN ('CAPSULE', 'SNAPSHOT')
+                """
+            ).fetchone()[0]
+            == 0
+        )
 
 
 def pointer_conflict_setup(
@@ -270,7 +307,7 @@ def pointer_conflict_setup(
     tuple[ac.SnapshotCapsuleMembership, ...],
 ]:
     factory = migrated_factory(data_dir)
-    stable = ac.SQLiteRepository(factory)
+    stable = secure_repository(factory)
     capture(stable, 1)
     first_item = capsule(1)
     first_snapshot, first_memberships = candidate_bundle(
@@ -372,6 +409,7 @@ def assert_conflict_crash_rolled_back(
         "capture.after_allocate",
         "capture.before_insert",
         "capture.after_insert",
+        "capture.after_metric",
     ),
 )
 def test_capture_crash_rolls_back_session_sequence_and_event(
@@ -379,7 +417,7 @@ def test_capture_crash_rolls_back_session_sequence_and_event(
     boundary: str,
 ) -> None:
     factory = migrated_factory(tmp_path)
-    crashing = ac.SQLiteRepository(factory, fault_injector=fail_at(boundary))
+    crashing = secure_repository(factory, fault_injector=fail_at(boundary))
 
     with pytest.raises(InjectedCrash, match=boundary):
         capture(crashing, 1)
@@ -387,14 +425,42 @@ def test_capture_crash_rolls_back_session_sequence_and_event(
     with factory.connection(read_only=True) as connection:
         assert connection.execute("SELECT count(*) FROM sessions").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM token_metrics").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT count(*) FROM token_metric_backfill_intents").fetchone()[0]
+            == 0
+        )
 
-    recovered = capture(ac.SQLiteRepository(factory), 1)
+    recovered = capture(secure_repository(factory), 1)
+    assert recovered.sequence == 1
+
+
+def test_capture_after_metric_crash_rolls_back_backfill_intent(tmp_path: Path) -> None:
+    factory = migrated_factory(tmp_path)
+    crashing = secure_repository(
+        factory,
+        fault_injector=fail_at("capture.after_metric"),
+    )
+
+    with pytest.raises(InjectedCrash, match="capture.after_metric"):
+        capture(crashing, 1, canonical_count=None)
+
+    with factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM sessions").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM token_metrics").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT count(*) FROM token_metric_backfill_intents").fetchone()[0]
+            == 0
+        )
+
+    recovered = capture(secure_repository(factory), 1, canonical_count=None)
     assert recovered.sequence == 1
 
 
 def test_claim_crash_rolls_back_owner_epoch_and_attempt(tmp_path: Path) -> None:
     factory = migrated_factory(tmp_path)
-    stable = ac.SQLiteRepository(factory)
+    stable = secure_repository(factory)
     capture(stable, 1)
     raised = stable.raise_compaction_intent(
         job_id="job-1",
@@ -403,7 +469,7 @@ def test_claim_crash_rolls_back_owner_epoch_and_attempt(tmp_path: Path) -> None:
         now=NOW,
     )
     assert raised is not None
-    crashing = ac.SQLiteRepository(
+    crashing = secure_repository(
         factory,
         fault_injector=fail_at("claim.after_update"),
     )
@@ -440,6 +506,7 @@ def test_claim_crash_rolls_back_owner_epoch_and_attempt(tmp_path: Path) -> None:
         "publish.after_capsule",
         "publish.after_snapshot",
         "publish.after_membership",
+        "publish.after_metric",
         "publish.after_pointer",
         "publish.after_terminal",
     ),
@@ -449,11 +516,11 @@ def test_publish_crash_rolls_back_every_candidate_and_terminal_boundary(
     boundary: str,
 ) -> None:
     factory = migrated_factory(tmp_path)
-    stable = ac.SQLiteRepository(factory)
+    stable = secure_repository(factory)
     capture(stable, 1)
     snapshot, memberships = candidate_bundle()
     job = ready_job(stable, candidate_snapshot_id=snapshot.snapshot_id)
-    crashing = ac.SQLiteRepository(factory, fault_injector=fail_at(boundary))
+    crashing = secure_repository(factory, fault_injector=fail_at(boundary))
 
     with pytest.raises(InjectedCrash, match=boundary):
         publish(crashing, job, snapshot, memberships)
@@ -467,7 +534,7 @@ def test_publish_after_ledger_crash_rolls_back_partial_ledger_insert(
     tmp_path: Path,
 ) -> None:
     factory = migrated_factory(tmp_path)
-    stable = ac.SQLiteRepository(factory)
+    stable = secure_repository(factory)
     capture(stable, 1)
     snapshot, memberships = candidate_bundle()
     job = ready_job(stable, candidate_snapshot_id=snapshot.snapshot_id)
@@ -482,7 +549,7 @@ def test_publish_after_ledger_crash_rolls_back_partial_ledger_insert(
             after_tokens=8,
         ),
     )
-    crashing = ac.SQLiteRepository(factory, fault_injector=fail_at("publish.after_ledger"))
+    crashing = secure_repository(factory, fault_injector=fail_at("publish.after_ledger"))
 
     with pytest.raises(InjectedCrash, match="publish.after_ledger"):
         publish(
@@ -509,7 +576,7 @@ def test_injected_ledger_integrity_error_is_not_misclassified_as_publish_conflic
     tmp_path: Path,
 ) -> None:
     factory = migrated_factory(tmp_path)
-    stable = ac.SQLiteRepository(factory)
+    stable = secure_repository(factory)
     capture(stable, 1)
     snapshot, memberships = candidate_bundle()
     job = ready_job(stable, candidate_snapshot_id=snapshot.snapshot_id)
@@ -518,7 +585,7 @@ def test_injected_ledger_integrity_error_is_not_misclassified_as_publish_conflic
         if name == "publish.after_ledger":
             raise sqlite3.IntegrityError("injected crash after ledger insert")
 
-    crashing = ac.SQLiteRepository(factory, fault_injector=crash_after_ledger)
+    crashing = secure_repository(factory, fault_injector=crash_after_ledger)
 
     with pytest.raises(sqlite3.IntegrityError, match="injected crash"):
         publish(
@@ -536,7 +603,7 @@ def test_follow_up_creation_crash_rolls_back_publication_and_pending_job(
     tmp_path: Path,
 ) -> None:
     factory = migrated_factory(tmp_path)
-    stable = ac.SQLiteRepository(factory)
+    stable = secure_repository(factory)
     capture(stable, 1)
     snapshot, memberships = candidate_bundle()
     job = ready_job(stable, candidate_snapshot_id=snapshot.snapshot_id)
@@ -549,7 +616,7 @@ def test_follow_up_creation_crash_rolls_back_publication_and_pending_job(
     )
     assert raised is not None
     assert raised.intent_target_high_water_mark == 2
-    crashing = ac.SQLiteRepository(
+    crashing = secure_repository(
         factory,
         fault_injector=fail_at("publish.after_follow_up"),
     )
@@ -576,7 +643,7 @@ def test_follow_up_creation_crash_rolls_back_publication_and_pending_job(
 
 def test_conflict_terminal_crash_rolls_back_superseded_job(tmp_path: Path) -> None:
     factory, stable, job, snapshot, memberships = pointer_conflict_setup(tmp_path)
-    crashing = ac.SQLiteRepository(
+    crashing = secure_repository(
         factory,
         fault_injector=fail_at("publish.after_terminal"),
     )
@@ -611,7 +678,7 @@ def test_conflict_follow_up_crash_rolls_back_superseded_and_pending_job(
     )
     assert raised is not None
     assert raised.intent_target_high_water_mark == 3
-    crashing = ac.SQLiteRepository(
+    crashing = secure_repository(
         factory,
         fault_injector=fail_at("publish.after_follow_up"),
     )
@@ -638,7 +705,7 @@ def test_injected_integrity_error_is_not_misclassified_as_publish_conflict(
     tmp_path: Path,
 ) -> None:
     factory = migrated_factory(tmp_path)
-    stable = ac.SQLiteRepository(factory)
+    stable = secure_repository(factory)
     capture(stable, 1)
     snapshot, memberships = candidate_bundle()
     job = ready_job(stable, candidate_snapshot_id=snapshot.snapshot_id)
@@ -647,7 +714,7 @@ def test_injected_integrity_error_is_not_misclassified_as_publish_conflict(
         if name == "publish.after_snapshot":
             raise sqlite3.IntegrityError("injected crash after Snapshot insert")
 
-    crashing = ac.SQLiteRepository(factory, fault_injector=crash_after_snapshot)
+    crashing = secure_repository(factory, fault_injector=crash_after_snapshot)
 
     with pytest.raises(sqlite3.IntegrityError, match="injected crash"):
         publish(crashing, job, snapshot, memberships)

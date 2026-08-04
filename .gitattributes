@@ -1,0 +1,11 @@
+.gitattributes text eol=lf
+* text=auto
+*.py text eol=lf
+*.md text eol=lf
+*.json text eol=lf
+*.yaml text eol=lf
+*.yml text eol=lf
+*.toml text eol=lf
+uv.lock text eol=lf
+*.tiktoken -text
+LICENSE text eol=lf

@@ -1,13 +1,24 @@
 from __future__ import annotations
 
+import asyncio
+import base64
+import hashlib
 import importlib
+import json
 import shutil
 import sys
+from dataclasses import fields
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
 from typing import Any, ClassVar
 
 import pytest
+
+from astrcontinuum.adapters.astrbot import _content_texts
+from astrcontinuum.runtime import durable_event_units
+
+TEST_MASTER_KEY = base64.urlsafe_b64encode(b"\x01" * 32).decode("ascii").rstrip("=")
+TEST_MASTER_KEY_ID = hashlib.sha256(b"\x01" * 32).hexdigest()[:16]
 
 
 class FakeLogger:
@@ -28,6 +39,8 @@ class FakeLogger:
 
 
 class FakeFilter:
+    PermissionType = SimpleNamespace(ADMIN="ADMIN")
+
     @staticmethod
     def _hook(kind: str, **kwargs: object):
         def decorate(function):
@@ -58,6 +71,14 @@ class FakeFilter:
     def command(self, name: str, **kwargs: object):
         return self._hook(f"command:{name}", **kwargs)
 
+    @staticmethod
+    def permission_type(permission: object):
+        def decorate(function):
+            function.__astrbot_permission__ = permission
+            return function
+
+        return decorate
+
 
 class FakeStar:
     def __init__(self, context: object, config: dict[str, Any] | None = None) -> None:
@@ -67,6 +88,7 @@ class FakeStar:
 
 class FakeTextPart:
     def __init__(self, *, text: str) -> None:
+        self.type = "text"
         self.text = text
         self._no_save = False
 
@@ -82,14 +104,26 @@ class FakeMessage:
         self._no_save = False
 
 
+def fake_user_message(text: str) -> FakeMessage:
+    return FakeMessage(role="user", content=[FakeTextPart(text=text)])
+
+
 class FakeEvent:
-    def __init__(self, *, message_id: str = "message-1") -> None:
+    def __init__(
+        self,
+        *,
+        message_id: str = "message-1",
+        session_id: str = "session-1",
+    ) -> None:
         self.message_obj = SimpleNamespace(
             message_id=message_id,
             timestamp=1_727_000_000,
+            type=SimpleNamespace(value="FriendMessage"),
+            session_id=session_id,
         )
         self._extras: dict[str, object] = {}
         self.plain_results: list[str] = []
+        self.unified_msg_origin = f"umo:platform-1:{session_id}"
 
     def get_platform_id(self) -> str:
         return "platform-1"
@@ -98,7 +132,7 @@ class FakeEvent:
         return SimpleNamespace(value="FriendMessage")
 
     def get_session_id(self) -> str:
-        return "session-1"
+        return self.message_obj.session_id
 
     def get_group_id(self) -> str:
         return ""
@@ -186,12 +220,175 @@ class RecordingScheduler:
             raise RuntimeError("close secret")
 
 
-def fake_request(prompt: str = "current input") -> SimpleNamespace:
+def fake_request(
+    prompt: str = "current input",
+    *,
+    token_usage: int = 0,
+    model: object = None,
+    conversation_id: str = "conversation-1",
+) -> SimpleNamespace:
     return SimpleNamespace(
         prompt=prompt,
+        model=model,
         contexts=[FakeMessage(role="assistant", content="native context")],
-        conversation=SimpleNamespace(cid="conversation-1", persona_id=None),
+        conversation=SimpleNamespace(
+            cid=conversation_id,
+            persona_id=None,
+            token_usage=token_usage,
+        ),
     )
+
+
+def fake_context_trace(
+    *,
+    mode: object,
+    outcome: object,
+    error_code: object = None,
+    candidate_count: object = 8,
+    selected_count: object = 4,
+    relation_count: object = 6,
+    constraint_count: object = 2,
+    retained_count: object = 7,
+    reduced_count: object = 1,
+    selected_budget_units: object = 1_234,
+    required_passed: object = True,
+    provenance_passed: object = True,
+    residual_band: object = "VERIFIED",
+    adaptive_retry_count: object = 0,
+) -> SimpleNamespace:
+    return SimpleNamespace(
+        mode=mode,
+        outcome=outcome,
+        error_code=error_code,
+        candidate_count=candidate_count,
+        selected_count=selected_count,
+        relation_count=relation_count,
+        constraint_count=constraint_count,
+        retained_count=retained_count,
+        reduced_count=reduced_count,
+        selected_budget_units=selected_budget_units,
+        required_passed=required_passed,
+        provenance_passed=provenance_passed,
+        residual_band=residual_band,
+        adaptive_retry_count=adaptive_retry_count,
+    )
+
+
+class FakeContext:
+    def __init__(self, *, provider: object = None) -> None:
+        self.provider = provider
+        self.providers = [provider] if provider is not None else []
+        self.provider_requests: list[str] = []
+        self.provider_by_id_requests: list[str] = []
+        self.using_provider_requests: list[str] = []
+        self.generate_calls: list[dict[str, object]] = []
+        self.conversation_manager = FakeConversationManager()
+
+    def get_using_provider(self, *, umo: str) -> object:
+        self.using_provider_requests.append(umo)
+        return self.provider
+
+    async def get_current_chat_provider_id(self, *, umo: str) -> str:
+        self.provider_requests.append(umo)
+        return "conversation-provider"
+
+    def get_provider_by_id(self, provider_id: str) -> object:
+        self.provider_by_id_requests.append(provider_id)
+        return self.provider
+
+    def get_all_providers(self) -> list[object]:
+        return self.providers
+
+    async def llm_generate(self, **kwargs: object) -> SimpleNamespace:
+        self.generate_calls.append(kwargs)
+        prompt = kwargs["prompt"]
+        assert isinstance(prompt, str)
+        payload = json.loads(prompt)
+        events = payload["events"]
+        response = {
+            "acknowledged_event_ids": [item["event_id"] for item in events],
+            "goals": [
+                {
+                    "event_id": item["event_id"],
+                    "quote": item["content"],
+                    "confidence": 1.0,
+                }
+                for item in events
+                if item["content"]
+            ],
+            "constraints": [],
+            "decisions": [],
+            "progress": [],
+            "open_loops": [],
+            "preferences": [],
+            "entities": [],
+            "emotional_context": [],
+            "anchors": [],
+        }
+        return SimpleNamespace(completion_text=json.dumps(response, ensure_ascii=False))
+
+
+def background_runtime_context() -> FakeContext:
+    return FakeContext(
+        provider=SimpleNamespace(
+            get_model=lambda: "gpt-4o",
+            provider_config={"max_context_tokens": 262_144},
+        )
+    )
+
+
+class ThinkingCompatibilityProvider:
+    def __init__(self, provider_id: str) -> None:
+        self._provider_id = provider_id
+        self.calls: list[list[object] | None] = []
+
+    def meta(self) -> SimpleNamespace:
+        return SimpleNamespace(type="openai_chat_completion", id=self._provider_id)
+
+    def get_model(self) -> str:
+        return "claude-opus-4-6"
+
+    async def text_chat(
+        self,
+        *,
+        contexts: list[object] | None = None,
+        model: str | None = None,
+    ) -> SimpleNamespace:
+        del model
+        self.calls.append(contexts)
+        return SimpleNamespace(completion_text="ok")
+
+    def text_chat_stream(
+        self,
+        *,
+        contexts: list[object] | None = None,
+        model: str | None = None,
+    ):
+        del contexts, model
+
+        async def stream():
+            yield SimpleNamespace(completion_text="ok")
+
+        return stream()
+
+
+class FakeConversationManager:
+    def __init__(self) -> None:
+        self.current_id: str | None = "conversation-1"
+        self.conversation: object | None = SimpleNamespace(
+            cid="conversation-1",
+            persona_id=None,
+        )
+        self.current_id_calls: list[str] = []
+        self.conversation_calls: list[tuple[str, str]] = []
+
+    async def get_curr_conversation_id(self, umo: str) -> str | None:
+        self.current_id_calls.append(umo)
+        return self.current_id
+
+    async def get_conversation(self, umo: str, cid: str) -> object | None:
+        self.conversation_calls.append((umo, cid))
+        return self.conversation
 
 
 def load_main(
@@ -200,7 +397,13 @@ def load_main(
     *,
     projection_capability: bool = True,
     module_name: str = "main",
+    master_key: str | None = TEST_MASTER_KEY,
 ) -> tuple[ModuleType, FakeLogger]:
+    if master_key is None:
+        monkeypatch.delenv("ASTRCONTINUUM_MASTER_KEY", raising=False)
+    else:
+        monkeypatch.setenv("ASTRCONTINUUM_MASTER_KEY", master_key)
+    monkeypatch.delenv("ASTRCONTINUUM_PREVIOUS_KEY", raising=False)
     logger = FakeLogger()
     fake_filter = FakeFilter()
 
@@ -285,6 +488,29 @@ async def finalize_intent(module: ModuleType, plugin: object) -> tuple[FakeEvent
     return event, state
 
 
+def test_host_text_extractors_never_read_private_thinking_fields(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    class ThinkingCanaryPart:
+        text = "visible"
+        think = "PRIVATE_CANARY"
+        thinking = "PRIVATE_CANARY"
+        signature = "PRIVATE_SIGNATURE_CANARY"
+        reasoning_content = "PRIVATE_CANARY"
+
+        def __getattribute__(self, name: str) -> object:
+            if name in {"think", "thinking", "signature", "reasoning_content"}:
+                raise AssertionError(f"private thinking field accessed: {name}")
+            return super().__getattribute__(name)
+
+    message = SimpleNamespace(content=[ThinkingCanaryPart()])
+    module, _logger = load_main(monkeypatch, tmp_path)
+
+    assert _content_texts(message) == ("visible",)
+    assert module._host_texts(message) == ("visible",)
+
+
 def test_main_imports_from_real_astrbot_plugin_package_layout(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -360,18 +586,39 @@ def test_main_declares_one_star_and_exact_hook_priorities(
     assert star_types == [plugin_type]
 
 
+def test_key_source_status_labels_use_simple_chinese(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path, master_key=None)
+
+    assert module.AstrContinuumPlugin._key_source_label(module.KeySource.LOCAL) == "自动管理"
+    assert module.AstrContinuumPlugin._key_source_label(module.KeySource.FILE) == "服务器密钥文件"
+    assert module.AstrContinuumPlugin._key_source_label(module.KeySource.ENVIRONMENT) == "环境变量"
+
+
 @pytest.mark.asyncio
 async def test_lifecycle_command_and_llm_response_are_idempotent_and_observational(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     module, _logger = load_main(monkeypatch, tmp_path)
-    plugin = module.AstrContinuumPlugin(object(), {"enabled": True})
+    plugin = module.AstrContinuumPlugin(
+        background_runtime_context(),
+        {
+            "enabled": True,
+            "compaction_provider_id": "test-compactor",
+        },
+    )
 
     await plugin.initialize()
     first_bridge = plugin._bridge
+    first_worker = plugin._worker
     await plugin.initialize()
     assert plugin._bridge is first_bridge
+    assert plugin._worker is first_worker
+    assert first_worker is not None
+    assert first_worker.task is not None
     assert first_bridge is not None
     assert first_bridge.repository.factory.database_path.exists()
 
@@ -381,46 +628,2234 @@ async def test_lifecycle_command_and_llm_response_are_idempotent_and_observation
         assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 0
 
     results = [item async for item in plugin.context_status(event)]
-    assert results == [("plain", "AstrContinuum is ready; background compaction unavailable.")]
-    assert event.plain_results == ["AstrContinuum is ready; background compaction unavailable."]
+    assert len(results) == 1
+    assert results[0][0] == "plain"
+    status_text = results[0][1]
+    assert event.plain_results == [status_text]
+    for expected in (
+        "AstrContinuum：运行中",
+        "数据保护：ACTIVE",
+        "加密格式：AES-256-GCM / envelope-v1",
+        "密钥来源：环境变量",
+        f"活动密钥标识：{TEST_MASTER_KEY_ID}",
+        "存储维护：ACTIVE",
+        "安全代码：NONE",
+        "上下文引擎：ACTIVE",
+        "最近引擎状态：NONE",
+        "预算诊断：尚无已完成请求",
+        "Canonical 计数：完成 0·待补 0",
+        "后台归约：运行中",
+        "已记录事件：0",
+        "已发布 Checkpoint：0",
+        "待处理任务：0",
+    ):
+        assert expected in status_text
+    assert "test-compactor" not in status_text
+    assert plugin.context_status.__func__.__astrbot_permission__ == "ADMIN"
 
     await plugin.terminate()
     await plugin.terminate()
     assert plugin._bridge is None
-    not_ready_event = FakeEvent()
-    assert [item async for item in plugin.context_status(not_ready_event)] == [
-        ("plain", "AstrContinuum is not ready.")
-    ]
-
+    assert plugin._worker is None
+    assert first_worker.task is None
     await plugin.initialize()
     assert plugin._bridge is not None
+    assert plugin._worker is not None
+    await plugin.terminate()
 
 
 @pytest.mark.asyncio
-async def test_default_lifecycle_persists_intent_without_constructing_compaction_runtime(
+async def test_thinking_compatibility_survives_storage_lock_and_reconciles_before_ready(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path, master_key=None)
+    initial = ThinkingCompatibilityProvider("initial")
+    context = FakeContext(provider=initial)
+    plugin = module.AstrContinuumPlugin(
+        context,
+        {"enabled": True, "encryption_key_source": "environment"},
+    )
+
+    await plugin.initialize()
+
+    assert plugin._bridge is None
+    assert "text_chat" in initial.__dict__
+    original_contexts: list[object] = [
+        {
+            "role": "assistant",
+            "content": [{"type": "think", "think": "readable reasoning"}],
+        }
+    ]
+    await initial.text_chat(contexts=original_contexts)
+    assert initial.calls[-1] is not original_contexts
+    assert initial.calls[-1] == [
+        {
+            "role": "assistant",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "[assistant reasoning]\nreadable reasoning",
+                }
+            ],
+        }
+    ]
+
+    replacement = ThinkingCompatibilityProvider("replacement")
+    context.providers = [replacement]
+    await plugin.on_llm_request(FakeEvent(message_id="locked-reconcile"), fake_request())
+    assert "text_chat" in replacement.__dict__
+    assert "text_chat" not in initial.__dict__
+
+    await plugin.terminate()
+    assert "text_chat" not in replacement.__dict__
+
+
+@pytest.mark.asyncio
+async def test_unstable_tool_preflight_has_no_provider_side_effects(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     module, _logger = load_main(monkeypatch, tmp_path)
-    plugin = module.AstrContinuumPlugin(object(), {"enabled": True})
-
+    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
     await plugin.initialize()
-    _event, state = await finalize_intent(module, plugin)
+    opening = FakeEvent(message_id="opening")
+    await plugin.on_llm_request(opening, fake_request("opening input"))
+    opening_state = plugin._state(opening)
+    assert opening_state is not None and opening_state.prepared is not None
+    providers = plugin._providers
+    assert providers is not None
+    original_binding = providers.resolve(opening_state.prepared.turn.session_key)
+    await plugin.on_using_llm_tool(
+        opening,
+        SimpleNamespace(name="weather"),
+        {"city": "杭州"},
+    )
+    binding_calls: list[object] = []
+    original_invalidate = plugin._invalidate_current_provider_binding
 
-    assert plugin._worker is None
-    assert plugin._scheduler is None
+    def record_invalidation(*args: object) -> None:
+        binding_calls.append(args)
+        original_invalidate(*args)
+
+    monkeypatch.setattr(plugin, "_invalidate_current_provider_binding", record_invalidation)
+    blocked = FakeEvent(message_id="blocked")
+    request = fake_request("blocked input")
+
+    await plugin.on_llm_request(blocked, request)
+
+    blocked_state = plugin._state(blocked)
+    assert blocked_state is not None
+    assert blocked_state.prepared is None
+    assert binding_calls == []
+    assert providers.resolve(opening_state.prepared.turn.session_key) == original_binding
     bridge = plugin._bridge
     assert bridge is not None
     with bridge.repository.factory.connection(read_only=True) as connection:
-        assert connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0] == 1
-    assert state.intent_raised is True
-    assert [item async for item in plugin.context_status(FakeEvent())] == [
-        ("plain", "AstrContinuum is ready; background compaction unavailable.")
-    ]
+        assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 2
+        assert connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0] == 0
+    await plugin.terminate()
 
 
 @pytest.mark.asyncio
-async def test_explicit_backend_starts_once_notifies_first_intent_and_never_compiles_in_hook(
+async def test_metadata_failure_preserves_binding_when_durable_tool_loop_is_nonstable(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    await plugin.initialize()
+    opening = FakeEvent(message_id="metadata-nonstable-opening")
+    await plugin.on_llm_request(opening, fake_request("opening input"))
+    opening_state = plugin._state(opening)
+    assert opening_state is not None and opening_state.prepared is not None
+    providers = plugin._providers
+    assert providers is not None
+    session_key = opening_state.prepared.turn.session_key
+    original_binding = providers.resolve(session_key)
+    await plugin.on_using_llm_tool(
+        opening,
+        SimpleNamespace(name="weather"),
+        {"city": "杭州"},
+    )
+
+    def fail_metadata(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("private metadata failure")
+
+    monkeypatch.setattr(module, "resolve_astrbot_request_metadata", fail_metadata)
+
+    await plugin.on_llm_request(
+        FakeEvent(message_id="metadata-nonstable-blocked"),
+        fake_request("must not be persisted"),
+    )
+
+    assert providers.resolve(session_key) == original_binding
+    bridge = plugin._bridge
+    assert bridge is not None
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 2
+        assert connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0] == 0
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_metadata_failure_preserves_binding_when_stability_guard_fails(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    await plugin.initialize()
+    opening = FakeEvent(message_id="metadata-guard-opening")
+    await plugin.on_llm_request(opening, fake_request("opening input"))
+    opening_state = plugin._state(opening)
+    assert opening_state is not None and opening_state.prepared is not None
+    providers = plugin._providers
+    assert providers is not None
+    session_key = opening_state.prepared.turn.session_key
+    original_binding = providers.resolve(session_key)
+
+    def fail_metadata(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("private metadata failure")
+
+    async def fail_stability_guard(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("private durable read failure")
+
+    bridge = plugin._bridge
+    assert bridge is not None
+    monkeypatch.setattr(module, "resolve_astrbot_request_metadata", fail_metadata)
+    monkeypatch.setattr(bridge, "read_tool_loop_state", fail_stability_guard)
+
+    await plugin.on_llm_request(
+        FakeEvent(message_id="metadata-guard-blocked"),
+        fake_request("must not be persisted"),
+    )
+
+    assert providers.resolve(session_key) == original_binding
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0] == 0
+    await plugin.terminate()
+
+
+@pytest.mark.parametrize(
+    ("trusted_usage", "expected_projection", "expected_jobs"),
+    [
+        (10_000, False, 0),
+        (52_000, False, 1),
+        (60_000, True, 1),
+    ],
+)
+@pytest.mark.asyncio
+async def test_pressure_controls_projection_and_durable_intent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    trusted_usage: int,
+    expected_projection: bool,
+    expected_jobs: int,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        object(),
+        {
+            "enabled": True,
+            "model_context_limit": 100_000,
+            "compaction_start_ratio": 0.75,
+            "provider_view_switch_ratio": 0.80,
+        },
+    )
+    await plugin.initialize()
+
+    event = FakeEvent(message_id=f"message-{trusted_usage}")
+    request = fake_request(token_usage=trusted_usage)
+    original_conversation = request.conversation
+    await plugin.on_llm_request(event, request)
+
+    system = FakeMessage(role="system", content="system")
+    history = FakeMessage(role="assistant", content="native history")
+    current = fake_user_message("current input")
+    messages = [system, history, current]
+    run_context = SimpleNamespace(messages=messages)
+
+    await plugin.on_agent_begin_guard(event, run_context)
+    await plugin.on_agent_begin_project(event, run_context)
+    state = plugin._state(event)
+    assert state is not None
+    assert state.pressure is not None
+    assert state.pressure.should_project is expected_projection
+
+    if expected_projection:
+        assert messages == [system, current]
+        assert request.conversation is not original_conversation
+        assert request.conversation.token_usage == 0
+        assert original_conversation.token_usage == trusted_usage
+    else:
+        assert messages == [system, history, current]
+        assert request.conversation is original_conversation
+
+    assistant = FakeMessage(role="assistant", content="assistant response")
+    messages.append(assistant)
+    await plugin.on_agent_done_restore(
+        event,
+        run_context,
+        SimpleNamespace(completion_text="assistant response"),
+    )
+    await plugin.on_agent_done_finalize(
+        event,
+        run_context,
+        SimpleNamespace(completion_text="assistant response"),
+    )
+
+    assert request.conversation is original_conversation
+    assert original_conversation.token_usage == trusted_usage
+    assert messages == [system, history, current, assistant]
+    bridge = plugin._bridge
+    assert bridge is not None
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        job_count = connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0]
+    assert job_count == expected_jobs
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_finalizer_does_not_capture_or_intend_while_tool_results_are_pending(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    await plugin.initialize()
+    event = FakeEvent(message_id="pending-finalizer")
+    await plugin.on_llm_request(event, fake_request("opening input"))
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    state.pressure = SimpleNamespace(should_compact=True)
+    await plugin.on_using_llm_tool(
+        event,
+        SimpleNamespace(name="weather"),
+        {"city": "杭州"},
+    )
+    bridge = plugin._bridge
+    assert bridge is not None
+    captured: list[object] = []
+    original_capture = bridge.capture_assistant
+
+    async def record_capture(*args: object, **kwargs: object) -> object:
+        captured.append((args, kwargs))
+        return await original_capture(*args, **kwargs)
+
+    monkeypatch.setattr(bridge, "capture_assistant", record_capture)
+
+    await plugin.on_agent_done_finalize(
+        event,
+        SimpleNamespace(messages=[]),
+        SimpleNamespace(completion_text="must not be captured"),
+    )
+
+    assert captured == []
+    assert state.assistant_event is None
+    assert state.intent_raised is False
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 2
+        assert connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0] == 0
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_finalizer_does_not_capture_or_intend_when_durable_state_is_invalid(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    await plugin.initialize()
+    event = FakeEvent(message_id="invalid-finalizer")
+    await plugin.on_llm_request(event, fake_request("opening input"))
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    state.pressure = SimpleNamespace(should_compact=True)
+    bridge = plugin._bridge
+    assert bridge is not None
+    capture_calls: list[object] = []
+    intent_calls: list[object] = []
+
+    async def invalid_state(*_args: object, **_kwargs: object) -> object:
+        return SimpleNamespace(state=module.ToolLoopState.INVALID)
+
+    async def record_capture(*args: object, **kwargs: object) -> object:
+        capture_calls.append((args, kwargs))
+        raise AssertionError("capture must not run for an invalid durable state")
+
+    async def record_intent(*args: object, **kwargs: object) -> object:
+        intent_calls.append((args, kwargs))
+        raise AssertionError("intent must not run for an invalid durable state")
+
+    monkeypatch.setattr(bridge, "read_tool_loop_state", invalid_state)
+    monkeypatch.setattr(bridge, "capture_assistant", record_capture)
+    monkeypatch.setattr(bridge, "raise_compaction_intent", record_intent)
+
+    await plugin.on_agent_done_finalize(
+        event,
+        SimpleNamespace(messages=[]),
+        SimpleNamespace(completion_text="must not be captured"),
+    )
+
+    assert capture_calls == []
+    assert intent_calls == []
+    assert state.assistant_event is None
+    assert state.intent_raised is False
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 1
+        assert connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0] == 0
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_finalizer_closes_a_tool_round_before_raising_its_compaction_intent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        background_runtime_context(),
+        {"enabled": True, "compaction_provider_id": "test-compactor"},
+    )
+    await plugin.initialize()
+    event = FakeEvent(message_id="closed-tool-finalizer")
+    await plugin.on_llm_request(event, fake_request("opening input"))
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    state.pressure = SimpleNamespace(should_compact=True)
+    tool = SimpleNamespace(name="weather")
+    tool_args = {"city": "杭州"}
+    await plugin.on_using_llm_tool(event, tool, tool_args)
+    await plugin.on_llm_tool_respond(event, tool, tool_args, {"temperature": 28})
+    bridge = plugin._bridge
+    worker = plugin._worker
+    assert bridge is not None and worker is not None
+    monkeypatch.setattr(worker, "wake", lambda: None)
+
+    await plugin.on_agent_done_finalize(
+        event,
+        SimpleNamespace(messages=[]),
+        SimpleNamespace(completion_text="assistant response"),
+    )
+
+    assert state.assistant_event is not None
+    assert state.assistant_event.sequence == 4
+    assert state.intent_raised is True
+    view = bridge.repository.read_request_view(state.prepared.turn.session_key)
+    units = durable_event_units(view.delta)
+    assert units is not None
+    assert tuple(tuple(item.sequence for item in unit) for unit in units) == ((1,), (2, 3, 4))
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        row = connection.execute(
+            "SELECT target_high_water_mark, intent_target_high_water_mark FROM compaction_jobs"
+        ).fetchone()
+    assert row is not None
+    assert tuple(row) == (4, 4)
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_finalizer_rechecks_durable_stability_before_raising_intent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    await plugin.initialize()
+    event = FakeEvent(message_id="postcapture-unstable")
+    await plugin.on_llm_request(event, fake_request("opening input"))
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    state.pressure = SimpleNamespace(should_compact=True)
+    bridge = plugin._bridge
+    assert bridge is not None
+    original_capture = bridge.capture_assistant
+
+    async def capture_then_open_tool(*args: object, **kwargs: object) -> object:
+        assistant_event = await original_capture(*args, **kwargs)
+        await bridge.capture_tool_call(
+            state.prepared,
+            SimpleNamespace(name="weather"),
+            {"city": "杭州"},
+            ordinal=97,
+        )
+        return assistant_event
+
+    monkeypatch.setattr(bridge, "capture_assistant", capture_then_open_tool)
+
+    await plugin.on_agent_done_finalize(
+        event,
+        SimpleNamespace(messages=[]),
+        SimpleNamespace(completion_text="assistant response"),
+    )
+
+    assert state.assistant_event is not None
+    assert state.assistant_event.sequence == 2
+    assert state.intent_raised is False
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 3
+        assert connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0] == 0
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_finalizer_intent_target_remains_the_assistant_high_water_mark(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        background_runtime_context(),
+        {"enabled": True, "compaction_provider_id": "test-compactor"},
+    )
+    await plugin.initialize()
+    event = FakeEvent(message_id="assistant-high-water")
+    await plugin.on_llm_request(event, fake_request("opening input"))
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    state.pressure = SimpleNamespace(should_compact=True)
+    bridge = plugin._bridge
+    worker = plugin._worker
+    assert bridge is not None and worker is not None
+    monkeypatch.setattr(worker, "wake", lambda: None)
+    original_capture = bridge.capture_assistant
+    follow_up_events: list[object] = []
+
+    async def capture_then_append_stable_follow_up(*args: object, **kwargs: object) -> object:
+        assistant_event = await original_capture(*args, **kwargs)
+        follow_up = await bridge.prepare_request(
+            FakeEvent(message_id="assistant-high-water-follow-up"),
+            fake_request("later user input"),
+            budget_profile=state.prepared.budget_profile,
+        )
+        assert follow_up is not None
+        follow_up_events.append(follow_up.user_event)
+        return assistant_event
+
+    monkeypatch.setattr(bridge, "capture_assistant", capture_then_append_stable_follow_up)
+
+    await plugin.on_agent_done_finalize(
+        event,
+        SimpleNamespace(messages=[]),
+        SimpleNamespace(completion_text="assistant response"),
+    )
+
+    assert state.assistant_event is not None
+    assert state.assistant_event.sequence == 2
+    assert len(follow_up_events) == 1
+    assert state.intent_raised is True
+    view = bridge.repository.read_request_view(state.prepared.turn.session_key)
+    assert view.high_water_mark == 3
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        row = connection.execute(
+            "SELECT target_high_water_mark, intent_target_high_water_mark FROM compaction_jobs"
+        ).fetchone()
+    assert row is not None
+    assert tuple(row) == (2, 2)
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_initialize_injects_dedicated_canonical_o200k_counter(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        background_runtime_context(),
+        {"enabled": True, "compaction_provider_id": "test-compactor"},
+    )
+
+    await plugin.initialize()
+
+    worker = plugin._worker
+    assert worker is not None
+    assert worker._canonical_profile_id == module.CANONICAL_O200K.profile_id
+    assert not hasattr(plugin, "_counter")
+    assert worker._canonical_counter is not worker._compatibility_counter
+    assert worker._canonical_counter.profile == module.CANONICAL_O200K
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_explicit_compaction_provider_resolves_through_public_registry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = SimpleNamespace(
+        get_model=lambda: "MiniMax-Text-01",
+        provider_config={"max_context_tokens": 262_144},
+    )
+    context = FakeContext(provider=provider)
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        context,
+        {
+            "enabled": True,
+            "compaction_provider_id": "private-provider-id",
+            "model_context_limit": 0,
+        },
+    )
+
+    await plugin.initialize()
+
+    assert context.provider_by_id_requests == ["private-provider-id"]
+    providers = plugin._providers
+    assert providers is not None
+    arbitrary_session = module.SessionKey(
+        platform_instance_id="platform",
+        message_type="friend_message",
+        session_id="session",
+        group_id=None,
+        user_id="user",
+        conversation_id="conversation",
+        persona_id=None,
+    )
+    resolved = providers.resolve(arbitrary_session)
+    assert resolved.context_limit == 130_000
+    assert resolved.context_limit_source.value == "AUTO_ASTRBOT"
+    assert "private-provider-id" not in repr(resolved)
+    assert "MiniMax-Text-01" not in repr(resolved)
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_unavailable_explicit_provider_cannot_fall_back_to_live_session_binding(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    context = FakeContext(provider=None)
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        context,
+        {
+            "enabled": True,
+            "compaction_provider_id": "missing-private-provider",
+        },
+    )
+    await plugin.initialize()
+    providers = plugin._providers
+    assert providers is not None
+    session = module.SessionKey(
+        platform_instance_id="platform",
+        message_type="friend_message",
+        session_id="session",
+        group_id=None,
+        user_id="user",
+        conversation_id="conversation",
+        persona_id=None,
+    )
+    providers.remember(
+        session,
+        module.CompactionProviderBinding(
+            provider_id="live-provider",
+            model_identity="gpt-4o",
+            context_limit=1,
+            context_limit_source=plugin._context_limit_resolver.resolve(200_000).source,
+        ),
+    )
+
+    with pytest.raises(RuntimeError) as caught:
+        providers.resolve(session)
+
+    assert getattr(caught.value, "code", None) == "EXTRACTIVE_PROVIDER_UNAVAILABLE"
+    assert context.provider_by_id_requests == ["missing-private-provider"]
+    assert context.generate_calls == []
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_live_request_only_refreshes_binding_without_running_compaction_lane(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = SimpleNamespace(
+        get_model=lambda: "gpt-4o",
+        provider_config={"max_context_tokens": 262_144},
+    )
+    context = FakeContext(provider=provider)
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        context,
+        {
+            "enabled": True,
+            "compaction_provider_id": "test-compactor",
+            "model_context_limit": 0,
+        },
+    )
+    await plugin.initialize()
+    worker = plugin._worker
+    assert worker is not None
+
+    async def forbidden_lane(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("live request awaited the background compaction lane")
+
+    runtime = worker._runtime
+    assert runtime is not None
+    monkeypatch.setattr(runtime, "_backfill_metrics", forbidden_lane)
+    event = FakeEvent(message_id="binding-only")
+
+    await plugin.on_llm_request(event, fake_request(model="gpt-4o"))
+
+    assert context.generate_calls == []
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    providers = plugin._providers
+    assert providers is not None
+    resolved = providers.resolve(state.prepared.turn.session_key)
+    assert resolved.model_identity == "gpt-4o"
+    assert resolved.context_limit == 130_000
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_small_model_window_marks_live_provider_unavailable_before_compaction(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = SimpleNamespace(
+        get_model=lambda: "gpt-4o-mini",
+        provider_config={"max_context_tokens": 20_000},
+    )
+    context = FakeContext(provider=provider)
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        context,
+        {"enabled": True, "model_context_limit": 0},
+    )
+    await plugin.initialize()
+    event = FakeEvent(message_id="small-window")
+
+    await plugin.on_llm_request(event, fake_request(model="gpt-4o-mini"))
+
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    providers = plugin._providers
+    assert providers is not None
+    with pytest.raises(RuntimeError) as caught:
+        providers.resolve(state.prepared.turn.session_key)
+    assert getattr(caught.value, "code", None) == "EXTRACTIVE_PROVIDER_UNAVAILABLE"
+    assert context.generate_calls == []
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_failed_live_refresh_clears_stale_binding_and_later_success_recovers(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = SimpleNamespace(
+        get_model=lambda: "gpt-4o",
+        provider_config={"max_context_tokens": 262_144},
+    )
+
+    class MutableProviderContext(FakeContext):
+        current_provider: str | BaseException = "provider-one"
+
+        async def get_current_chat_provider_id(self, *, umo: str) -> str:
+            self.provider_requests.append(umo)
+            if isinstance(self.current_provider, BaseException):
+                raise self.current_provider
+            return self.current_provider
+
+    context = MutableProviderContext(provider=provider)
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        context,
+        {"enabled": True, "model_context_limit": 0},
+    )
+    await plugin.initialize()
+    first = FakeEvent(message_id="refresh-one")
+    await plugin.on_llm_request(first, fake_request(model="gpt-4o"))
+    first_state = plugin._state(first)
+    assert first_state is not None and first_state.prepared is not None
+    session = first_state.prepared.turn.session_key
+    providers = plugin._providers
+    assert providers is not None
+    assert providers.resolve(session).provider_id == "provider-one"
+
+    original_metadata_resolver = module.resolve_astrbot_request_metadata
+
+    def fail_metadata(*_args: object, **_kwargs: object) -> object:
+        raise RuntimeError("private metadata failure")
+
+    monkeypatch.setattr(module, "resolve_astrbot_request_metadata", fail_metadata)
+    second = FakeEvent(message_id="refresh-two")
+    await plugin.on_llm_request(second, fake_request(model="gpt-4o"))
+    with pytest.raises(RuntimeError) as metadata_failure:
+        providers.resolve(session)
+    assert getattr(metadata_failure.value, "code", None) == "EXTRACTIVE_PROVIDER_UNAVAILABLE"
+
+    monkeypatch.setattr(module, "resolve_astrbot_request_metadata", original_metadata_resolver)
+    context.current_provider = RuntimeError("private provider id failure")
+    third = FakeEvent(message_id="refresh-three")
+    await plugin.on_llm_request(third, fake_request(model="gpt-4o"))
+    with pytest.raises(RuntimeError) as provider_failure:
+        providers.resolve(session)
+    assert getattr(provider_failure.value, "code", None) == "EXTRACTIVE_PROVIDER_UNAVAILABLE"
+
+    context.current_provider = "provider-two"
+    fourth = FakeEvent(message_id="refresh-four")
+    await plugin.on_llm_request(fourth, fake_request(model="gpt-4o"))
+    assert providers.resolve(session).provider_id == "provider-two"
+    assert context.generate_calls == []
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_canonical_counter_construction_failure_never_uses_byte_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+
+    class FailingRegistry:
+        def counter_for(self, _profile: object) -> None:
+            raise RuntimeError("private tokenizer construction detail")
+
+    monkeypatch.setattr(module, "TokenizerRegistry", FailingRegistry)
+    plugin = module.AstrContinuumPlugin(
+        background_runtime_context(),
+        {"enabled": True, "compaction_provider_id": "test-compactor"},
+    )
+
+    await plugin.initialize()
+
+    worker = plugin._worker
+    assert worker is not None
+    assert worker._canonical_profile_id == module.CANONICAL_O200K.profile_id
+    assert worker._canonical_counter is None
+    assert not hasattr(plugin, "_counter")
+    await plugin.terminate()
+
+
+@pytest.mark.parametrize(
+    (
+        "request_model",
+        "provider_model",
+        "provider_limit",
+        "configured_limit",
+        "expected_limit",
+        "expected_source",
+        "expected_profile_id",
+    ),
+    [
+        (
+            "gpt-4o",
+            "gpt-4o",
+            262_144,
+            0,
+            262_144,
+            "AUTO_ASTRBOT",
+            "openai-o200k_base-v1",
+        ),
+        (
+            "gpt-4o",
+            "gpt-3.5-turbo",
+            1_000_000,
+            0,
+            128_000,
+            "AUTO_SAFE_FALLBACK",
+            "openai-o200k_base-v1",
+        ),
+        (
+            None,
+            None,
+            None,
+            0,
+            128_000,
+            "AUTO_SAFE_FALLBACK",
+            "reference-o200k-v1",
+        ),
+        (
+            "MiniMax-Text-01",
+            "provider-default",
+            32_000,
+            90_000,
+            90_000,
+            "MANUAL",
+            "reference-o200k-v1",
+        ),
+    ],
+)
+@pytest.mark.asyncio
+async def test_request_metadata_routes_one_immutable_profile_before_capture(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    request_model: str | None,
+    provider_model: str | None,
+    provider_limit: int | None,
+    configured_limit: int,
+    expected_limit: int,
+    expected_source: str,
+    expected_profile_id: str,
+) -> None:
+    provider = (
+        None
+        if provider_model is None and provider_limit is None
+        else SimpleNamespace(
+            get_model=lambda: provider_model,
+            provider_config=(
+                {} if provider_limit is None else {"max_context_tokens": provider_limit}
+            ),
+        )
+    )
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        FakeContext(provider=provider),
+        {
+            "enabled": True,
+            "model_context_limit": configured_limit,
+        },
+    )
+    await plugin.initialize()
+    event = FakeEvent(message_id=f"profile-{expected_source}")
+    request = fake_request(model=request_model)
+
+    await plugin.on_llm_request(event, request)
+
+    state = plugin._state(event)
+    assert state is not None
+    assert state.prepared is not None
+    profile = state.prepared.budget_profile
+    assert profile.model_identity == request_model
+    assert profile.context_limit == expected_limit
+    assert profile.context_limit_source.value == expected_source
+    assert profile.tokenizer_profile.profile_id == expected_profile_id
+    assert state.prepared.user_event.token_count == len(request.prompt.encode("utf-8"))
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_concurrent_sessions_keep_profiles_local_and_model_switch_keeps_canonical_metrics(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    providers = {
+        "umo:platform-1:session-openai": SimpleNamespace(
+            get_model=lambda: "gpt-4o",
+            provider_config={"max_context_tokens": 262_144},
+        ),
+        "umo:platform-1:session-minimax": SimpleNamespace(
+            get_model=lambda: "MiniMax-Text-01",
+            provider_config={"max_context_tokens": 1_000_000},
+        ),
+    }
+
+    class PerSessionContext(FakeContext):
+        def get_using_provider(self, *, umo: str) -> object:
+            self.using_provider_requests.append(umo)
+            return providers[umo]
+
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        PerSessionContext(),
+        {"enabled": True, "model_context_limit": 0},
+    )
+    await plugin.initialize()
+    openai_event = FakeEvent(
+        message_id="profile-openai",
+        session_id="session-openai",
+    )
+    minimax_event = FakeEvent(
+        message_id="profile-minimax",
+        session_id="session-minimax",
+    )
+    openai_request = fake_request(
+        "openai request",
+        model="gpt-4o",
+        conversation_id="conversation-openai",
+    )
+    minimax_request = fake_request(
+        "minimax request",
+        model="MiniMax-Text-01",
+        conversation_id="conversation-minimax",
+    )
+
+    await asyncio.gather(
+        plugin.on_llm_request(openai_event, openai_request),
+        plugin.on_llm_request(minimax_event, minimax_request),
+    )
+
+    openai_state = plugin._state(openai_event)
+    minimax_state = plugin._state(minimax_event)
+    assert openai_state is not None and openai_state.prepared is not None
+    assert minimax_state is not None and minimax_state.prepared is not None
+    assert openai_state.prepared.budget_profile.tokenizer_profile is module.OPENAI_O200K
+    assert minimax_state.prepared.budget_profile.tokenizer_profile is module.REFERENCE_O200K
+    assert openai_state.prepared.budget_profile.context_limit == 262_144
+    assert minimax_state.prepared.budget_profile.context_limit == 1_000_000
+
+    bridge = plugin._bridge
+    assert bridge is not None
+    first_id = openai_state.prepared.user_event.event_id
+    before = bridge.repository.read_event_token_counts(
+        openai_state.prepared.turn.session_key,
+        (first_id,),
+        profile_id=module.CANONICAL_O200K.profile_id,
+    )
+    assert first_id in before
+
+    switched_event = FakeEvent(
+        message_id="profile-openai-switched",
+        session_id="session-openai",
+    )
+    switched_request = fake_request(
+        "same session switched model",
+        model="MiniMax-Text-01",
+        conversation_id="conversation-openai",
+    )
+    await plugin.on_llm_request(switched_event, switched_request)
+    switched_state = plugin._state(switched_event)
+    assert switched_state is not None and switched_state.prepared is not None
+    assert switched_state.prepared.budget_profile.tokenizer_profile is module.REFERENCE_O200K
+    after = bridge.repository.read_event_token_counts(
+        openai_state.prepared.turn.session_key,
+        (first_id, switched_state.prepared.user_event.event_id),
+        profile_id=module.CANONICAL_O200K.profile_id,
+    )
+    assert after[first_id] == before[first_id]
+    assert switched_state.prepared.user_event.event_id in after
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_live_budget_uses_one_coarse_thread_call_and_atomic_byte_fallback(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        FakeContext(),
+        {
+            "enabled": True,
+            "model_context_limit": 100_000,
+        },
+    )
+    await plugin.initialize()
+    event = FakeEvent(message_id="one-coarse-budget")
+    request = fake_request(token_usage=60_000, model="gpt-4o")
+    await plugin.on_llm_request(event, request)
+    bridge = plugin._bridge
+    assert bridge is not None
+
+    class FailingCounter:
+        def count_text(self, _text: str) -> int:
+            raise RuntimeError("private tokenizer failure")
+
+    bridge._counter_provider = lambda _profile: FailingCounter()
+    original_to_thread = asyncio.to_thread
+    live_budget_calls = 0
+
+    async def counted_to_thread(
+        function: object,
+        /,
+        *args: object,
+        **kwargs: object,
+    ) -> object:
+        nonlocal live_budget_calls
+        if getattr(function, "__name__", "") == "run_request_budget":
+            live_budget_calls += 1
+        assert callable(function)
+        return await original_to_thread(function, *args, **kwargs)
+
+    monkeypatch.setattr(module.asyncio, "to_thread", counted_to_thread)
+    system = FakeMessage(role="system", content="system")
+    history = FakeMessage(role="assistant", content="history")
+    current = fake_user_message("current input")
+    messages = [system, history, current]
+    run_context = SimpleNamespace(messages=messages)
+
+    await plugin.on_agent_begin_guard(event, run_context)
+    await plugin.on_agent_begin_project(event, run_context)
+
+    state = plugin._state(event)
+    assert state is not None
+    assert live_budget_calls == 1
+    assert state.outcome is not None
+    assert state.outcome.tokenizer_mode == "BYTE_FALLBACK"
+    assert state.outcome.fallback_code == "TOKENIZER_BYTE_FALLBACK"
+    assert state.outcome.primary_result_discarded is True
+    await plugin.terminate()
+
+
+@pytest.mark.parametrize(
+    ("context_limit", "system_text", "expected_code"),
+    [
+        (1, "system", "CONTEXT_LIMIT_TOO_SMALL"),
+        (40_000, " budget" * 20_000, "REQUIRED_INPUT_EXCEEDS_BUDGET"),
+    ],
+    ids=("context-too-small", "required-overflow"),
+)
+@pytest.mark.asyncio
+async def test_budget_rejection_preserves_message_list_and_every_object_identity(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    context_limit: int,
+    system_text: str,
+    expected_code: str,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        FakeContext(),
+        {
+            "enabled": True,
+            "model_context_limit": context_limit,
+        },
+    )
+    await plugin.initialize()
+    event = FakeEvent(message_id=f"reject-{expected_code}")
+    request = fake_request(
+        "current input",
+        token_usage=60_000,
+        model="MiniMax-Text-01",
+    )
+    original_conversation = request.conversation
+    await plugin.on_llm_request(event, request)
+    system = FakeMessage(role="system", content=system_text)
+    history = FakeMessage(role="assistant", content="history")
+    current = fake_user_message("current input")
+    current_content = current.content
+    assert isinstance(current_content, list)
+    current_part = current_content[0]
+    messages = [system, history, current]
+    message_list = messages
+    original_objects = tuple(messages)
+    run_context = SimpleNamespace(messages=messages)
+
+    await plugin.on_agent_begin_guard(event, run_context)
+    await plugin.on_agent_begin_project(event, run_context)
+
+    state = plugin._state(event)
+    assert state is not None
+    assert state.outcome is not None
+    assert state.outcome.mutation_allowed is False
+    assert messages is message_list
+    assert tuple(messages) == original_objects
+    assert all(actual is expected for actual, expected in zip(messages, original_objects))
+    assert current.content is current_content
+    assert current_content[0] is current_part
+    assert request.conversation is original_conversation
+    assert state.projected is None
+    assert state.faults[-1].code == expected_code
+    await plugin.terminate()
+
+
+@pytest.mark.parametrize(
+    ("failure_kind", "expected_code"),
+    [
+        ("tokenizer", "TOKENIZER_COUNT_FAILED"),
+        ("certificate", "INTERNAL_BUDGET_INVARIANT"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_terminal_budget_failures_never_mutate_native_messages(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    failure_kind: str,
+    expected_code: str,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        FakeContext(),
+        {"enabled": True, "model_context_limit": 100_000},
+    )
+    await plugin.initialize()
+    event = FakeEvent(message_id=f"terminal-{failure_kind}")
+    request = fake_request(token_usage=60_000)
+    original_conversation = request.conversation
+    await plugin.on_llm_request(event, request)
+    bridge = plugin._bridge
+    assert bridge is not None
+
+    async def fail_budget(*_args: object, **_kwargs: object) -> object:
+        if failure_kind == "tokenizer":
+            raise module.TokenizerError(module.TokenizerErrorCode.TOKENIZER_COUNT_FAILED)
+        raise module.BudgetInvariantError(module.BudgetErrorCode.INTERNAL_BUDGET_INVARIANT)
+
+    monkeypatch.setattr(bridge, "evaluate_prepared", fail_budget)
+    system = FakeMessage(role="system", content="system")
+    history = FakeMessage(role="assistant", content="history")
+    current = fake_user_message("current input")
+    messages = [system, history, current]
+    original_objects = tuple(messages)
+    run_context = SimpleNamespace(messages=messages)
+
+    await plugin.on_agent_begin_guard(event, run_context)
+    await plugin.on_agent_begin_project(event, run_context)
+
+    state = plugin._state(event)
+    assert state is not None
+    assert tuple(messages) == original_objects
+    assert all(actual is expected for actual, expected in zip(messages, original_objects))
+    assert request.conversation is original_conversation
+    assert state.projected is None
+    assert state.faults[-1].code == expected_code
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_soft_pressure_wakes_worker_and_publishes_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    context = background_runtime_context()
+    plugin = module.AstrContinuumPlugin(
+        context,
+        {
+            "enabled": True,
+            "model_context_limit": 100_000,
+            "compaction_start_ratio": 0.75,
+            "provider_view_switch_ratio": 0.80,
+            "worker_poll_interval_seconds": 0.01,
+        },
+    )
+    await plugin.initialize()
+
+    event = FakeEvent(message_id="message-worker-e2e")
+    request = fake_request("保留精确原文", token_usage=52_000)
+    await plugin.on_llm_request(event, request)
+    system = FakeMessage(role="system", content="system")
+    history = FakeMessage(role="assistant", content="native history")
+    current = fake_user_message("保留精确原文")
+    assistant = FakeMessage(role="assistant", content="已完成")
+    messages = [system, history, current]
+    run_context = SimpleNamespace(messages=messages)
+
+    await plugin.on_agent_begin_guard(event, run_context)
+    await plugin.on_agent_begin_project(event, run_context)
+    assert messages == [system, history, current]
+    messages.append(assistant)
+    await plugin.on_agent_done_restore(
+        event,
+        run_context,
+        SimpleNamespace(completion_text="已完成"),
+    )
+    await plugin.on_agent_done_finalize(
+        event,
+        run_context,
+        SimpleNamespace(completion_text="已完成"),
+    )
+
+    bridge = plugin._bridge
+    assert bridge is not None
+    for _ in range(100):
+        view = bridge.repository.read_request_view(plugin._state(event).prepared.turn.session_key)
+        if view.snapshot is not None:
+            break
+        await asyncio.sleep(0.01)
+    else:
+        pytest.fail("background worker did not publish a checkpoint")
+
+    assert view.covered_event_end == 2
+    assert view.high_water_mark == 2
+    assert view.delta == ()
+    assert context.provider_requests == ["umo:platform-1:session-1"]
+    assert context.generate_calls
+    assert context.generate_calls[0]["chat_provider_id"] == "conversation-provider"
+    assert context.generate_calls[0].get("tools") is None
+    assert messages == [system, history, current, assistant]
+    status_event = FakeEvent(message_id="status")
+    status = [item async for item in plugin.context_status(status_event)]
+    assert "已记录事件：2" in status[0][1]
+    assert "已发布 Checkpoint：1" in status[0][1]
+    assert "待处理任务：0" in status[0][1]
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_missing_key_latches_locked_without_touching_sqlite(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, logger = load_main(monkeypatch, tmp_path, master_key=None)
+    plugin = module.AstrContinuumPlugin(
+        object(),
+        {
+            "enabled": True,
+            "encryption_key_source": "environment",
+        },
+    )
+
+    await plugin.initialize()
+
+    assert plugin._initialized is True
+    assert plugin._bridge is None
+    assert plugin._worker is None
+    assert not (tmp_path / "astrcontinuum.sqlite3").exists()
+
+    request = fake_request()
+    original_contexts = request.contexts
+    event = FakeEvent()
+    await plugin.on_llm_request(event, request)
+    assert request.contexts is original_contexts
+    assert plugin._state(event).prepared is None
+
+    status = [item async for item in plugin.context_status(event)]
+    status_text = status[0][1]
+    assert "数据保护：LOCKED" in status_text
+    assert "安全代码：STORAGE_KEY_MISSING" in status_text
+    assert "已记录事件" not in status_text
+    assert "已发布 Checkpoint" not in status_text
+    assert "待处理任务" not in status_text
+    assert "在高级设置选自动管理并重载（仅新库/确认无需旧库时）" in status_text
+    assert "设置服务器活动密钥与旧密钥并重载" in status_text
+    assert "ASTRCONTINUUM_MASTER_KEY" not in status_text
+    assert TEST_MASTER_KEY not in status_text
+    assert str(tmp_path) not in status_text
+    assert "astrcontinuum.key" not in status_text
+
+    inspection = [item async for item in plugin.context_inspect(event)]
+    inspection_text = inspection[0][1]
+    assert "检查代码：STORAGE_KEY_MISSING" in inspection_text
+    assert "在高级设置选自动管理并重载（仅新库/确认无需旧库时）" in inspection_text
+    assert "设置服务器活动密钥与旧密钥并重载" in inspection_text
+    assert "ASTRCONTINUUM_MASTER_KEY" not in inspection_text
+    assert TEST_MASTER_KEY not in inspection_text
+    assert str(tmp_path) not in inspection_text
+    assert "astrcontinuum.key" not in inspection_text
+    assert not (tmp_path / "astrcontinuum.sqlite3").exists()
+    assert all(TEST_MASTER_KEY not in str(record) for record in logger.records)
+
+    monkeypatch.setenv("ASTRCONTINUUM_MASTER_KEY", TEST_MASTER_KEY)
+    await plugin.initialize()
+    assert plugin._bridge is None
+    assert not (tmp_path / "astrcontinuum.sqlite3").exists()
+
+    await plugin.terminate()
+    await plugin.initialize()
+    assert plugin._bridge is not None
+    assert plugin._worker is None
+    assert plugin._scheduler is None
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_missing_source_uses_server_managed_default_and_reuses_key(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path, master_key=None)
+    first = module.AstrContinuumPlugin(object(), {"enabled": True})
+
+    assert first._storage_status.key_source == "自动管理"
+    await first.initialize()
+
+    local_path = tmp_path / "astrcontinuum.key"
+    first_text = local_path.read_text(encoding="ascii")
+    status = [item async for item in first.context_status(FakeEvent())]
+    assert "数据保护：LOCAL_KEY_DEGRADED" in status[0][1]
+    assert "密钥来源：自动管理" in status[0][1]
+    assert "安全代码：NONE" in status[0][1]
+    await first.terminate()
+
+    second = module.AstrContinuumPlugin(object(), {"enabled": True})
+    await second.initialize()
+
+    assert local_path.read_text(encoding="ascii") == first_text
+    assert second._bridge is not None
+    second_status = [item async for item in second.context_status(FakeEvent())]
+    assert "数据保护：LOCAL_KEY_DEGRADED" in second_status[0][1]
+    assert "密钥来源：自动管理" in second_status[0][1]
+    await second.terminate()
+
+
+@pytest.mark.asyncio
+async def test_explicit_local_key_mode_is_visibly_degraded(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path, master_key=None)
+    plugin = module.AstrContinuumPlugin(
+        object(),
+        {
+            "enabled": True,
+            "encryption_key_source": "local",
+        },
+    )
+
+    await plugin.initialize()
+
+    assert plugin._bridge is not None
+    assert (tmp_path / "astrcontinuum.key").is_file()
+    status = [item async for item in plugin.context_status(FakeEvent())]
+    assert "数据保护：LOCAL_KEY_DEGRADED" in status[0][1]
+    assert "密钥来源：自动管理" in status[0][1]
+    assert "安全代码：NONE" in status[0][1]
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_context_inspect_reports_current_session_provenance_without_content(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    context = FakeContext()
+    plugin = module.AstrContinuumPlugin(context, {"enabled": True})
+    await plugin.initialize()
+
+    secret = "CURRENT-SESSION-SECRET-MUST-NOT-LEAK"
+    request_event = FakeEvent(message_id="request")
+    await plugin.on_llm_request(request_event, fake_request(secret))
+
+    inspect_event = FakeEvent(message_id="inspect")
+    results = [item async for item in plugin.context_inspect(inspect_event)]
+    text = results[0][1]
+
+    assert "AstrContinuum 当前会话检查" in text
+    assert "数据保护：ACTIVE" in text
+    assert "活动 Checkpoint：NONE" in text
+    assert "指针版本：0" in text
+    assert "覆盖范围：EMPTY" in text
+    assert "Journal 高水位：1" in text
+    assert "Delta 范围：1-1" in text
+    assert "事件计数：USER_MESSAGE=1, ASSISTANT_MESSAGE=0, TOOL_CALL=0, TOOL_RESULT=0" in text
+    assert "Capsule 槽位：NONE" in text
+    assert "待处理任务：NONE" in text
+    assert "重试代码：NONE" in text
+    assert secret not in text
+    assert "session-1" not in text
+    assert "conversation-1" not in text
+    assert TEST_MASTER_KEY not in text
+    assert plugin.context_inspect.__func__.__astrbot_permission__ == "ADMIN"
+    assert context.conversation_manager.current_id_calls == [
+        inspect_event.unified_msg_origin,
+        inspect_event.unified_msg_origin,
+        inspect_event.unified_msg_origin,
+        inspect_event.unified_msg_origin,
+    ]
+    assert context.conversation_manager.conversation_calls == [
+        (inspect_event.unified_msg_origin, "conversation-1"),
+        (inspect_event.unified_msg_origin, "conversation-1"),
+    ]
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_context_inspect_rejects_same_cid_when_persona_changes_after_query(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    context = FakeContext()
+    plugin = module.AstrContinuumPlugin(context, {"enabled": True})
+    await plugin.initialize()
+    await plugin.on_llm_request(FakeEvent(message_id="request"), fake_request("current input"))
+    original_read = plugin._read_session_inspection
+
+    def read_then_change_persona(bridge: object, session_key: object) -> object:
+        inspection = original_read(bridge, session_key)
+        context.conversation_manager.conversation = SimpleNamespace(
+            cid="conversation-1",
+            persona_id="persona-after-query",
+        )
+        return inspection
+
+    monkeypatch.setattr(plugin, "_read_session_inspection", read_then_change_persona)
+
+    results = [item async for item in plugin.context_inspect(FakeEvent(message_id="inspect"))]
+    text = results[0][1]
+
+    assert "检查状态：不可用" in text
+    assert "检查代码：CURRENT_CONVERSATION_CHANGED" in text
+    assert "Journal 高水位" not in text
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_context_inspect_does_not_create_or_scan_when_no_conversation_exists(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    context = FakeContext()
+    context.conversation_manager.current_id = None
+    context.conversation_manager.conversation = None
+    plugin = module.AstrContinuumPlugin(context, {"enabled": True})
+    await plugin.initialize()
+
+    result = [item async for item in plugin.context_inspect(FakeEvent())]
+
+    assert "检查状态：不可用" in result[0][1]
+    assert "检查代码：NO_CURRENT_CONVERSATION" in result[0][1]
+    assert context.conversation_manager.conversation_calls == []
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_runtime_authentication_failure_locks_plugin_and_stops_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        background_runtime_context(),
+        {"enabled": True, "compaction_provider_id": "test-compactor"},
+    )
+    await plugin.initialize()
+    bridge = plugin._bridge
+    worker = plugin._worker
+    assert bridge is not None
+    assert worker is not None
+
+    async def fail_authentication(
+        _event: object,
+        _request: object,
+        *,
+        budget_profile: object,
+    ) -> None:
+        del budget_profile
+        raise module.StorageSecurityError(module.SecurityErrorCode.STORAGE_AUTHENTICATION_FAILED)
+
+    monkeypatch.setattr(bridge, "prepare_request", fail_authentication)
+    request = fake_request("native request remains untouched")
+    original_contexts = request.contexts
+
+    await plugin.on_llm_request(FakeEvent(), request)
+
+    assert request.contexts is original_contexts
+    assert plugin._bridge is None
+    assert plugin._worker is None
+    assert worker.task is None
+    status = [item async for item in plugin.context_status(FakeEvent())]
+    assert "数据保护：LOCKED" in status[0][1]
+    assert "安全代码：STORAGE_AUTHENTICATION_FAILED" in status[0][1]
+
+
+@pytest.mark.asyncio
+async def test_failed_rotation_does_not_report_configured_key_as_active(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    original_plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    await original_plugin.initialize()
+    await original_plugin.terminate()
+
+    replacement_raw = b"\x02" * 32
+    replacement_key = base64.urlsafe_b64encode(replacement_raw).decode("ascii").rstrip("=")
+    replacement_key_id = hashlib.sha256(replacement_raw).hexdigest()[:16]
+    monkeypatch.setenv("ASTRCONTINUUM_MASTER_KEY", replacement_key)
+    monkeypatch.delenv("ASTRCONTINUUM_PREVIOUS_KEY", raising=False)
+    replacement_plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+
+    await replacement_plugin.initialize()
+
+    status = [item async for item in replacement_plugin.context_status(FakeEvent())]
+    text = status[0][1]
+    assert "数据保护：LOCKED" in text
+    assert "安全代码：STORAGE_PREVIOUS_KEY_REQUIRED" in text
+    assert f"活动密钥标识：{replacement_key_id}" not in text
+    assert "活动密钥标识：NONE" in text
+    await replacement_plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_missing_source_never_silently_rekeys_an_existing_environment_database(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    original = module.AstrContinuumPlugin(
+        FakeContext(),
+        {
+            "enabled": True,
+            "encryption_key_source": "environment",
+        },
+    )
+    await original.initialize()
+    assert original._bridge is not None
+    await original.terminate()
+
+    monkeypatch.delenv("ASTRCONTINUUM_MASTER_KEY", raising=False)
+    replacement = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    await replacement.initialize()
+
+    assert replacement._bridge is None
+    assert (tmp_path / "astrcontinuum.key").is_file()
+    replacement_status = [item async for item in replacement.context_status(FakeEvent())]
+    replacement_text = replacement_status[0][1]
+    assert "数据保护：LOCKED" in replacement_text
+    assert "密钥来源：自动管理" in replacement_text
+    assert "安全代码：STORAGE_PREVIOUS_KEY_REQUIRED" in replacement_text
+    assert "活动密钥标识：NONE" in replacement_text
+    await replacement.terminate()
+
+    monkeypatch.setenv("ASTRCONTINUUM_MASTER_KEY", TEST_MASTER_KEY)
+    recovered = module.AstrContinuumPlugin(
+        FakeContext(),
+        {
+            "enabled": True,
+            "encryption_key_source": "environment",
+        },
+    )
+    await recovered.initialize()
+
+    assert recovered._bridge is not None
+    recovered_status = [item async for item in recovered.context_status(FakeEvent())]
+    assert "数据保护：ACTIVE" in recovered_status[0][1]
+    assert f"活动密钥标识：{TEST_MASTER_KEY_ID}" in recovered_status[0][1]
+    await recovered.terminate()
+
+
+@pytest.mark.asyncio
+async def test_context_status_rechecks_lifecycle_after_count_query(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        background_runtime_context(),
+        {"enabled": True, "compaction_provider_id": "test-compactor"},
+    )
+    await plugin.initialize()
+    query_finished = asyncio.Event()
+    release_query = asyncio.Event()
+    original_to_thread = asyncio.to_thread
+
+    async def controlled_to_thread(function, /, *args: object, **kwargs: object):
+        result = await original_to_thread(function, *args, **kwargs)
+        if getattr(function, "__name__", "") == "read_counts":
+            query_finished.set()
+            await release_query.wait()
+        return result
+
+    monkeypatch.setattr(module.asyncio, "to_thread", controlled_to_thread)
+    status_task = asyncio.create_task(anext(plugin.context_status(FakeEvent())))
+    await asyncio.wait_for(query_finished.wait(), timeout=1)
+    await plugin.terminate()
+    release_query.set()
+
+    result = await asyncio.wait_for(status_task, timeout=1)
+    text = result[1]
+    assert "AstrContinuum：运行中" not in text
+    assert "数据保护：LOCKED" in text
+    assert "安全代码：STORAGE_NOT_INITIALIZED" in text
+
+
+@pytest.mark.asyncio
+async def test_detected_ciphertext_tamper_locks_before_the_next_journal_write(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    await plugin.initialize()
+
+    await plugin.on_llm_request(FakeEvent(message_id="first"), fake_request("first input"))
+    bridge = plugin._bridge
+    assert bridge is not None
+    factory = bridge.repository.factory
+    with factory.transaction(immediate=True) as connection:
+        connection.execute("DROP TRIGGER journal_events_immutable_update")
+        row = connection.execute("SELECT event_id, content FROM journal_events").fetchone()
+        replacement = "A" if row["content"][-1] != "A" else "B"
+        connection.execute(
+            "UPDATE journal_events SET content = ? WHERE event_id = ?",
+            (row["content"][:-1] + replacement, row["event_id"]),
+        )
+
+    await plugin.on_llm_request(
+        FakeEvent(message_id="second"),
+        fake_request("second input must not be written"),
+    )
+
+    assert plugin._bridge is None
+    assert plugin._worker is None
+    with factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 1
+    status = [item async for item in plugin.context_status(FakeEvent())]
+    assert "数据保护：LOCKED" in status[0][1]
+    assert "安全代码：STORAGE_AUTHENTICATION_FAILED" in status[0][1]
+
+
+@pytest.mark.asyncio
+async def test_partial_worker_start_failure_leaks_no_background_task(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, logger = load_main(monkeypatch, tmp_path)
+    started: list[object] = []
+    original_start = module.CompactionWorker.start
+
+    async def fail_after_start(worker: object) -> None:
+        await original_start(worker)
+        started.append(worker)
+        raise RuntimeError("DO-NOT-LEAK-worker-start-detail")
+
+    monkeypatch.setattr(module.CompactionWorker, "start", fail_after_start)
+    plugin = module.AstrContinuumPlugin(
+        background_runtime_context(),
+        {"enabled": True, "compaction_provider_id": "test-compactor"},
+    )
+
+    await plugin.initialize()
+
+    assert len(started) == 1
+    assert started[0].task is None
+    assert plugin._bridge is None
+    assert plugin._worker is None
+    status = [item async for item in plugin.context_status(FakeEvent())]
+    assert "数据保护：LOCKED" in status[0][1]
+    assert "安全代码：STORAGE_STARTUP_FAILED" in status[0][1]
+    assert all("DO-NOT-LEAK" not in str(record) for record in logger.records)
+
+
+@pytest.mark.parametrize(
+    ("configured_mode", "expected_mode"),
+    [
+        ("active", "ACTIVE"),
+        ("AcTiVe", "ACTIVE"),
+        (" SHADOW ", "SHADOW"),
+        ("off", "OFF"),
+        ("unsupported", "ACTIVE"),
+        (object(), "ACTIVE"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_context_engine_mode_is_safe_case_insensitive_and_passed_to_bridge(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    configured_mode: object,
+    expected_mode: str,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        FakeContext(),
+        {
+            "enabled": True,
+            "context_engine_mode": configured_mode,
+        },
+    )
+
+    await plugin.initialize()
+
+    bridge = plugin._bridge
+    assert bridge is not None
+    assert plugin._context_engine_mode.value == expected_mode
+    assert bridge.context_engine_mode.value == expected_mode
+    await plugin.terminate()
+
+
+@pytest.mark.parametrize(
+    ("configured_mode", "outcome", "recovery_count", "expected_state"),
+    [
+        ("active", "ACTIVE", 0, "VERIFIED"),
+        ("active", "ACTIVE", 2, "REFINED"),
+        ("active", "DEGRADED_RAW", 0, "DEGRADED_RAW"),
+        ("shadow", "SHADOW", 0, "UNVERIFIED"),
+        ("off", "OFF", 0, "NONE"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_context_status_reports_mode_and_latest_content_free_state_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    configured_mode: str,
+    outcome: str,
+    recovery_count: int,
+    expected_state: str,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        FakeContext(),
+        {
+            "enabled": True,
+            "context_engine_mode": configured_mode,
+        },
+    )
+    await plugin.initialize()
+    bridge = plugin._bridge
+    assert bridge is not None
+    trace = fake_context_trace(
+        mode=configured_mode.upper(),
+        outcome=outcome,
+        error_code="TRACE-DETAIL-MUST-NOT-LEAK",
+        adaptive_retry_count=recovery_count,
+    )
+    plugin._bridge = SimpleNamespace(
+        repository=bridge.repository,
+        last_context_trace=trace,
+    )
+
+    result = [item async for item in plugin.context_status(FakeEvent())]
+    text = result[0][1]
+
+    assert f"上下文引擎：{configured_mode.upper()}" in text
+    assert f"最近引擎状态：{expected_state}" in text
+    assert "TRACE-DETAIL-MUST-NOT-LEAK" not in text
+    assert "候选块" not in text
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_context_status_reports_none_before_any_engine_trace(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        FakeContext(),
+        {
+            "enabled": True,
+            "context_engine_mode": "ACTIVE",
+        },
+    )
+    await plugin.initialize()
+
+    result = [item async for item in plugin.context_status(FakeEvent())]
+
+    assert "上下文引擎：ACTIVE" in result[0][1]
+    assert "最近引擎状态：NONE" in result[0][1]
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_context_inspect_uses_only_current_session_trace_and_bounded_proof(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    context = FakeContext()
+    plugin = module.AstrContinuumPlugin(
+        context,
+        {
+            "enabled": True,
+            "context_engine_mode": "active",
+        },
+    )
+    await plugin.initialize()
+    request_event = FakeEvent(message_id="request")
+    await plugin.on_llm_request(
+        request_event,
+        fake_request("CURRENT-SESSION-CONTENT-MUST-NOT-LEAK"),
+    )
+    state = plugin._state(request_event)
+    assert state is not None
+    assert state.prepared is not None
+    current_key = state.prepared.turn.session_key
+    bridge = plugin._bridge
+    assert bridge is not None
+    current_trace = fake_context_trace(
+        mode="ACTIVE",
+        outcome="ACTIVE",
+        candidate_count=8,
+        selected_count=4,
+        relation_count=6,
+        constraint_count=2,
+        retained_count=7,
+        reduced_count=1,
+        selected_budget_units=1_234,
+        required_passed=True,
+        provenance_passed=True,
+        residual_band="VERIFIED",
+        adaptive_retry_count=1,
+    )
+    other_session_trace = fake_context_trace(
+        mode="ACTIVE",
+        outcome="DEGRADED_RAW",
+        candidate_count=999,
+        error_code="OTHER-SESSION-CODE-MUST-NOT-LEAK",
+    )
+    inspected_keys: list[object] = []
+
+    def inspect_context_trace(session_key: object) -> object:
+        inspected_keys.append(session_key)
+        return current_trace if session_key == current_key else other_session_trace
+
+    plugin._bridge = SimpleNamespace(
+        repository=bridge.repository,
+        last_context_trace=other_session_trace,
+        inspect_context_trace=inspect_context_trace,
+    )
+
+    result = [item async for item in plugin.context_inspect(FakeEvent(message_id="inspect"))]
+    text = result[0][1]
+
+    assert inspected_keys == [current_key]
+    assert "上下文引擎：ACTIVE" in text
+    assert "最近引擎状态：REFINED" in text
+    assert "候选块：8" in text
+    assert "选中块：4" in text
+    assert "关系数：6" in text
+    assert "约束数：2" in text
+    assert "保留块：7" in text
+    assert "归约块：1" in text
+    assert "选择预算单位：1234" in text
+    assert "归约比例：12.50%" in text
+    assert "残差带：VERIFIED" in text
+    assert "恢复次数：1" in text
+    assert "必选覆盖：PASS" in text
+    assert "来源覆盖：PASS" in text
+    assert "稳定代码：NONE" in text
+    assert "999" not in text
+    assert "OTHER-SESSION-CODE-MUST-NOT-LEAK" not in text
+    assert "CURRENT-SESSION-CONTENT-MUST-NOT-LEAK" not in text
+    assert "session-1" not in text
+    assert "conversation-1" not in text
+    await plugin.terminate()
+
+
+@pytest.mark.parametrize(
+    ("mode", "outcome", "expected_state"),
+    [
+        ("SHADOW", "SHADOW", "UNVERIFIED"),
+        ("OFF", "OFF", "NONE"),
+        ("ACTIVE", "DEGRADED_RAW", "DEGRADED_RAW"),
+    ],
+)
+@pytest.mark.asyncio
+async def test_context_inspect_labels_shadow_off_and_degraded_evidence(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+    mode: str,
+    outcome: str,
+    expected_state: str,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        FakeContext(),
+        {
+            "enabled": True,
+            "context_engine_mode": mode,
+        },
+    )
+    await plugin.initialize()
+    bridge = plugin._bridge
+    assert bridge is not None
+    trace = fake_context_trace(
+        mode=mode,
+        outcome=outcome,
+        candidate_count=0,
+        selected_count=0,
+        relation_count=0,
+        constraint_count=0,
+        retained_count=0,
+        reduced_count=0,
+        selected_budget_units=0,
+        required_passed=True,
+        provenance_passed=True,
+        residual_band="UNAVAILABLE",
+    )
+    plugin._bridge = SimpleNamespace(
+        repository=bridge.repository,
+        last_context_trace=trace,
+        inspect_context_trace=lambda _session_key: trace,
+    )
+
+    result = [item async for item in plugin.context_inspect(FakeEvent())]
+    text = result[0][1]
+
+    assert f"上下文引擎：{mode}" in text
+    assert f"最近引擎状态：{expected_state}" in text
+    assert "归约比例：0.00%" in text
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_context_inspect_bounds_and_sanitizes_hostile_trace_values(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        FakeContext(),
+        {
+            "enabled": True,
+            "context_engine_mode": "active",
+        },
+    )
+    await plugin.initialize()
+    bridge = plugin._bridge
+    assert bridge is not None
+    trace = fake_context_trace(
+        mode="ACTIVE",
+        outcome="ACTIVE",
+        error_code="SECRET exception /provider/path",
+        candidate_count=10**100,
+        selected_count=float("nan"),
+        relation_count=float("inf"),
+        constraint_count="SECRET-CONSTRAINT",
+        retained_count=-1,
+        reduced_count=10**101,
+        selected_budget_units=10**102,
+        required_passed="SECRET-REQUIRED",
+        provenance_passed=None,
+        residual_band="SECRET RESIDUAL",
+        adaptive_retry_count=10**103,
+    )
+    plugin._bridge = SimpleNamespace(
+        repository=bridge.repository,
+        last_context_trace=trace,
+        inspect_context_trace=lambda _session_key: trace,
+    )
+
+    result = [item async for item in plugin.context_inspect(FakeEvent())]
+    text = result[0][1]
+    lowered = text.lower()
+
+    assert "候选块：1000000+" in text
+    assert "选中块：INVALID" in text
+    assert "关系数：INVALID" in text
+    assert "约束数：INVALID" in text
+    assert "保留块：INVALID" in text
+    assert "归约块：1000000+" in text
+    assert "选择预算单位：1000000+" in text
+    assert "归约比例：100.00%" in text
+    assert "残差带：INVALID" in text
+    assert "恢复次数：1000000+" in text
+    assert "必选覆盖：UNKNOWN" in text
+    assert "来源覆盖：UNKNOWN" in text
+    assert "稳定代码：INVALID" in text
+    assert "secret" not in lowered
+    assert "exception" not in lowered
+    assert "provider" not in lowered
+    assert "/path" not in lowered
+    assert "nan" not in lowered
+    assert "inf" not in lowered
+    await plugin.terminate()
+
+
+def test_completed_budget_diagnostics_has_content_free_allowlist_only(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+
+    assert tuple(item.name for item in fields(module._CompletedBudgetDiagnostics)) == (
+        "context_limit",
+        "context_limit_source",
+        "online_profile_id",
+        "online_mode",
+        "durable_profile_id",
+        "fallback_code",
+        "stable_code",
+        "effective_input_budget",
+        "selected_input_tokens",
+        "byte_fallback_count",
+    )
+    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": False})
+    assert plugin._latest_completed_budget is None
+    assert len(plugin._completed_budget_sessions) == 0
+
+
+def test_completed_budget_diagnostics_follow_completion_order_and_bound_session_lru(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": False})
+    profile = SimpleNamespace(
+        context_limit=262_144,
+        context_limit_source=SimpleNamespace(value="AUTO_ASTRBOT"),
+        tokenizer_profile=module.OPENAI_O200K,
+        effective_input_budget=130_000,
+    )
+
+    def outcome(stable_code: str, *, byte_fallback: bool = False) -> SimpleNamespace:
+        return SimpleNamespace(
+            tokenizer_profile_id=(
+                "utf8-byte-v1" if byte_fallback else module.OPENAI_O200K.profile_id
+            ),
+            tokenizer_mode="BYTE_FALLBACK" if byte_fallback else "EXACT_TEXT",
+            fallback_code="TOKENIZER_BYTE_FALLBACK" if byte_fallback else "NONE",
+            stable_code=stable_code,
+            assembly=SimpleNamespace(trace=SimpleNamespace(total_input_cost=777)),
+        )
+
+    sessions = [
+        module.SessionKey(
+            platform_instance_id="platform",
+            message_type="friend_message",
+            session_id=f"session-{index}",
+            group_id=None,
+            user_id="user",
+            conversation_id=f"conversation-{index}",
+            persona_id=None,
+        )
+        for index in range(257)
+    ]
+    for index, session_key in enumerate(sessions):
+        plugin._remember_completed_budget(
+            session_key,
+            profile,
+            outcome(
+                "CONTEXT_LIMIT_UNAVAILABLE" if index % 2 == 0 else "CONTEXT_LIMIT_CONFIG_INVALID"
+            ),
+        )
+
+    assert len(plugin._completed_budget_sessions) == 256
+    assert sessions[0].session_key_hash not in plugin._completed_budget_sessions
+    assert tuple(plugin._completed_budget_sessions)[-1] == sessions[-1].session_key_hash
+    assert plugin._latest_completed_budget.stable_code == "CONTEXT_LIMIT_UNAVAILABLE"
+
+    # A request that started earlier but completes later becomes the global latest.
+    plugin._remember_completed_budget(
+        sessions[1],
+        profile,
+        outcome("CONTEXT_LIMIT_CONFIG_INVALID"),
+    )
+    assert tuple(plugin._completed_budget_sessions)[-1] == sessions[1].session_key_hash
+    assert plugin._latest_completed_budget.stable_code == "CONTEXT_LIMIT_CONFIG_INVALID"
+    plugin._remember_completed_budget(
+        sessions[1],
+        profile,
+        outcome("REQUIRED_INPUT_EXCEEDS_BUDGET", byte_fallback=True),
+    )
+    assert plugin._latest_completed_budget.byte_fallback_count == 1
+
+
+@pytest.mark.asyncio
+async def test_status_and_inspect_report_content_free_budget_diagnostics(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    provider = SimpleNamespace(
+        get_model=lambda: "gpt-4o",
+        provider_config={"max_context_tokens": 262_144},
+    )
+    context = FakeContext(provider=provider)
+    module, logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(
+        context,
+        {
+            "enabled": True,
+            "model_context_limit": 0,
+            "compaction_provider_id": "",
+        },
+    )
+    await plugin.initialize()
+    secret = "PRIVATE-PROMPT-HTTP-BODY-MUST-NOT-LEAK"
+    event = FakeEvent(message_id="budget-diagnostics")
+    request = fake_request(secret, token_usage=220_000, model="gpt-4o")
+    await plugin.on_llm_request(event, request)
+    messages = [
+        FakeMessage(role="system", content="private system prompt"),
+        FakeMessage(role="assistant", content="private native history"),
+        fake_user_message(secret),
+    ]
+    run_context = SimpleNamespace(messages=messages)
+    await plugin.on_agent_begin_guard(event, run_context)
+    await plugin.on_agent_begin_project(event, run_context)
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None and state.outcome is not None
+
+    status_text = (await anext(plugin.context_status(FakeEvent(message_id="status"))))[1]
+    assert "模型窗口：262144·AUTO_ASTRBOT" in status_text
+    assert "在线计数：openai-o200k_base-v1·EXACT_TEXT" in status_text
+    assert "持久计数：canonical-o200k-v1·CANONICAL" in status_text
+    assert "Tokenizer 降级：NONE" in status_text
+    assert "预算稳定代码：NONE" in status_text
+    assert "归约模型：FOLLOW_CURRENT" in status_text
+    assert "后台归约：运行中" in status_text
+
+    inspect_text = (await anext(plugin.context_inspect(FakeEvent(message_id="inspect"))))[1]
+    assert "有效输入预算：130000" in inspect_text
+    assert "已选择输入量：" in inspect_text
+    assert "BYTE_FALLBACK 计数：0" in inspect_text
+    assert "Canonical 计数：完成 1·待补 0" in inspect_text
+    assert "预算稳定代码：NONE" in inspect_text
+
+    forbidden = (
+        secret,
+        "private system prompt",
+        "private native history",
+        "gpt-4o",
+        "conversation-provider",
+        state.prepared.turn.session_key.session_key_hash,
+        event.unified_msg_origin,
+        TEST_MASTER_KEY,
+        str(tmp_path),
+        "max_context_tokens",
+    )
+    combined = status_text + inspect_text + repr(plugin._latest_completed_budget)
+    assert all(value not in combined for value in forbidden)
+    assert all(all(value not in str(record) for value in forbidden) for record in logger.records)
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_canonical_metric_status_reports_durable_backfill_pending(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    actual_registry = module.TokenizerRegistry
+
+    class CanonicalFailingRegistry:
+        def __init__(self) -> None:
+            self._delegate = actual_registry()
+
+        def counter_for(self, profile: object) -> object:
+            if profile == module.CANONICAL_O200K:
+                raise RuntimeError("private canonical asset failure")
+            return self._delegate.counter_for(profile)
+
+    monkeypatch.setattr(module, "TokenizerRegistry", CanonicalFailingRegistry)
+    provider = SimpleNamespace(
+        get_model=lambda: "gpt-4o",
+        provider_config={"max_context_tokens": 262_144},
+    )
+    plugin = module.AstrContinuumPlugin(FakeContext(provider=provider), {"enabled": True})
+    await plugin.initialize()
+
+    event = FakeEvent(message_id="canonical-pending")
+    await plugin.on_llm_request(event, fake_request(model="gpt-4o"))
+    run_context = SimpleNamespace(messages=[fake_user_message("private input")])
+    await plugin.on_agent_begin_guard(event, run_context)
+    await plugin.on_agent_begin_project(event, run_context)
+
+    status_text = (await anext(plugin.context_status(FakeEvent(message_id="status"))))[1]
+    inspect_text = (await anext(plugin.context_inspect(FakeEvent(message_id="inspect"))))[1]
+    assert "Canonical 计数：完成 0·待补 1" in status_text
+    assert "Canonical 计数：完成 0·待补 1" in inspect_text
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_v030_default_lifecycle_persists_intent_without_background_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+
+    await plugin.initialize()
+    bridge = plugin._bridge
+    assert bridge is not None
+    assert plugin._worker is None
+    assert plugin._scheduler is None
+
+    event = FakeEvent()
+    await plugin.on_llm_request(event, fake_request())
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    state.pressure = SimpleNamespace(should_compact=True)
+    await plugin.on_agent_done_finalize(
+        event,
+        SimpleNamespace(messages=[]),
+        SimpleNamespace(completion_text="assistant completion"),
+    )
+
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0] == 1
+    assert state.intent_raised is True
+
+    await plugin.terminate()
+    stopped = [item async for item in plugin.context_status(FakeEvent())]
+    assert len(stopped) == 1
+    assert stopped[0][0] == "plain"
+    assert "AstrContinuum：" in stopped[0][1]
+    assert "后台归约：未启动" in stopped[0][1]
+
+
+@pytest.mark.asyncio
+async def test_v030_explicit_backend_starts_once_notifies_intent_without_hook_compilation(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -428,14 +2863,23 @@ async def test_explicit_backend_starts_once_notifies_first_intent_and_never_comp
     install_compaction_fakes(module, monkeypatch)
     backend = RecordingCompiler()
     plugin = module.AstrContinuumPlugin(
-        object(),
+        FakeContext(),
         {"enabled": True},
         compiler_backend=backend,
     )
 
     await plugin.initialize()
     await plugin.initialize()
-    event, state = await finalize_intent(module, plugin)
+    event = FakeEvent()
+    await plugin.on_llm_request(event, fake_request())
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    state.pressure = SimpleNamespace(should_compact=True)
+    await plugin.on_agent_done_finalize(
+        event,
+        SimpleNamespace(messages=[]),
+        SimpleNamespace(completion_text="assistant completion"),
+    )
     await plugin.on_agent_done_finalize(
         event,
         SimpleNamespace(messages=[]),
@@ -449,36 +2893,61 @@ async def test_explicit_backend_starts_once_notifies_first_intent_and_never_comp
     assert scheduler.notify_calls == [state.prepared.turn.session_key.session_key_hash]
     assert backend.calls == 0
     assert RecordingWorker.instances[0].run_once_calls == 0
-    assert [item async for item in plugin.context_status(FakeEvent())] == [
-        ("plain", "AstrContinuum is ready; background compaction active.")
-    ]
+    await plugin.terminate()
 
 
 @pytest.mark.asyncio
-async def test_scheduler_start_and_notify_fail_open_without_losing_durable_intent(
+async def test_v030_scheduler_start_and_notify_fail_open_without_losing_durable_intent(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     module, logger = load_main(monkeypatch, tmp_path)
     install_compaction_fakes(module, monkeypatch)
     RecordingScheduler.fail_start = True
-    plugin = module.AstrContinuumPlugin(object(), {"enabled": True}, compiler_backend=RecordingCompiler())
+    plugin = module.AstrContinuumPlugin(
+        FakeContext(),
+        {"enabled": True},
+        compiler_backend=RecordingCompiler(),
+    )
 
     await plugin.initialize()
-    _event, state = await finalize_intent(module, plugin)
+    event = FakeEvent()
+    await plugin.on_llm_request(event, fake_request())
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    state.pressure = SimpleNamespace(should_compact=True)
+    await plugin.on_agent_done_finalize(
+        event,
+        SimpleNamespace(messages=[]),
+        SimpleNamespace(completion_text="assistant completion"),
+    )
 
     assert plugin._bridge is not None
     assert plugin._worker is None
     assert plugin._scheduler is None
     assert state.intent_raised is True
     assert any("COMPACTION_SCHEDULER_START_FAILED" in str(args) for _, args in logger.records)
+    await plugin.terminate()
 
     module, logger = load_main(monkeypatch, tmp_path / "notify")
     install_compaction_fakes(module, monkeypatch)
     RecordingScheduler.fail_notify = True
-    plugin = module.AstrContinuumPlugin(object(), {"enabled": True}, compiler_backend=RecordingCompiler())
+    plugin = module.AstrContinuumPlugin(
+        FakeContext(),
+        {"enabled": True},
+        compiler_backend=RecordingCompiler(),
+    )
     await plugin.initialize()
-    _event, state = await finalize_intent(module, plugin)
+    event = FakeEvent()
+    await plugin.on_llm_request(event, fake_request())
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    state.pressure = SimpleNamespace(should_compact=True)
+    await plugin.on_agent_done_finalize(
+        event,
+        SimpleNamespace(messages=[]),
+        SimpleNamespace(completion_text="assistant completion"),
+    )
 
     assert state.intent_raised is True
     bridge = plugin._bridge
@@ -486,10 +2955,11 @@ async def test_scheduler_start_and_notify_fail_open_without_losing_durable_inten
     with bridge.repository.factory.connection(read_only=True) as connection:
         assert connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0] == 1
     assert any("COMPACTION_SCHEDULER_NOTIFY_FAILED" in str(args) for _, args in logger.records)
+    await plugin.terminate()
 
 
 @pytest.mark.asyncio
-async def test_worker_setup_and_background_callback_fail_open(
+async def test_v030_worker_setup_and_background_callback_fail_open(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
@@ -497,7 +2967,7 @@ async def test_worker_setup_and_background_callback_fail_open(
     install_compaction_fakes(module, monkeypatch)
     RecordingWorker.fail_construction = True
     plugin = module.AstrContinuumPlugin(
-        object(),
+        FakeContext(),
         {"enabled": True},
         compiler_backend=RecordingCompiler(),
     )
@@ -507,16 +2977,14 @@ async def test_worker_setup_and_background_callback_fail_open(
     assert plugin._bridge is not None
     assert plugin._worker is None
     assert plugin._scheduler is None
-    assert [item async for item in plugin.context_status(FakeEvent())] == [
-        ("plain", "AstrContinuum is ready; background compaction unavailable.")
-    ]
     assert any("COMPACTION_SCHEDULER_START_FAILED" in str(args) for _, args in logger.records)
+    await plugin.terminate()
 
     module, logger = load_main(monkeypatch, tmp_path / "callback")
     install_compaction_fakes(module, monkeypatch)
     RecordingWorker.fail_run_once = True
     plugin = module.AstrContinuumPlugin(
-        object(),
+        FakeContext(),
         {"enabled": True},
         compiler_backend=RecordingCompiler(),
     )
@@ -527,17 +2995,18 @@ async def test_worker_setup_and_background_callback_fail_open(
     await scheduler.callback("session-key-hash")
 
     assert any("COMPACTION_WORKER_RUN_FAILED" in str(args) for _, args in logger.records)
+    await plugin.terminate()
 
 
 @pytest.mark.asyncio
-async def test_old_scheduler_callback_never_targets_worker_from_reinitialized_lifecycle(
+async def test_v030_stale_scheduler_never_targets_reinitialized_worker(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     module, _logger = load_main(monkeypatch, tmp_path)
     install_compaction_fakes(module, monkeypatch)
     plugin = module.AstrContinuumPlugin(
-        object(),
+        FakeContext(),
         {"enabled": True},
         compiler_backend=RecordingCompiler(),
     )
@@ -555,17 +3024,22 @@ async def test_old_scheduler_callback_never_targets_worker_from_reinitialized_li
 
     assert old_worker.run_once_calls == 1
     assert new_worker.run_once_calls == 0
+    await plugin.terminate()
 
 
 @pytest.mark.asyncio
-async def test_terminate_detaches_scheduler_fail_open_and_reinitializes_fresh_runtime(
+async def test_v030_terminate_detaches_scheduler_fail_open_and_reinitializes(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     module, logger = load_main(monkeypatch, tmp_path)
     install_compaction_fakes(module, monkeypatch)
     RecordingScheduler.fail_close = True
-    plugin = module.AstrContinuumPlugin(object(), {"enabled": True}, compiler_backend=RecordingCompiler())
+    plugin = module.AstrContinuumPlugin(
+        FakeContext(),
+        {"enabled": True},
+        compiler_backend=RecordingCompiler(),
+    )
 
     await plugin.initialize()
     first_scheduler = plugin._scheduler
@@ -584,3 +3058,4 @@ async def test_terminate_detaches_scheduler_fail_open_and_reinitializes_fresh_ru
     await plugin.initialize()
     assert plugin._scheduler is not None
     assert plugin._scheduler is not first_scheduler
+    await plugin.terminate()

@@ -24,7 +24,7 @@ ledger coverage.
 
 ### Durable shape and canonicalization
 
-Migration v2 creates `snapshot_reorganization_records`, keyed by `(snapshot_id, ordinal)`
+Migration v3 creates `snapshot_reorganization_records`, keyed by `(snapshot_id, ordinal)`
 with unique `(snapshot_id, source_capsule_id, kind, item_id)`. Every row records source
 identity, `retained`/`approximate`/`released` status, before/after token counts, and whether
 the item was required. Rows are append-only through update/delete rejection triggers.
@@ -69,7 +69,7 @@ kept explicit for the Technical Preview.
 
 ## Consequences
 
-- Existing databases require the checksum-verified migration plan to reach schema version 2.
+- Existing databases require the checksum-verified migration plan to reach schema version 3.
 - Schema migration versions and Capsule `schema_version` are data contracts; neither is the
   package's v0.3.0 release version.
 - v0.3.0 establishes a storage-safety Technical Preview only. The standard

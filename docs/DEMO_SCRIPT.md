@@ -1,21 +1,36 @@
-# 发布演示
+# Demonstration scenarios — not release claims
 
-## 百万 Token 穿越
+This page is a future demonstration and acceptance outline. It does not prove that the listed
+scenarios are already exposed by v0.3.0. In particular, standard background compaction does not
+call a reorganization engine, there is no public rollback UI, and the Sylanne adapter is not an
+active runtime integration.
 
-在早期埋入仓库名、用户禁忌、被否决决定和未完成任务。跨越多次窗口后正确恢复并展示 Source Trace 与 Token Map。
+## Million-token continuity
 
-## 30 秒压缩不阻塞
+Seed a repository name, user prohibition, rejected decision, and unfinished task early in a
+conversation. After several context windows, recover them correctly and show a Source Trace and
+Token Map. This is a future evaluation scenario, not a current performance claim.
 
-Mock 压缩 Provider 延迟 30 秒。期间连续发消息，Bot 正常回复。Inspector 显示 committed V7、running V8、Delta 持续增长，随后无感切换。
+## A 30-second compiler does not block replies
 
-## 杀死 Worker
+Use a mock compiler provider with a 30-second delay. Continue sending messages while the bot
+responds normally. The intended inspector view shows a committed Snapshot, a running job, and a
+growing Delta before an atomic switch. This requires a controlled test harness.
 
-候选生成后、提交前抛异常。旧快照仍 active，新请求使用旧快照 + Delta，重启后恢复。
+## Kill the worker
 
-## 决定反转
+Raise an exception after candidate generation and before commit. The expected invariant is that
+the old Snapshot stays active, new requests use the old Snapshot plus Delta, and restart recovers
+durable work. This describes a failure-injection test, not an end-user command.
 
-同步压缩 → 否决 → 影子压缩。最终同步方案 superseded，影子压缩 active。
+## Decision reversal
 
-## Sylanne 共存
+Exercise a decision sequence such as “synchronous compaction → rejected → shadow compaction”.
+The expected final state is that the superseded plan cannot become active. This remains a scenario
+for a controlled test rather than a published time-travel interface.
 
-开启前后对比 Assembly Trace，证明无重复注入、无隐私越界；关闭 Sylanne 后仍正常工作。
+## Sylanne coexistence
+
+If a future verified Sylanne adapter is supplied, compare assembly traces before and after it to
+prove no duplicate injection or privacy boundary breach; confirm that disabling Sylanne leaves the
+standalone path functional. The current adapter boundary does not claim this integration is wired.

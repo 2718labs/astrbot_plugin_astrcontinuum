@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches:
+      - main
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  quality:
+    name: ${{ matrix.os }} / Python ${{ matrix.python-version }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os:
+          - ubuntu-latest
+          - windows-latest
+        python-version:
+          - "3.10"
+          - "3.11"
+          - "3.12"
+          - "3.13"
+        exclude:
+          - os: windows-latest
+            python-version: "3.10"
+          - os: windows-latest
+            python-version: "3.11"
+          - os: windows-latest
+            python-version: "3.13"
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: ${{ matrix.python-version }}
+          enable-cache: true
+
+      - name: Install locked development environment
+        run: uv sync --frozen --extra dev
+
+      - name: Validate public configuration JSON
+        run: uv run python -m json.tool _conf_schema.json
+
+      - name: Ruff lint
+        run: uv run ruff check .
+
+      - name: Ruff formatting
+        run: uv run ruff format --check .
+
+      - name: Mypy
+        run: uv run mypy astrcontinuum main.py
+
+      - name: Test
+        run: uv run pytest -q
+
+  release-contract:
+    name: Release contract / Ubuntu / Python 3.12
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv and Python
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          python-version: "3.12"
+          enable-cache: true
+
+      - name: Materialize an isolated tracked tree
+        shell: bash
+        run: |
+          git archive \
+            --format=zip \
+            --prefix=astrbot_plugin_astrcontinuum/ \
+            --output="${RUNNER_TEMP}/tracked-tree.zip" \
+            HEAD -- \
+            main.py metadata.yaml _conf_schema.json requirements.txt \
+            README.md README.zh-CN.md CHANGELOG.md LICENSE \
+            THIRD_PARTY_NOTICES.md logo.png astrcontinuum
+          python -c "import os, zipfile; target=os.path.join(os.environ['RUNNER_TEMP'], 'tracked-tree'); zipfile.ZipFile(os.path.join(os.environ['RUNNER_TEMP'], 'tracked-tree.zip')).extractall(target)"
+
+      - name: Install locked development environment
+        run: uv sync --frozen --extra dev
+
+      - name: Run release contract and offline tokenizer tests
+        env:
+          TIKTOKEN_CACHE_DIR: ${{ runner.temp }}/tiktoken-cache
+          DATA_GYM_CACHE_DIR: ${{ runner.temp }}/data-gym-cache
+        run: |
+          uv run pytest tests/release tests/tokenization -q
+
+      - name: Validate isolated tracked plugin tree
+        shell: bash
+        run: |
+          uv run python scripts/vendor/2718lab_validate_plugin.py "${RUNNER_TEMP}/tracked-tree/astrbot_plugin_astrcontinuum"
+
+      - name: Probe pinned AstrBot public APIs
+        run: |
+          uv run --python 3.12 --with astrbot==4.24.0 python scripts/probe_astrbot.py --expected-astrbot-version 4.24.0
+          uv run --python 3.12 --with astrbot==4.26.7 python scripts/probe_astrbot.py --expected-astrbot-version 4.26.7
+
+      - name: Build and verify deterministic plugin archive
+        shell: bash
+        run: |
+          archive="${RUNNER_TEMP}/astrbot_plugin_astrcontinuum-v0.2.1.zip"
+          uv run python scripts/build_plugin_archive.py --output "${archive}"
+          uv run python scripts/verify_plugin_archive.py --archive "${archive}" --expected-version v0.2.1
+          uv run python -c "import os, zipfile; archive=os.path.join(os.environ['RUNNER_TEMP'], 'astrbot_plugin_astrcontinuum-v0.2.1.zip'); zipfile.ZipFile(archive).extractall(os.path.join(os.environ['RUNNER_TEMP'], 'plugin-archive'))"
+          uv run python scripts/vendor/2718lab_validate_plugin.py "${RUNNER_TEMP}/plugin-archive/astrbot_plugin_astrcontinuum"
+
+      - name: Confirm tracked checkout stayed clean
+        run: |
+          git diff --exit-code
+          git status --porcelain --untracked-files=no

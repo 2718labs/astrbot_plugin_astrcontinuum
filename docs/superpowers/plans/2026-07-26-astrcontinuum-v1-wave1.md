@@ -114,7 +114,7 @@ def test_capsule_has_version_time_and_quality() -> None:
 Run:
 
 ```powershell
-$env:TEMP='D:\bun\tmp\codex\astrcontinuum\temp'
+$env:TEMP='<task-temp-root>\temp'
 $env:TMP=$env:TEMP
 $env:TMPDIR=$env:TEMP
 uv run --extra dev pytest tests/contracts/test_capsule_contract.py -q
@@ -129,7 +129,7 @@ syntax error is not an acceptable RED.
 Store the complete output under:
 
 ```text
-D:\bun\tmp\codex\astrcontinuum\evidence\V1-101\capsule-contract-red.txt
+<task-temp-root>\evidence\V1-101\capsule-contract-red.txt
 ```
 
 Do not edit the expected assertions after observing failures unless the test itself is
@@ -369,7 +369,7 @@ uv run --extra dev pytest tests/contracts/test_persistence_contract.py -q
 
 Expected: failures identify the missing ADR, tables, savepoint language, and test matrix
 rows. Record the output as
-`D:\bun\tmp\codex\astrcontinuum\evidence\V1-101\persistence-contract-red.txt`.
+`<task-temp-root>\evidence\V1-101\persistence-contract-red.txt`.
 
 - [ ] **Step 3: Commit only the RED test**
 
@@ -509,7 +509,7 @@ Expected: all existing eight tests plus the seven new contract tests pass.
 - [ ] **Step 4: Validate the work package**
 
 ```powershell
-uv run --extra dev python "C:\Users\pidan\.codex\plugins\cache\pidan-local-plugins\2718lab-devkit\0.2.0+codex.20260725181051\skills\work-methodology\scripts\validate_work_package.py" docs/work-packages/astrcontinuum-v1
+uv run --extra dev python "<2718lab-devkit>\skills\work-methodology\scripts\validate_work_package.py" docs/work-packages/astrcontinuum-v1
 ```
 
 Expected: validator exits `0` with no missing section or line-budget error.

@@ -17,7 +17,7 @@ astrbot_plugin_astrcontinuum
 产品名：
 
 ```text
-AstrContinuum / 星续
+AstrContinuum
 ```
 
 使命：

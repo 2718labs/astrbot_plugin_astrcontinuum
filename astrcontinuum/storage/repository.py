@@ -6,7 +6,7 @@ import hashlib
 import json
 import sqlite3
 from collections.abc import Callable, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
 from typing import TYPE_CHECKING
@@ -27,7 +27,15 @@ from ..domain import (
     SourceHook,
     validate_permanent,
 )
+from .crypto import SecureCodec
+from .migrations import SQLiteMigrator
 from .sqlite import SQLiteConnectionFactory
+from .token_metrics import (
+    ArtifactKind,
+    CanonicalMetricObservation,
+    TokenMetric,
+    TokenMetricStore,
+)
 
 if TYPE_CHECKING:
     from ..reorganization import ReorganizationRecord
@@ -61,6 +69,7 @@ _ALLOWED_WORKER_TRANSITIONS = {
     CompactionJobState.AUDITING: frozenset({CompactionJobState.READY_TO_COMMIT}),
     CompactionJobState.READY_TO_COMMIT: frozenset(),
 }
+_MAX_METRIC_BACKFILL_BATCH = 1024
 
 
 class RepositoryError(RuntimeError):
@@ -149,6 +158,17 @@ class PublishResult:
     pointer_version: int
 
 
+@dataclass(frozen=True, slots=True)
+class MetricBackfillArtifact:
+    """One authenticated artifact text held only for bounded in-process counting."""
+
+    artifact_kind: ArtifactKind
+    artifact_id: str
+    tokenizer_profile_id: str
+    sort_key: tuple[int, int, int, str]
+    text: str = field(repr=False)
+
+
 class _PublishConflict(Exception):
     pass
 
@@ -207,9 +227,18 @@ class SQLiteRepository:
         self,
         factory: SQLiteConnectionFactory,
         *,
+        codec: SecureCodec,
         fault_injector: FaultInjector | None = None,
     ) -> None:
+        if not isinstance(codec, SecureCodec):
+            raise TypeError("codec must be a SecureCodec")
+        # Storage security owns keyed v2.  Once that immutable step has
+        # completed, apply the non-keyed v3 ledger extension as the next plan
+        # prefix before any repository transaction can reference it.
+        SQLiteMigrator(factory).migrate()
         self._factory = factory
+        self._codec = codec
+        self._metric_store = TokenMetricStore(codec)
         self._fault_injector = fault_injector
 
     @property
@@ -217,6 +246,33 @@ class SQLiteRepository:
         """Return the connection factory owned by this repository."""
 
         return self._factory
+
+    @property
+    def key_id(self) -> str:
+        """Return the non-secret identifier of the repository codec."""
+
+        return self._codec.key_id
+
+    def _session_key_from_storage(
+        self,
+        session_key_hash: str,
+        sentinel_json: str,
+    ) -> SessionKey:
+        canonical = self._codec.decrypt_object_json(
+            "sessions",
+            "canonical_session_key_json",
+            session_key_hash,
+            sentinel_json,
+        )
+        try:
+            session_key = SessionKey.model_validate_json(canonical)
+        except ValueError:
+            raise RepositoryInvariantError("durable SessionKey cannot be reconstructed") from None
+        if session_key.session_key_hash != session_key_hash:
+            raise RepositoryInvariantError(
+                "durable SessionKey hash does not match canonical identity"
+            )
+        return session_key
 
     def capture_user_event(
         self,
@@ -226,6 +282,7 @@ class SQLiteRepository:
         content: str,
         idempotency_key: str,
         token_count: int,
+        canonical: CanonicalMetricObservation,
         created_at: datetime,
     ) -> EventEnvelope:
         """Run ``TX_CAPTURE_USER_EVENT``."""
@@ -237,6 +294,7 @@ class SQLiteRepository:
             content=content,
             idempotency_key=idempotency_key,
             token_count=token_count,
+            canonical=canonical,
             created_at=created_at,
         )
 
@@ -248,6 +306,7 @@ class SQLiteRepository:
         content: str,
         idempotency_key: str,
         token_count: int,
+        canonical: CanonicalMetricObservation,
         created_at: datetime,
     ) -> EventEnvelope:
         """Run ``TX_CAPTURE_ASSISTANT_EVENT``."""
@@ -259,6 +318,7 @@ class SQLiteRepository:
             content=content,
             idempotency_key=idempotency_key,
             token_count=token_count,
+            canonical=canonical,
             created_at=created_at,
         )
 
@@ -271,6 +331,7 @@ class SQLiteRepository:
         content: str,
         idempotency_key: str,
         token_count: int,
+        canonical: CanonicalMetricObservation,
         created_at: datetime,
     ) -> EventEnvelope:
         """Run ``TX_CAPTURE_TOOL_EVENT`` for a call or result."""
@@ -284,6 +345,7 @@ class SQLiteRepository:
             content=content,
             idempotency_key=idempotency_key,
             token_count=token_count,
+            canonical=canonical,
             created_at=created_at,
         )
 
@@ -387,19 +449,44 @@ class SQLiteRepository:
         lease_epoch: int,
         now: datetime,
     ) -> RequestView:
-        """Read the immutable compaction input frozen by one live Job lease."""
+        """Compatibility spelling retained for the fenced v0.3 worker."""
+
+        return self.read_compaction_view(
+            job_id=job_id,
+            owner=owner,
+            lease_epoch=lease_epoch,
+            now=now,
+        )
+
+    def read_compaction_view(
+        self,
+        *,
+        job_id: str,
+        owner: str,
+        lease_epoch: int,
+        now: datetime,
+    ) -> RequestView:
+        """Read the exact base and Delta frozen by one live compaction lease."""
 
         now_text = _normalize_datetime(now)
         with self._factory.connection(read_only=True) as connection:
             connection.execute("BEGIN")
             try:
-                self._require_live_fence(
+                row = self._require_live_fence(
                     connection,
                     job_id=job_id,
                     owner=owner,
                     lease_epoch=lease_epoch,
                     now=now_text,
                 )
+                state = CompactionJobState(row["state"])
+                if state not in {
+                    CompactionJobState.COMPILING,
+                    CompactionJobState.AUDITING,
+                }:
+                    raise JobTransitionError(
+                        "compaction input requires a COMPILING or AUDITING Job"
+                    )
                 job = self._job_by_id(connection, job_id)
                 if job.base_snapshot_id is None:
                     snapshot = None
@@ -413,15 +500,10 @@ class SQLiteRepository:
                     snapshot, memberships = self._snapshot_bundle_by_id(
                         connection,
                         job.base_snapshot_id,
+                        session_key=job.session_key,
                     )
-                    if snapshot.session_key != job.session_key:
-                        raise SessionIdentityConflict(
-                            "Job base Snapshot belongs to a different durable session"
-                        )
                     if snapshot.state != SnapshotState.COMMITTED:
-                        raise RepositoryInvariantError(
-                            "Job base Snapshot is not committed"
-                        )
+                        raise RepositoryInvariantError("Job base Snapshot is not committed")
                     covered_event_end = snapshot.covered_event_end
 
                 if covered_event_end > job.target_high_water_mark:
@@ -457,6 +539,308 @@ class SQLiteRepository:
                 connection.commit()
                 return view
 
+    def read_metric_backfill_batch(
+        self,
+        session_key: SessionKey,
+        *,
+        profile_id: str,
+        limit: int,
+    ) -> tuple[MetricBackfillArtifact, ...]:
+        """Read one stable bounded batch of authenticated texts without holding a write lock."""
+
+        if not isinstance(session_key, SessionKey):
+            raise TypeError("session_key must be a SessionKey")
+        if not isinstance(profile_id, str) or not profile_id.strip():
+            raise ValueError("profile_id must be non-empty")
+        if (
+            isinstance(limit, bool)
+            or not isinstance(limit, int)
+            or limit < 1
+            or limit > _MAX_METRIC_BACKFILL_BATCH
+        ):
+            raise ValueError("limit must be a bounded positive integer")
+
+        with self._factory.connection(read_only=True) as connection:
+            connection.execute("BEGIN")
+            try:
+                self._require_session_identity(connection, session_key)
+                rows = connection.execute(
+                    """
+                    WITH missing AS (
+                        SELECT
+                            0 AS kind_rank,
+                            event.sequence AS sort_major,
+                            0 AS sort_minor,
+                            'EVENT' AS artifact_kind,
+                            event.event_id AS artifact_id
+                        FROM journal_events AS event
+                        WHERE event.session_key_hash = ?
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM token_metrics AS metric
+                              WHERE metric.artifact_kind = 'EVENT'
+                                AND metric.artifact_id = event.event_id
+                                AND metric.tokenizer_profile_id = ?
+                          )
+                        UNION ALL
+                        SELECT
+                            1,
+                            capsule.covered_event_end,
+                            capsule.covered_event_start,
+                            'CAPSULE',
+                            capsule.capsule_id
+                        FROM capsules AS capsule
+                        WHERE capsule.session_key_hash = ?
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM token_metrics AS metric
+                              WHERE metric.artifact_kind = 'CAPSULE'
+                                AND metric.artifact_id = capsule.capsule_id
+                                AND metric.tokenizer_profile_id = ?
+                          )
+                        UNION ALL
+                        SELECT
+                            2,
+                            snapshot.covered_event_end,
+                            snapshot.source_high_water_mark,
+                            'SNAPSHOT',
+                            snapshot.snapshot_id
+                        FROM snapshots AS snapshot
+                        WHERE snapshot.session_key_hash = ?
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM token_metrics AS metric
+                              WHERE metric.artifact_kind = 'SNAPSHOT'
+                                AND metric.artifact_id = snapshot.snapshot_id
+                                AND metric.tokenizer_profile_id = ?
+                          )
+                    )
+                    SELECT kind_rank, sort_major, sort_minor, artifact_kind, artifact_id
+                    FROM missing
+                    ORDER BY kind_rank, sort_major, sort_minor, artifact_id
+                    LIMIT ?
+                    """,
+                    (
+                        session_key.session_key_hash,
+                        profile_id,
+                        session_key.session_key_hash,
+                        profile_id,
+                        session_key.session_key_hash,
+                        profile_id,
+                        limit,
+                    ),
+                ).fetchall()
+                batch = tuple(
+                    self._metric_backfill_artifact(
+                        connection,
+                        session_key=session_key,
+                        profile_id=profile_id,
+                        row=row,
+                    )
+                    for row in rows
+                )
+            except BaseException:
+                connection.rollback()
+                raise
+            else:
+                connection.commit()
+                return batch
+
+    def write_metric_backfill_batch(
+        self,
+        session_key: SessionKey,
+        metrics: Sequence[TokenMetric],
+        *,
+        now: datetime,
+    ) -> tuple[TokenMetric, ...]:
+        """CAS-write one counted batch after rechecking each artifact's session ownership."""
+
+        if not isinstance(session_key, SessionKey):
+            raise TypeError("session_key must be a SessionKey")
+        metric_tuple = tuple(metrics)
+        if len(metric_tuple) > _MAX_METRIC_BACKFILL_BATCH:
+            raise ValueError("metrics exceed the bounded backfill batch limit")
+        if any(not isinstance(metric, TokenMetric) for metric in metric_tuple):
+            raise TypeError("metrics must contain only TokenMetric values")
+        normalized_now = _normalize_datetime(now)
+
+        with self._factory.transaction(immediate=True) as connection:
+            self._require_session_identity(connection, session_key)
+            for metric in metric_tuple:
+                ownership_query = {
+                    ArtifactKind.EVENT: (
+                        "SELECT session_key_hash FROM journal_events WHERE event_id = ?"
+                    ),
+                    ArtifactKind.CAPSULE: (
+                        "SELECT session_key_hash FROM capsules WHERE capsule_id = ?"
+                    ),
+                    ArtifactKind.SNAPSHOT: (
+                        "SELECT session_key_hash FROM snapshots WHERE snapshot_id = ?"
+                    ),
+                }[metric.artifact_kind]
+                owner = connection.execute(
+                    ownership_query,
+                    (metric.artifact_id,),
+                ).fetchone()
+                if owner is None or owner["session_key_hash"] != session_key.session_key_hash:
+                    raise RepositoryInvariantError(
+                        "metric backfill artifact does not belong to the requested session"
+                    )
+                self._metric_store.put_in_transaction(
+                    connection,
+                    metric,
+                    created_at=_parse_datetime(normalized_now),
+                )
+                connection.execute(
+                    """
+                    DELETE FROM token_metric_backfill_intents
+                    WHERE artifact_kind = ?
+                      AND artifact_id = ?
+                      AND tokenizer_profile_id = ?
+                    """,
+                    (
+                        metric.artifact_kind.value,
+                        metric.artifact_id,
+                        metric.tokenizer_profile_id,
+                    ),
+                )
+                self._inject("backfill.after_metric")
+        return metric_tuple
+
+    def read_event_token_counts(
+        self,
+        session_key: SessionKey,
+        event_ids: Sequence[str],
+        *,
+        profile_id: str,
+    ) -> dict[str, int]:
+        """Return the authenticated subset of one session's requested Event metrics."""
+
+        if not isinstance(session_key, SessionKey):
+            raise TypeError("session_key must be a SessionKey")
+        if not isinstance(profile_id, str) or not profile_id.strip():
+            raise ValueError("profile_id must be non-empty")
+        requested_ids = tuple(event_ids)
+        if any(not isinstance(event_id, str) or not event_id.strip() for event_id in requested_ids):
+            raise ValueError("event_ids must contain non-empty strings")
+        if len(set(requested_ids)) != len(requested_ids):
+            raise ValueError("event_ids must be unique")
+
+        with self._factory.connection(read_only=True) as connection:
+            connection.execute("BEGIN")
+            try:
+                self._require_session_identity(connection, session_key)
+                counts: dict[str, int] = {}
+                for event_id in requested_ids:
+                    owner = connection.execute(
+                        """
+                        SELECT session_key_hash
+                        FROM journal_events
+                        WHERE event_id = ?
+                        """,
+                        (event_id,),
+                    ).fetchone()
+                    if owner is None or owner["session_key_hash"] != session_key.session_key_hash:
+                        raise RepositoryInvariantError(
+                            "requested Event metric does not belong to the session"
+                        )
+                    metric = self._metric_store.get_in_transaction(
+                        connection,
+                        artifact_kind=ArtifactKind.EVENT,
+                        artifact_id=event_id,
+                        tokenizer_profile_id=profile_id,
+                    )
+                    if metric is not None:
+                        counts[event_id] = metric.token_count
+            except BaseException:
+                connection.rollback()
+                raise
+            else:
+                connection.commit()
+                return counts
+
+    def _require_session_identity(
+        self,
+        connection: sqlite3.Connection,
+        session_key: SessionKey,
+    ) -> None:
+        row = connection.execute(
+            """
+            SELECT canonical_session_key_json
+            FROM sessions
+            WHERE session_key_hash = ?
+            """,
+            (session_key.session_key_hash,),
+        ).fetchone()
+        if row is None:
+            raise SessionIdentityConflict("session is missing from durable storage")
+        stored = self._session_key_from_storage(
+            session_key.session_key_hash,
+            str(row["canonical_session_key_json"]),
+        )
+        if stored != session_key:
+            raise SessionIdentityConflict("session hash resolves to a different SessionKey")
+
+    def _metric_backfill_artifact(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        session_key: SessionKey,
+        profile_id: str,
+        row: sqlite3.Row,
+    ) -> MetricBackfillArtifact:
+        artifact_kind = ArtifactKind(str(row["artifact_kind"]))
+        artifact_id = str(row["artifact_id"])
+        sort_key = (
+            int(row["kind_rank"]),
+            int(row["sort_major"]),
+            int(row["sort_minor"]),
+            artifact_id,
+        )
+        if artifact_kind is ArtifactKind.EVENT:
+            event_row = connection.execute(
+                """
+                SELECT *
+                FROM journal_events
+                WHERE event_id = ?
+                  AND session_key_hash = ?
+                """,
+                (artifact_id, session_key.session_key_hash),
+            ).fetchone()
+            if event_row is None:
+                raise RepositoryInvariantError("metric backfill Event disappeared")
+            text = self._event_from_row(event_row, session_key=session_key).content
+        elif artifact_kind is ArtifactKind.CAPSULE:
+            capsule_row = connection.execute(
+                """
+                SELECT *
+                FROM capsules
+                WHERE capsule_id = ?
+                  AND session_key_hash = ?
+                """,
+                (artifact_id, session_key.session_key_hash),
+            ).fetchone()
+            if capsule_row is None:
+                raise RepositoryInvariantError("metric backfill Capsule disappeared")
+            capsule = self._capsule_from_row(capsule_row, session_key=session_key)
+            from ..compaction.rendering import render_capsule
+
+            text = render_capsule(capsule)
+        else:
+            snapshot, _ = self._snapshot_bundle_by_id(
+                connection,
+                artifact_id,
+                session_key=session_key,
+            )
+            text = snapshot.rendered_context
+        return MetricBackfillArtifact(
+            artifact_kind=artifact_kind,
+            artifact_id=artifact_id,
+            tokenizer_profile_id=profile_id,
+            sort_key=sort_key,
+            text=text,
+        )
+
     def raise_compaction_intent(
         self,
         *,
@@ -486,7 +870,11 @@ class SQLiteRepository:
                 raise RepositoryInvariantError(
                     "compaction intent requires a durable session with Journal events"
                 )
-            if session_row["canonical_session_key_json"] != session_key.canonical_json():
+            stored_session = self._session_key_from_storage(
+                session_key.session_key_hash,
+                str(session_row["canonical_session_key_json"]),
+            )
+            if stored_session != session_key:
                 raise SessionIdentityConflict(
                     "session hash does not resolve to the exact canonical SessionKey"
                 )
@@ -572,10 +960,10 @@ class SQLiteRepository:
                         now_text,
                     ),
                 )
-            except sqlite3.IntegrityError as error:
+            except sqlite3.IntegrityError:
                 raise RepositoryConflict(
                     "compaction Job identity conflicts with durable state"
-                ) from error
+                ) from None
             self._inject("intent.after_insert")
             return self._job_by_id(connection, job_id)
 
@@ -789,6 +1177,7 @@ class SQLiteRepository:
         error_code: str,
         error_message: str,
         retry_at: datetime | None,
+        preserve_attempt: bool = False,
     ) -> CompactionJobEnvelope:
         """Run ``TX_FAIL_JOB`` under the worker's live fence."""
 
@@ -799,6 +1188,19 @@ class SQLiteRepository:
             character in error_message for character in ("\r", "\n", "\x00")
         ):
             raise ValueError("error_message must be one bounded redacted line")
+        if type(preserve_attempt) is not bool:
+            raise ValueError("preserve_attempt must be a boolean")
+        if preserve_attempt and (
+            retry_at is None
+            or error_stage != "COMPILING"
+            or error_code
+            not in {
+                "EXTRACTIVE_PROVIDER_UNAVAILABLE",
+                "TOKEN_METRIC_MISSING",
+                "TOKEN_METRIC_UNAVAILABLE",
+            }
+        ):
+            raise ValueError("attempt preservation is limited to retryable transient deferrals")
 
         now_text = _normalize_datetime(now)
         if retry_at is None:
@@ -825,6 +1227,10 @@ class SQLiteRepository:
                     candidate_snapshot_id = NULL,
                     lease_owner = NULL,
                     lease_expires_at = NULL,
+                    attempt_count = CASE
+                        WHEN ? THEN MAX(attempt_count - 1, 0)
+                        ELSE attempt_count
+                    END,
                     next_retry_at = ?,
                     error_stage = ?,
                     error_code = ?,
@@ -838,6 +1244,7 @@ class SQLiteRepository:
                 """,
                 (
                     next_state.value,
+                    preserve_attempt,
                     retry_text,
                     error_stage,
                     error_code,
@@ -915,6 +1322,7 @@ class SQLiteRepository:
         lease_epoch: int,
         candidate_snapshot: SnapshotEnvelope,
         memberships: Sequence[SnapshotCapsuleMembership],
+        canonical_metrics: Sequence[TokenMetric] | None = None,
         reorganization_records: Sequence[ReorganizationRecord] = (),
         token_ceiling: int,
         now: datetime,
@@ -926,6 +1334,7 @@ class SQLiteRepository:
         now_text = _normalize_datetime(now)
         membership_tuple = tuple(memberships)
         record_tuple = tuple(reorganization_records)
+        canonical_metric_tuple = tuple(canonical_metrics) if canonical_metrics is not None else None
 
         with self._factory.transaction(immediate=True) as connection:
             fence_row = self._require_live_fence(
@@ -959,6 +1368,12 @@ class SQLiteRepository:
                 raise RepositoryInvariantError(
                     "candidate reorganization records are invalid"
                 ) from error
+            if canonical_metric_tuple is not None:
+                self._validate_candidate_metrics(
+                    candidate_snapshot,
+                    membership_tuple,
+                    canonical_metric_tuple,
+                )
 
             if job.base_snapshot_id is None:
                 previous_snapshot = None
@@ -967,6 +1382,7 @@ class SQLiteRepository:
                 previous_snapshot, previous_memberships = self._snapshot_bundle_by_id(
                     connection,
                     job.base_snapshot_id,
+                    session_key=job.session_key,
                 )
             source_events = self._events_between(
                 connection,
@@ -1072,6 +1488,27 @@ class SQLiteRepository:
                         ),
                     )
                     self._inject("publish.after_ledger")
+                if canonical_metric_tuple is not None:
+                    for metric in canonical_metric_tuple:
+                        self._metric_store.put_in_transaction(
+                            connection,
+                            metric,
+                            created_at=_parse_datetime(now_text),
+                        )
+                        connection.execute(
+                            """
+                            DELETE FROM token_metric_backfill_intents
+                            WHERE artifact_kind = ?
+                              AND artifact_id = ?
+                              AND tokenizer_profile_id = ?
+                            """,
+                            (
+                                metric.artifact_kind.value,
+                                metric.artifact_id,
+                                metric.tokenizer_profile_id,
+                            ),
+                        )
+                        self._inject("publish.after_metric")
 
             if not conflict:
                 conflict = not self._cas_active_pointer(
@@ -1162,7 +1599,11 @@ class SQLiteRepository:
                 high_water_mark=0,
                 delta=(),
             )
-        if session_row["canonical_session_key_json"] != session_key.canonical_json():
+        stored_session = self._session_key_from_storage(
+            session_key.session_key_hash,
+            str(session_row["canonical_session_key_json"]),
+        )
+        if stored_session != session_key:
             raise SessionIdentityConflict(
                 "session hash does not resolve to the exact canonical SessionKey"
             )
@@ -1210,16 +1651,12 @@ class SQLiteRepository:
 
         rows = connection.execute(
             """
-            SELECT
-                event.*,
-                session.canonical_session_key_json
-            FROM journal_events AS event
-            JOIN sessions AS session
-              ON session.session_key_hash = event.session_key_hash
-            WHERE event.session_key_hash = ?
-              AND event.sequence > ?
-              AND event.sequence <= ?
-            ORDER BY event.sequence
+            SELECT *
+            FROM journal_events
+            WHERE session_key_hash = ?
+              AND sequence > ?
+              AND sequence <= ?
+            ORDER BY sequence
             """,
             (
                 session_key.session_key_hash,
@@ -1227,7 +1664,7 @@ class SQLiteRepository:
                 high_water_mark,
             ),
         ).fetchall()
-        delta = tuple(self._event_from_row(row) for row in rows)
+        delta = tuple(self._event_from_row(row, session_key=session_key) for row in rows)
         expected_sequences = tuple(range(covered_event_end + 1, high_water_mark + 1))
         if tuple(event.sequence for event in delta) != expected_sequences:
             raise RepositoryInvariantError(
@@ -1253,8 +1690,11 @@ class SQLiteRepository:
         content: str,
         idempotency_key: str,
         token_count: int,
+        canonical: CanonicalMetricObservation,
         created_at: datetime,
     ) -> EventEnvelope:
+        if not isinstance(canonical, CanonicalMetricObservation):
+            raise TypeError("canonical must be a CanonicalMetricObservation")
         normalized_created_at = _normalize_datetime(created_at)
         requested = EventEnvelope.create(
             event_id=event_id,
@@ -1276,7 +1716,7 @@ class SQLiteRepository:
             self._inject("capture.after_session")
             existing = self._find_idempotent_event(
                 connection,
-                session_key_hash=session_key.session_key_hash,
+                session_key=session_key,
                 source_hook=requested.source_hook,
                 idempotency_key=idempotency_key,
             )
@@ -1285,6 +1725,14 @@ class SQLiteRepository:
                     raise IdempotencyConflict(
                         "event idempotency tuple was reused with different immutable data"
                     )
+                self._record_canonical_observation(
+                    connection,
+                    session_key_hash=session_key.session_key_hash,
+                    artifact_id=existing.event_id,
+                    canonical=canonical,
+                    normalized_created_at=normalized_created_at,
+                )
+                self._inject("capture.after_metric")
                 return existing
 
             row = connection.execute(
@@ -1337,7 +1785,7 @@ class SQLiteRepository:
                         content,
                         source_hook,
                         idempotency_key,
-                        token_count,
+                        token_count_envelope,
                         created_at
                     ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
                     """,
@@ -1347,19 +1795,101 @@ class SQLiteRepository:
                         event.sequence,
                         event.event_type.value,
                         event.role.value,
-                        event.content,
+                        self._codec.encrypt_text(
+                            "journal_events",
+                            "content",
+                            event.event_id,
+                            event.content,
+                        ),
                         event.source_hook.value,
                         event.idempotency_key,
-                        event.token_count,
+                        self._codec.encrypt_non_negative_int(
+                            "journal_events",
+                            "token_count",
+                            event.event_id,
+                            event.token_count,
+                        ),
                         normalized_created_at,
                     ),
                 )
-            except sqlite3.IntegrityError as error:
+            except sqlite3.IntegrityError:
                 raise EventIdentityConflict(
                     "event identity or sequence conflicts with durable state"
-                ) from error
+                ) from None
             self._inject("capture.after_insert")
+            self._record_canonical_observation(
+                connection,
+                session_key_hash=session_key.session_key_hash,
+                artifact_id=event.event_id,
+                canonical=canonical,
+                normalized_created_at=normalized_created_at,
+            )
+            self._inject("capture.after_metric")
             return event
+
+    def _record_canonical_observation(
+        self,
+        connection: sqlite3.Connection,
+        *,
+        session_key_hash: str,
+        artifact_id: str,
+        canonical: CanonicalMetricObservation,
+        normalized_created_at: str,
+    ) -> None:
+        if canonical.token_count is not None:
+            self._metric_store.put_in_transaction(
+                connection,
+                TokenMetric(
+                    artifact_kind=ArtifactKind.EVENT,
+                    artifact_id=artifact_id,
+                    tokenizer_profile_id=canonical.tokenizer_profile_id,
+                    token_count=canonical.token_count,
+                ),
+                created_at=_parse_datetime(normalized_created_at),
+            )
+            connection.execute(
+                """
+                DELETE FROM token_metric_backfill_intents
+                WHERE artifact_kind = ?
+                  AND artifact_id = ?
+                  AND tokenizer_profile_id = ?
+                """,
+                (
+                    ArtifactKind.EVENT.value,
+                    artifact_id,
+                    canonical.tokenizer_profile_id,
+                ),
+            )
+            return
+
+        existing = self._metric_store.get_in_transaction(
+            connection,
+            artifact_kind=ArtifactKind.EVENT,
+            artifact_id=artifact_id,
+            tokenizer_profile_id=canonical.tokenizer_profile_id,
+        )
+        if existing is not None:
+            return
+        connection.execute(
+            """
+            INSERT INTO token_metric_backfill_intents (
+                session_key_hash,
+                artifact_kind,
+                artifact_id,
+                tokenizer_profile_id,
+                created_at
+            ) VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT (artifact_kind, artifact_id, tokenizer_profile_id)
+            DO NOTHING
+            """,
+            (
+                session_key_hash,
+                ArtifactKind.EVENT.value,
+                artifact_id,
+                canonical.tokenizer_profile_id,
+                normalized_created_at,
+            ),
+        )
 
     def _ensure_session(
         self,
@@ -1368,6 +1898,36 @@ class SQLiteRepository:
         session_key: SessionKey,
         timestamp: str,
     ) -> None:
+        record_key = session_key.session_key_hash
+        existing = connection.execute(
+            """
+            SELECT canonical_session_key_json
+            FROM sessions
+            WHERE session_key_hash = ?
+            """,
+            (record_key,),
+        ).fetchone()
+        if existing is not None:
+            stored_session = self._session_key_from_storage(
+                record_key,
+                str(existing["canonical_session_key_json"]),
+            )
+            if stored_session != session_key:
+                raise SessionIdentityConflict(
+                    "session hash does not resolve to the exact canonical SessionKey"
+                )
+            return
+
+        def encrypt_identity(column: str, value: str | None) -> str | None:
+            if value is None:
+                return None
+            return self._codec.encrypt_text(
+                "sessions",
+                column,
+                record_key,
+                value,
+            )
+
         try:
             connection.execute(
                 """
@@ -1388,23 +1948,34 @@ class SQLiteRepository:
                 ON CONFLICT(session_key_hash) DO NOTHING
                 """,
                 (
-                    session_key.session_key_hash,
-                    session_key.canonical_json(),
-                    session_key.platform_instance_id,
-                    session_key.message_type,
-                    session_key.session_id,
-                    session_key.group_id,
-                    session_key.user_id,
-                    session_key.conversation_id,
-                    session_key.persona_id,
+                    record_key,
+                    self._codec.encrypt_object_json(
+                        "sessions",
+                        "canonical_session_key_json",
+                        record_key,
+                        session_key.canonical_json(),
+                    ),
+                    encrypt_identity(
+                        "platform_instance_id",
+                        session_key.platform_instance_id,
+                    ),
+                    encrypt_identity("message_type", session_key.message_type),
+                    encrypt_identity("session_id", session_key.session_id),
+                    encrypt_identity("group_id", session_key.group_id),
+                    encrypt_identity("user_id", session_key.user_id),
+                    encrypt_identity(
+                        "conversation_id",
+                        session_key.conversation_id,
+                    ),
+                    encrypt_identity("persona_id", session_key.persona_id),
                     timestamp,
                     timestamp,
                 ),
             )
-        except sqlite3.IntegrityError as error:
+        except sqlite3.IntegrityError:
             raise SessionIdentityConflict(
                 "canonical SessionKey conflicts with durable session identity"
-            ) from error
+            ) from None
 
         row = connection.execute(
             """
@@ -1412,9 +1983,17 @@ class SQLiteRepository:
             FROM sessions
             WHERE session_key_hash = ?
             """,
-            (session_key.session_key_hash,),
+            (record_key,),
         ).fetchone()
-        if row is None or str(row["canonical_session_key_json"]) != session_key.canonical_json():
+        if row is None:
+            raise SessionIdentityConflict(
+                "session hash does not resolve to the exact canonical SessionKey"
+            )
+        stored_session = self._session_key_from_storage(
+            record_key,
+            str(row["canonical_session_key_json"]),
+        )
+        if stored_session != session_key:
             raise SessionIdentityConflict(
                 "session hash does not resolve to the exact canonical SessionKey"
             )
@@ -1450,8 +2029,8 @@ class SQLiteRepository:
             int(row["covered_event_end"]),
         )
 
-    @staticmethod
     def _job_by_id(
+        self,
         connection: sqlite3.Connection,
         job_id: str,
     ) -> CompactionJobEnvelope:
@@ -1469,12 +2048,14 @@ class SQLiteRepository:
         ).fetchone()
         if row is None:
             raise RepositoryInvariantError("durable compaction Job is missing")
-        return SQLiteRepository._job_from_row(row)
+        return self._job_from_row(row)
 
-    @staticmethod
-    def _job_from_row(row: sqlite3.Row) -> CompactionJobEnvelope:
+    def _job_from_row(self, row: sqlite3.Row) -> CompactionJobEnvelope:
+        session_key = self._session_key_from_storage(
+            str(row["session_key_hash"]),
+            str(row["canonical_session_key_json"]),
+        )
         try:
-            session_key = SessionKey.model_validate_json(row["canonical_session_key_json"])
             job = CompactionJobEnvelope(
                 job_id=row["job_id"],
                 session_key=session_key,
@@ -1508,10 +2089,10 @@ class SQLiteRepository:
                     else None
                 ),
             )
-        except (TypeError, ValueError) as error:
+        except (TypeError, ValueError):
             raise RepositoryInvariantError(
                 "compaction Job row does not form a canonical envelope"
-            ) from error
+            ) from None
         if row["session_key_hash"] != session_key.session_key_hash:
             raise RepositoryInvariantError(
                 "compaction Job physical session identity does not round-trip"
@@ -1568,9 +2149,34 @@ class SQLiteRepository:
             )
 
     @staticmethod
+    def _validate_candidate_metrics(
+        snapshot: SnapshotEnvelope,
+        memberships: tuple[SnapshotCapsuleMembership, ...],
+        metrics: tuple[TokenMetric, ...],
+    ) -> None:
+        if any(not isinstance(metric, TokenMetric) for metric in metrics):
+            raise TypeError("canonical_metrics must contain only TokenMetric values")
+        expected_artifacts = {
+            *((ArtifactKind.CAPSULE, membership.capsule_id) for membership in memberships),
+            (ArtifactKind.SNAPSHOT, snapshot.snapshot_id),
+        }
+        actual_artifacts = {(metric.artifact_kind, metric.artifact_id) for metric in metrics}
+        profile_ids = {metric.tokenizer_profile_id for metric in metrics}
+        if (
+            len(metrics) != len(expected_artifacts)
+            or actual_artifacts != expected_artifacts
+            or len(profile_ids) != 1
+        ):
+            raise RepositoryInvariantError(
+                "publication requires one canonical metric for every candidate artifact"
+            )
+
     def _snapshot_bundle_by_id(
+        self,
         connection: sqlite3.Connection,
         snapshot_id: str,
+        *,
+        session_key: SessionKey,
     ) -> tuple[SnapshotEnvelope, tuple[SnapshotCapsuleMembership, ...]]:
         row = connection.execute(
             """
@@ -1586,25 +2192,27 @@ class SQLiteRepository:
         ).fetchone()
         if row is None:
             raise RepositoryInvariantError("Job base Snapshot is missing")
-        try:
-            session_key = SessionKey.model_validate_json(row["canonical_session_key_json"])
-        except ValueError as error:
-            raise RepositoryInvariantError("Snapshot SessionKey cannot be reconstructed") from error
-        memberships = SQLiteRepository._memberships_for_snapshot(
+        stored_session_key = self._session_key_from_storage(
+            str(row["session_key_hash"]),
+            str(row["canonical_session_key_json"]),
+        )
+        if stored_session_key != session_key:
+            raise RepositoryInvariantError("Snapshot belongs to a different durable session")
+        memberships = self._memberships_for_snapshot(
             connection,
             snapshot_id=snapshot_id,
             session_key=session_key,
         )
-        snapshot = SQLiteRepository._snapshot_from_row(
+        snapshot = self._snapshot_from_row(
             row,
             session_key=session_key,
             capsule_ids=tuple(item.capsule_id for item in memberships),
         )
-        SQLiteRepository._validate_snapshot_memberships(snapshot, memberships)
+        self._validate_snapshot_memberships(snapshot, memberships)
         return snapshot, memberships
 
-    @staticmethod
     def _active_snapshot_bundle(
+        self,
         connection: sqlite3.Connection,
         session_key: SessionKey,
     ) -> tuple[
@@ -1622,16 +2230,17 @@ class SQLiteRepository:
         ).fetchone()
         if row is None:
             raise RepositoryInvariantError("publish conflict has no durable active winner")
-        snapshot, memberships = SQLiteRepository._snapshot_bundle_by_id(
+        snapshot, memberships = self._snapshot_bundle_by_id(
             connection,
             str(row["snapshot_id"]),
+            session_key=session_key,
         )
         if snapshot.session_key != session_key:
             raise RepositoryInvariantError("publish winner belongs to another durable session")
         return snapshot, int(row["pointer_version"]), memberships
 
-    @staticmethod
     def _events_between(
+        self,
         connection: sqlite3.Connection,
         *,
         session_key: SessionKey,
@@ -1640,12 +2249,8 @@ class SQLiteRepository:
     ) -> tuple[EventEnvelope, ...]:
         rows = connection.execute(
             """
-            SELECT
-                event.*,
-                session.canonical_session_key_json
+            SELECT event.*
             FROM journal_events AS event
-            JOIN sessions AS session
-              ON session.session_key_hash = event.session_key_hash
             WHERE event.session_key_hash = ?
               AND event.sequence > ?
               AND event.sequence <= ?
@@ -1657,10 +2262,10 @@ class SQLiteRepository:
                 end_inclusive,
             ),
         ).fetchall()
-        return tuple(SQLiteRepository._event_from_row(row) for row in rows)
+        return tuple(self._event_from_row(row, session_key=session_key) for row in rows)
 
-    @staticmethod
     def _insert_or_verify_capsule(
+        self,
         connection: sqlite3.Connection,
         capsule: ContextCapsuleEnvelope,
     ) -> None:
@@ -1674,13 +2279,25 @@ class SQLiteRepository:
             (capsule.capsule_id,),
         ).fetchone()
         if row is not None:
+            stored_canonical_json = self._codec.decrypt_object_json(
+                "capsules",
+                "canonical_capsule_json",
+                capsule.capsule_id,
+                str(row["canonical_capsule_json"]),
+            )
+            stored_token_cost = self._codec.decrypt_non_negative_int(
+                "capsules",
+                "token_cost",
+                capsule.capsule_id,
+                row["token_cost_envelope"],
+            )
             if (
                 row["session_key_hash"] != capsule.session_key.session_key_hash
                 or row["level"] != capsule.level.value
                 or int(row["covered_event_start"]) != capsule.covered_event_start
                 or int(row["covered_event_end"]) != capsule.covered_event_end
-                or row["canonical_capsule_json"] != canonical_json
-                or int(row["token_cost"]) != capsule.token_cost
+                or stored_canonical_json != canonical_json
+                or stored_token_cost != capsule.token_cost
                 or float(row["source_coverage"]) != capsule.quality.source_coverage
                 or row["created_at"] != _normalize_datetime(capsule.created_at)
             ):
@@ -1698,7 +2315,7 @@ class SQLiteRepository:
                 covered_event_start,
                 covered_event_end,
                 canonical_capsule_json,
-                token_cost,
+                token_cost_envelope,
                 source_coverage,
                 created_at
             ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -1709,20 +2326,36 @@ class SQLiteRepository:
                 capsule.level.value,
                 capsule.covered_event_start,
                 capsule.covered_event_end,
-                canonical_json,
-                capsule.token_cost,
+                self._codec.encrypt_object_json(
+                    "capsules",
+                    "canonical_capsule_json",
+                    capsule.capsule_id,
+                    canonical_json,
+                ),
+                self._codec.encrypt_non_negative_int(
+                    "capsules",
+                    "token_cost",
+                    capsule.capsule_id,
+                    capsule.token_cost,
+                ),
                 capsule.quality.source_coverage,
                 _normalize_datetime(capsule.created_at),
             ),
         )
 
-    @staticmethod
     def _insert_committed_snapshot(
+        self,
         connection: sqlite3.Connection,
         snapshot: SnapshotEnvelope,
     ) -> None:
         if snapshot.committed_at is None:
             raise RepositoryInvariantError("committed Snapshot insert requires committed_at")
+        exact_anchor_ids_json = json.dumps(
+            list(snapshot.exact_anchor_ids),
+            ensure_ascii=False,
+            separators=(",", ":"),
+        )
+        audit_outcome_json = _canonical_model_json(snapshot.audit_outcome)
         connection.execute(
             """
             INSERT INTO snapshots (
@@ -1733,7 +2366,7 @@ class SQLiteRepository:
                 source_high_water_mark,
                 exact_anchor_ids_json,
                 rendered_context,
-                token_cost,
+                token_cost_envelope,
                 audit_outcome,
                 lifecycle_state,
                 created_at,
@@ -1746,14 +2379,30 @@ class SQLiteRepository:
                 snapshot.base_snapshot_id,
                 snapshot.covered_event_end,
                 snapshot.source_high_water_mark,
-                json.dumps(
-                    list(snapshot.exact_anchor_ids),
-                    ensure_ascii=False,
-                    separators=(",", ":"),
+                self._codec.encrypt_array_json(
+                    "snapshots",
+                    "exact_anchor_ids_json",
+                    snapshot.snapshot_id,
+                    exact_anchor_ids_json,
                 ),
-                snapshot.rendered_context,
-                snapshot.token_cost,
-                _canonical_model_json(snapshot.audit_outcome),
+                self._codec.encrypt_text(
+                    "snapshots",
+                    "rendered_context",
+                    snapshot.snapshot_id,
+                    snapshot.rendered_context,
+                ),
+                self._codec.encrypt_non_negative_int(
+                    "snapshots",
+                    "token_cost",
+                    snapshot.snapshot_id,
+                    snapshot.token_cost,
+                ),
+                self._codec.encrypt_object_json(
+                    "snapshots",
+                    "audit_outcome",
+                    snapshot.snapshot_id,
+                    audit_outcome_json,
+                ),
                 _normalize_datetime(snapshot.created_at),
                 _normalize_datetime(snapshot.committed_at),
             ),
@@ -1812,8 +2461,8 @@ class SQLiteRepository:
         )
         return cursor.rowcount == 1
 
-    @staticmethod
     def _finish_publish_job(
+        self,
         connection: sqlite3.Connection,
         *,
         job: CompactionJobEnvelope,
@@ -1852,10 +2501,10 @@ class SQLiteRepository:
         )
         if cursor.rowcount != 1:
             raise StaleLeaseError("publication lost its fenced terminal transition")
-        return SQLiteRepository._job_by_id(connection, job.job_id)
+        return self._job_by_id(connection, job.job_id)
 
-    @staticmethod
     def _preserve_follow_up(
+        self,
         connection: sqlite3.Connection,
         *,
         terminal_job: CompactionJobEnvelope,
@@ -1939,47 +2588,108 @@ class SQLiteRepository:
             ),
         )
 
-    @staticmethod
     def _find_idempotent_event(
+        self,
         connection: sqlite3.Connection,
         *,
-        session_key_hash: str,
+        session_key: SessionKey,
         source_hook: SourceHook,
         idempotency_key: str,
     ) -> EventEnvelope | None:
         row = connection.execute(
             """
-            SELECT
-                event.*,
-                session.canonical_session_key_json
+            SELECT event.*
             FROM journal_events AS event
-            JOIN sessions AS session
-              ON session.session_key_hash = event.session_key_hash
             WHERE event.session_key_hash = ?
               AND event.source_hook = ?
               AND event.idempotency_key = ?
             """,
-            (session_key_hash, source_hook.value, idempotency_key),
+            (
+                session_key.session_key_hash,
+                source_hook.value,
+                idempotency_key,
+            ),
         ).fetchone()
-        return SQLiteRepository._event_from_row(row) if row is not None else None
+        return self._event_from_row(row, session_key=session_key) if row is not None else None
 
-    @staticmethod
-    def _event_from_row(row: sqlite3.Row) -> EventEnvelope:
-        return EventEnvelope(
-            event_id=row["event_id"],
-            session_key=SessionKey.model_validate_json(row["canonical_session_key_json"]),
-            sequence=row["sequence"],
-            event_type=EventType(row["event_type"]),
-            role=EventRole(row["role"]),
-            content=row["content"],
-            source_hook=SourceHook(row["source_hook"]),
-            idempotency_key=row["idempotency_key"],
-            token_count=row["token_count"],
-            created_at=_parse_datetime(row["created_at"]),
+    def _event_from_row(
+        self,
+        row: sqlite3.Row,
+        *,
+        session_key: SessionKey,
+    ) -> EventEnvelope:
+        if row["session_key_hash"] != session_key.session_key_hash:
+            raise RepositoryInvariantError("Journal event belongs to a different durable session")
+        event_id = str(row["event_id"])
+        content = self._codec.decrypt_text(
+            "journal_events",
+            "content",
+            event_id,
+            str(row["content"]),
         )
+        token_count = self._codec.decrypt_non_negative_int(
+            "journal_events",
+            "token_count",
+            event_id,
+            row["token_count_envelope"],
+        )
+        try:
+            return EventEnvelope(
+                event_id=event_id,
+                session_key=session_key,
+                sequence=row["sequence"],
+                event_type=EventType(row["event_type"]),
+                role=EventRole(row["role"]),
+                content=content,
+                source_hook=SourceHook(row["source_hook"]),
+                idempotency_key=row["idempotency_key"],
+                token_count=token_count,
+                created_at=_parse_datetime(row["created_at"]),
+            )
+        except (TypeError, ValueError):
+            raise RepositoryInvariantError(
+                "Journal event row does not form a canonical envelope"
+            ) from None
 
-    @staticmethod
+    def _capsule_from_row(
+        self,
+        row: sqlite3.Row,
+        *,
+        session_key: SessionKey,
+    ) -> ContextCapsuleEnvelope:
+        capsule_id = str(row["capsule_id"])
+        canonical_capsule_json = self._codec.decrypt_object_json(
+            "capsules",
+            "canonical_capsule_json",
+            capsule_id,
+            str(row["canonical_capsule_json"]),
+        )
+        try:
+            capsule = ContextCapsuleEnvelope.model_validate_json(canonical_capsule_json)
+        except (TypeError, ValueError):
+            raise RepositoryInvariantError("durable Capsule cannot be reconstructed") from None
+        stored_token_cost = self._codec.decrypt_non_negative_int(
+            "capsules",
+            "token_cost",
+            capsule_id,
+            row["token_cost_envelope"],
+        )
+        if (
+            capsule_id != capsule.capsule_id
+            or row["session_key_hash"] != session_key.session_key_hash
+            or capsule.session_key != session_key
+            or row["level"] != capsule.level.value
+            or int(row["covered_event_start"]) != capsule.covered_event_start
+            or int(row["covered_event_end"]) != capsule.covered_event_end
+            or stored_token_cost != capsule.token_cost
+            or float(row["source_coverage"]) != capsule.quality.source_coverage
+            or row["created_at"] != _normalize_datetime(capsule.created_at)
+        ):
+            raise RepositoryInvariantError("durable Capsule row is not canonical")
+        return capsule
+
     def _memberships_for_snapshot(
+        self,
         connection: sqlite3.Connection,
         *,
         snapshot_id: str,
@@ -2001,16 +2711,32 @@ class SQLiteRepository:
         ).fetchall()
         memberships: list[SnapshotCapsuleMembership] = []
         for expected_ordinal, row in enumerate(rows):
-            capsule = ContextCapsuleEnvelope.model_validate_json(row["canonical_capsule_json"])
+            capsule_id = str(row["capsule_id"])
+            canonical_capsule_json = self._codec.decrypt_object_json(
+                "capsules",
+                "canonical_capsule_json",
+                capsule_id,
+                str(row["canonical_capsule_json"]),
+            )
+            try:
+                capsule = ContextCapsuleEnvelope.model_validate_json(canonical_capsule_json)
+            except (TypeError, ValueError):
+                raise RepositoryInvariantError("durable Capsule cannot be reconstructed") from None
+            stored_token_cost = self._codec.decrypt_non_negative_int(
+                "capsules",
+                "token_cost",
+                capsule_id,
+                row["token_cost_envelope"],
+            )
             if (
                 int(row["ordinal"]) != expected_ordinal
-                or row["capsule_id"] != capsule.capsule_id
+                or capsule_id != capsule.capsule_id
                 or row["session_key_hash"] != session_key.session_key_hash
                 or capsule.session_key != session_key
                 or row["level"] != capsule.level.value
                 or int(row["covered_event_start"]) != capsule.covered_event_start
                 or int(row["covered_event_end"]) != capsule.covered_event_end
-                or int(row["token_cost"]) != capsule.token_cost
+                or stored_token_cost != capsule.token_cost
                 or float(row["source_coverage"]) != capsule.quality.source_coverage
                 or row["created_at"] != _normalize_datetime(capsule.created_at)
             ):
@@ -2026,35 +2752,60 @@ class SQLiteRepository:
             )
         return tuple(memberships)
 
-    @staticmethod
     def _snapshot_from_row(
+        self,
         row: sqlite3.Row,
         *,
         session_key: SessionKey,
         capsule_ids: tuple[str, ...],
     ) -> SnapshotEnvelope:
+        snapshot_id = str(row["snapshot_id"])
+        exact_anchor_ids_json = self._codec.decrypt_array_json(
+            "snapshots",
+            "exact_anchor_ids_json",
+            snapshot_id,
+            str(row["exact_anchor_ids_json"]),
+        )
+        rendered_context = self._codec.decrypt_text(
+            "snapshots",
+            "rendered_context",
+            snapshot_id,
+            str(row["rendered_context"]),
+        )
+        audit_outcome_json = self._codec.decrypt_object_json(
+            "snapshots",
+            "audit_outcome",
+            snapshot_id,
+            str(row["audit_outcome"]),
+        )
+        token_cost = self._codec.decrypt_non_negative_int(
+            "snapshots",
+            "token_cost",
+            snapshot_id,
+            row["token_cost_envelope"],
+        )
         try:
-            exact_anchor_ids = tuple(json.loads(row["exact_anchor_ids_json"]))
-            audit_outcome = SnapshotAuditOutcome.model_validate(json.loads(row["audit_outcome"]))
+            exact_anchor_ids = tuple(json.loads(exact_anchor_ids_json))
+            audit_outcome = SnapshotAuditOutcome.model_validate_json(audit_outcome_json)
             snapshot = SnapshotEnvelope(
-                snapshot_id=row["snapshot_id"],
+                snapshot_id=snapshot_id,
                 session_key=session_key,
                 base_snapshot_id=row["base_snapshot_id"],
                 covered_event_end=row["covered_event_end"],
                 source_high_water_mark=row["source_high_water_mark"],
                 capsule_ids=capsule_ids,
                 exact_anchor_ids=exact_anchor_ids,
-                rendered_context=row["rendered_context"],
-                token_cost=row["token_cost"],
+                rendered_context=rendered_context,
+                token_cost=token_cost,
                 audit_outcome=audit_outcome,
                 state=SnapshotState(row["lifecycle_state"]),
                 created_at=_parse_datetime(row["created_at"]),
                 committed_at=_parse_datetime(row["committed_at"]),
             )
-        except (TypeError, ValueError, json.JSONDecodeError) as error:
+        except (TypeError, ValueError, json.JSONDecodeError):
             raise RepositoryInvariantError(
                 "committed Snapshot row does not form a canonical envelope"
-            ) from error
+            ) from None
         if row["session_key_hash"] != session_key.session_key_hash:
             raise RepositoryInvariantError("active Snapshot belongs to a different durable session")
         return snapshot

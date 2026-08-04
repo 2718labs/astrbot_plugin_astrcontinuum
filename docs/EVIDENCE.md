@@ -1,72 +1,105 @@
-# 证据与实验摘要
+# Evidence and experiment summary
 
-> 这是一份证据边界页，不是 v0.3 的语义评测通过声明。当前 v0.3
-> Technical Preview 的生产工作树只包含评测方案和发布安全契约；它没有
-> 获准的真实语义模型／Provider 结果。
+English | [简体中文](EVIDENCE.zh-CN.md)
 
-![冻结 R2 合成评测结果](assets/evidence-r2-outcomes-rmb.svg)
+> **Scope boundary.** This page records isolated research evidence and its
+> provenance boundary. It is not a claim that v0.3.0 has passed a semantic
+> model evaluation, a Provider benchmark, a production-performance benchmark,
+> or a release-readiness gate.
 
-## 如何读这份证据
+<p align="center">
+  <img src="assets/evidence-r2-outcomes-rmb.svg" width="720"
+       alt="Frozen R2 synthetic outcomes; research-only and not evidence of v0.3 production readiness / 冻结 R2 合成结果；仅限研究，不构成 v0.3 生产就绪证据">
+</p>
 
-本页收录两类隔离研究记录：
+<p align="center"><em>
+Frozen R2 synthetic evaluation (12 scenarios × 3 trials, n=36). Research-only;
+not a v0.3 production-performance or release-readiness claim.
+<br>
+冻结 R2 合成评测（12 个场景 × 3 次试验，n=36）。仅限研究，不构成 v0.3
+生产性能或发布就绪声明。
+</em></p>
 
-1. **冻结 R2 合成评测**：12 个场景 × 3 次试验，共 36 个固定分母单元。
-   它区分结构可用、回答交付和 claim-v2 端到端通过，不能替代真实用户、
-   真实语义模型或生产性能验证。
-2. **CRM V21-008 确定性压力记录**：12 轮、30 条输入记录、122,880
-   输入字节的 replay-matching 记录。它量化预注册确定性 CRM 路径上的
-   字节与损失记账，不能作为当前 v0.3 工作流已接线或可发布的证据。
+## How to read this evidence
 
-两种数据均为本地冻结证据的**摘要摘录**；完整来源、哈希和本仓库中提交的
-CSV 见 [docs/evidence/README.md](evidence/README.md)。
+The repository publishes bounded aggregate extracts only. It deliberately does
+not publish raw conversations, blinded prompts or responses, or nonessential
+intermediate artifacts. The [evidence manifest](evidence/README.md) identifies
+each extract, its source identity, and its committed-file checksum.
 
-## 冻结 R2 合成评测
+Two independent research records are included:
 
-来源为本地冻结的 data/results.json，SHA-256：
+1. **Frozen R2 synthetic evaluation.** Twelve scenarios × three trials give
+   36 fixed-denominator units. It separately reports structural validity,
+   answer delivery, and claim-v2 end-to-end outcomes. It does not represent
+   real users, real semantic models, or production latency.
+2. **CRM V21-008 deterministic stress record.** Twelve replay-matching rounds
+   cover 30 input records and 122,880 input bytes. It measures byte and loss
+   accounting on a pre-registered deterministic CRM path. It does not prove
+   that the CRM path is wired into the v0.3 worker or ready to release.
 
-E3394C2D8590BCFC4206B322D612DB2BE33DE1754715A9E144AB60283E1E0215。
+## Frozen R2 synthetic evaluation
 
-| Arm | 结构有效 | 回答交付 | claim-v2 端到端 | 解读边界 |
+The frozen research source is identified as results.json with SHA-256:
+
+E3394C2D8590BCFC4206B322D612DB2BE33DE1754715A9E144AB60283E1E0215.
+
+| Arm | Structural valid | Answer delivered | claim-v2 end-to-end | Interpretation boundary |
 | --- | ---: | ---: | ---: | --- |
-| Full capsule | 27 / 36 | 27 / 36 | 21 / 36 | 冻结合成记录 |
-| Projection | 36 / 36 | 36 / 36 | 25 / 36 | 冻结合成记录 |
-| Summary | 36 / 36 | 36 / 36 | 27 / 36 | 仅离线对照，不能成为运行时或回退路径 |
-| Oracle floor | 36 / 36 | n/a | n/a | 已登记编码下限，不是质量或信息论最优值 |
+| Full capsule | 27 / 36 | 27 / 36 | 21 / 36 | Frozen synthetic record |
+| Projection | 36 / 36 | 36 / 36 | 25 / 36 | Frozen synthetic record |
+| Summary | 36 / 36 | 36 / 36 | 27 / 36 | Offline comparison only; never a runtime fallback |
+| Oracle floor | 36 / 36 | n/a | n/a | Registered encoding floor, not a quality or information-theoretic optimum |
 
-CSV：[docs/evidence/frozen-r2-outcomes.csv](evidence/frozen-r2-outcomes.csv)。
-该设计中的 Summary 只保留为历史离线比较臂；AstrContinuum 的运行时不以
-Summary 作为主路径或降级回退。
+The committed aggregate is
+[docs/evidence/frozen-r2-outcomes.csv](evidence/frozen-r2-outcomes.csv).
+Its SHA-256 is
+415B52EF538B2F7B76CA6815C45BC2C2F6580CC50BD9C16798D83296E8918B7F.
+The Summary arm remains a historical offline comparison; AstrContinuum does
+not use it as a main path or degraded runtime fallback.
 
-## CRM V21-008 确定性压力记录
+## CRM V21-008 deterministic stress record
 
-来源为隔离的 codex/crm-experiment 工作树提交
-af835babbd1ca07619251f83c4e0201264975a49 中的
-evidence/v21-008-stress-data.json，SHA-256：
+The isolated source record is identified by immutable revision
+af835babbd1ca07619251f83c4e0201264975a49 and source SHA-256:
 
-0C8BDC214588AA53F06DA830181D7EB9FF5D164063E8EC8FB74F75B7D0651760。
+0C8BDC214588AA53F06DA830181D7EB9FF5D164063E8EC8FB74F75B7D0651760.
 
-记录报告 replay_match=true 与 COMPLETED：12 轮总计 30 条输入记录、
-122,880 输入字节。逐轮 reduction_ppm 为 116,499–347,594，均值
-247,519.17；第 12 轮为 33,974 resident bytes、347,594 reduction ppm、
-652,405 retention ppm、累计 loss 30。
+It reports replay_match=true and COMPLETED: 12 rounds, 30 input records, and
+122,880 input bytes. Per-round reduction_ppm ranges from 116,499 to 347,594
+(mean 247,519.17). Round 12 reports 33,974 resident bytes, 347,594 reduction
+ppm, 652,405 retention ppm, and cumulative loss 30.
 
-CSV：[docs/evidence/crm-v21-008-stress-rounds.csv](evidence/crm-v21-008-stress-rounds.csv)。
-这些数值只说明该冻结确定性压力记录的记账结果；它们不说明生产会话质量、
-用户效用、模型泛化、Provider 行为或 v0.3 发布状态。
+The committed aggregate is
+[docs/evidence/crm-v21-008-stress-rounds.csv](evidence/crm-v21-008-stress-rounds.csv).
+Its SHA-256 is
+645943F5738320295580CAA62BC228694267251EF8AA01BFA13ECC5C2FFF2A01.
+These values only describe the frozen deterministic accounting record. They do
+not establish production-session quality, user utility, model generalization,
+Provider behavior, or v0.3 release status.
 
-## 当前 v0.3 的可声称范围
+## What v0.3.0 can and cannot claim
 
-当前可声称的是持久化发布安全契约：fenced SQLite 发布、不可变
-Capsule/Snapshot、显式传入时的重组账本、永久质量闸门，以及 CAS/崩溃
-不留孤儿账本行。标准 CompactionWorker 尚未调用
-reorganize_capsules()，所以正常后台发布的重组记录元组为空。
+v0.3.0 can claim its tested persistence and publication contracts: fenced
+SQLite publication, immutable Capsules and Snapshots, a permanent mechanical
+quality gate, and an immutable reorganization ledger when records are
+explicitly supplied to publication. A successful CAS does not leave orphaned
+ledger rows; a ledger-integrity failure rolls back the transaction and does not
+move the active pointer.
 
-当前不能声称：
+The standard CompactionWorker does not call reorganize_capsules(); ordinary
+background publication therefore supplies an empty reorganization-record tuple.
+The ledger interface exists, but automatic CRM reorganization is not a v0.3
+runtime capability.
 
-- 已完成真实语义模型或 Provider 评测；
-- CRM 重组路径已接入生产 worker；
-- 非摘要 released 记录可以绕过永久质量闸门；
-- v0.3 已达到公开 v1.0、性能基准或全面兼容矩阵。
+v0.3.0 cannot claim:
 
-生产链和研究目标链的精确关系见 [docs/WORKFLOW.md](WORKFLOW.md)；
-方案、场景和未来发布阈值见 [docs/EVALUATION.md](EVALUATION.md)。
+- a real semantic-model or Provider evaluation;
+- an automatically wired CRM reorganization worker;
+- a bypass around the permanent gate for non-summary released records;
+- public v1.0 status, a million-token performance result, or a complete
+  compatibility matrix.
+
+See [Workflow](WORKFLOW.md) for the separation between the shipped publication
+chain and the CRM research target, and [Evaluation](EVALUATION.md) for
+scenarios, metrics, and future release thresholds.

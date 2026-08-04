@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import inspect
+import json
 from dataclasses import FrozenInstanceError
 from datetime import datetime, timezone
 from typing import Any
@@ -214,6 +215,63 @@ def test_structured_fields_and_raw_delta_are_independently_retrievable() -> None
     assert all(candidate.capsule_id != "Unhelpful." for candidate in candidates)
 
 
+def test_parallel_tool_continuation_becomes_one_atomic_raw_candidate() -> None:
+    key = session_key()
+
+    def tool_event(
+        sequence: int,
+        event_type: ac.EventType,
+        payload: dict[str, object],
+    ) -> ac.EventEnvelope:
+        return ac.EventEnvelope.create(
+            event_id=f"tool-event-{sequence}",
+            session_key=key,
+            sequence=sequence,
+            event_type=event_type,
+            content=json.dumps(payload, separators=(",", ":"), ensure_ascii=False),
+            idempotency_key=f"tool-idempotency-{sequence}",
+            token_count=1,
+            created_at=NOW,
+        )
+
+    delta = (
+        tool_event(
+            1, ac.EventType.TOOL_CALL, {"kind": "call", "tool": "search", "arguments": {"q": "a"}}
+        ),
+        tool_event(
+            2, ac.EventType.TOOL_CALL, {"kind": "call", "tool": "lookup", "arguments": {"id": 7}}
+        ),
+        tool_event(
+            3,
+            ac.EventType.TOOL_RESULT,
+            {"kind": "result", "tool": "lookup", "arguments": {"id": 7}, "result": "found"},
+        ),
+        tool_event(
+            4,
+            ac.EventType.TOOL_RESULT,
+            {"kind": "result", "tool": "search", "arguments": {"q": "a"}, "result": "ok"},
+        ),
+        tool_event(5, ac.EventType.ASSISTANT_MESSAGE, {}),
+    )
+    view = ac.RequestView(
+        session_key=key,
+        snapshot=None,
+        memberships=(),
+        pointer_version=0,
+        covered_event_end=0,
+        high_water_mark=5,
+        delta=delta,
+    )
+
+    candidates = ac.select_candidates(view, "", ac.RetrievalConfig())
+    raw = tuple(item for item in candidates if item.kind is ac.CandidateKind.RAW_EVENT)
+
+    assert len(raw) == 1
+    assert raw[0].source_event_ids == tuple(item.event_id for item in delta)
+    assert raw[0].event_type is None
+    assert all(item.content in raw[0].text for item in delta)
+
+
 def test_decision_block_keeps_complete_reasoning_and_dependency_context() -> None:
     config_type, _candidate_type, kind_type, selector = runtime_surface()
     view = request_view((capsule(session_key()),))
@@ -248,6 +306,10 @@ def test_retrieval_bounds_query_capsules_delta_and_candidate_count() -> None:
     assert all(candidate.capsule_id != "capsule-2" for candidate in candidates)
     raw = [item for item in candidates if item.kind == kind_type.RAW_EVENT]
     assert [item.event_sequence for item in raw] == [4, 5]
+    assert [item.text for item in raw] == [
+        "[USER_MESSAGE/USER event-4]\nraw delta 4",
+        "[USER_MESSAGE/USER event-5]\nraw delta 5",
+    ]
     assert all("SHOULD-NOT-BE-SCANNED" not in item.reason for item in candidates)
 
 
@@ -267,6 +329,57 @@ def test_ties_use_stable_ids_and_output_is_repeatable() -> None:
 
     assert first == second
     assert entity_ids == sorted(entity_ids)
+
+
+def test_required_candidate_at_capacity_plus_one_marks_selection_incomplete() -> None:
+    key = session_key()
+
+    def saturated_capsule(index: int) -> ac.ContextCapsuleEnvelope:
+        item = capsule(key, capsule_id=f"capsule-{index}")
+        source_id = item.source_event_ids[0]
+
+        def claims(prefix: str) -> tuple[ac.CapsuleClaim, ...]:
+            return tuple(
+                ac.CapsuleClaim(
+                    claim_id=f"{prefix}-{index}-{claim_index}",
+                    text=f"{prefix} {index} {claim_index}",
+                    status=ac.SemanticStatus.ACTIVE,
+                    confidence=1.0,
+                    source_event_ids=(source_id,),
+                )
+                for claim_index in range(64)
+            )
+
+        return item.model_copy(
+            update={
+                "goals": claims("goal"),
+                "constraints": claims("constraint"),
+            }
+        )
+
+    view = request_view(tuple(saturated_capsule(index) for index in range(3)), delta_count=0)
+
+    candidates = ac.select_candidates(view, "", ac.RetrievalConfig(max_candidates=256))
+
+    assert len(candidates) == 256
+    assert all(candidate.required for candidate in candidates)
+    assert all(candidate.required_selection_complete is False for candidate in candidates)
+
+
+def test_required_delta_source_bound_marks_selection_incomplete() -> None:
+    view = request_view((capsule(session_key()),), delta_count=2)
+
+    candidates = ac.select_candidates(
+        view,
+        "",
+        ac.RetrievalConfig(max_delta_events=1),
+    )
+
+    raw = tuple(
+        candidate for candidate in candidates if candidate.kind is ac.CandidateKind.RAW_EVENT
+    )
+    assert tuple(candidate.event_sequence for candidate in raw) == (3,)
+    assert all(candidate.required_selection_complete is False for candidate in candidates)
 
 
 def test_public_surface_is_immutable_and_has_no_provider_input() -> None:

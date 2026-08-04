@@ -4,7 +4,6 @@ import json
 from pathlib import Path
 from typing import Any
 
-
 ROOT = Path(__file__).resolve().parents[2]
 
 
@@ -46,9 +45,7 @@ def test_capsule_materializes_master_prompt_semantics() -> None:
 def test_all_capsule_objects_are_closed() -> None:
     schema = load_capsule_schema()
     object_defs = {
-        name: value
-        for name, value in schema["$defs"].items()
-        if value.get("type") == "object"
+        name: value for name, value in schema["$defs"].items() if value.get("type") == "object"
     }
 
     assert object_defs
