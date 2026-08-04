@@ -402,11 +402,49 @@ BEGIN
 END;
 """.strip()
 
+SNAPSHOT_REORGANIZATION_LEDGER_V2_SQL = """
+CREATE TABLE snapshot_reorganization_records (
+    snapshot_id TEXT NOT NULL CHECK (length(trim(snapshot_id)) > 0),
+    ordinal INTEGER NOT NULL CHECK (ordinal >= 0),
+    source_capsule_id TEXT NOT NULL CHECK (length(trim(source_capsule_id)) > 0),
+    kind TEXT NOT NULL CHECK (length(trim(kind)) > 0),
+    item_id TEXT NOT NULL CHECK (length(trim(item_id)) > 0),
+    status TEXT NOT NULL CHECK (status IN ('retained', 'approximate', 'released')),
+    before_tokens INTEGER NOT NULL CHECK (before_tokens >= 0),
+    after_tokens INTEGER NOT NULL CHECK (after_tokens >= 0),
+    required INTEGER NOT NULL CHECK (required IN (0, 1)),
+    PRIMARY KEY (snapshot_id, ordinal),
+    UNIQUE (snapshot_id, source_capsule_id, kind, item_id),
+    FOREIGN KEY (snapshot_id) REFERENCES snapshots(snapshot_id)
+);
+
+CREATE INDEX idx_snapshot_reorganization_records_snapshot_ordinal
+ON snapshot_reorganization_records (snapshot_id, ordinal);
+
+CREATE TRIGGER snapshot_reorganization_records_immutable_update
+BEFORE UPDATE ON snapshot_reorganization_records
+BEGIN
+    SELECT RAISE(ABORT, 'snapshot_reorganization_records rows are immutable');
+END;
+
+CREATE TRIGGER snapshot_reorganization_records_immutable_delete
+BEFORE DELETE ON snapshot_reorganization_records
+BEGIN
+    SELECT RAISE(ABORT, 'snapshot_reorganization_records rows are immutable');
+END;
+""".strip()
+
+
 MIGRATIONS = (
     Migration(
         version=1,
         name="initial_v1_schema",
         sql=INITIAL_SCHEMA_SQL,
+    ),
+    Migration(
+        version=2,
+        name="snapshot_reorganization_ledger_v2",
+        sql=SNAPSHOT_REORGANIZATION_LEDGER_V2_SQL,
     ),
 )
 

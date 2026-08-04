@@ -83,9 +83,9 @@ def _migrated_factory(
     *,
     busy_timeout_ms: int = 100,
 ) -> Any:
-    _, _, _, migrator_type = _migration_api()
+    migrations, _, _, migrator_type = _migration_api()
     factory = ac.SQLiteConnectionFactory(tmp_path, busy_timeout_ms=busy_timeout_ms)
-    assert migrator_type(factory).migrate() == 1
+    assert migrator_type(factory).migrate() == migrations[-1].version
     return factory
 
 
@@ -227,6 +227,47 @@ def _insert_capsule_snapshot_membership(connection: sqlite3.Connection) -> None:
     )
 
 
+def _insert_snapshot_reorganization_record(
+    connection: sqlite3.Connection,
+    *,
+    snapshot_id: str = "snapshot-1",
+    ordinal: int = 0,
+    source_capsule_id: str = "source-capsule-1",
+    kind: str = "goal",
+    item_id: str = "goal-1",
+    status: str = "retained",
+    before_tokens: int = 10,
+    after_tokens: int = 10,
+    required: int = 0,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO snapshot_reorganization_records (
+            snapshot_id,
+            ordinal,
+            source_capsule_id,
+            kind,
+            item_id,
+            status,
+            before_tokens,
+            after_tokens,
+            required
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            snapshot_id,
+            ordinal,
+            source_capsule_id,
+            kind,
+            item_id,
+            status,
+            before_tokens,
+            after_tokens,
+            required,
+        ),
+    )
+
+
 def _insert_job(
     connection: sqlite3.Connection,
     *,
@@ -308,8 +349,9 @@ def test_initial_migration_creates_complete_versioned_schema(tmp_path: Path) -> 
     factory = ac.SQLiteConnectionFactory(tmp_path)
     migrator = migrator_type(factory)
 
-    assert migrator.migrate() == 1
-    assert migrator.migrate() == 1
+    assert [migration.version for migration in migrations] == [1, 2]
+    assert migrator.migrate() == 2
+    assert migrator.migrate() == 2
 
     with factory.connection(read_only=True) as connection:
         tables = {
@@ -323,9 +365,20 @@ def test_initial_migration_creates_complete_versioned_schema(tmp_path: Path) -> 
             )
         }
         ledger = connection.execute(
-            "SELECT version, name, checksum FROM schema_migrations"
-        ).fetchone()
+            "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
+        ).fetchall()
         user_version = connection.execute("PRAGMA user_version").fetchone()[0]
+        indexes = {
+            row["name"]
+            for row in connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'index'
+                    AND tbl_name = 'snapshot_reorganization_records'
+                """
+            )
+        }
 
     assert tables == {
         "active_snapshots",
@@ -335,13 +388,49 @@ def test_initial_migration_creates_complete_versioned_schema(tmp_path: Path) -> 
         "schema_migrations",
         "sessions",
         "snapshot_capsules",
+        "snapshot_reorganization_records",
         "snapshots",
     }
-    assert ledger["version"] == migrations[0].version == 1
-    assert ledger["name"] == migrations[0].name
-    assert ledger["checksum"] == migrations[0].checksum
+    assert [row["version"] for row in ledger] == [1, 2]
+    assert [row["name"] for row in ledger] == [migration.name for migration in migrations]
+    assert [row["checksum"] for row in ledger] == [migration.checksum for migration in migrations]
     assert migrations[0].checksum == hashlib.sha256(migrations[0].sql.encode("utf-8")).hexdigest()
-    assert user_version == 1
+    assert "idx_snapshot_reorganization_records_snapshot_ordinal" in indexes
+    assert user_version == 2
+
+
+def test_v1_database_upgrades_to_snapshot_reorganization_ledger_v2_idempotently(
+    tmp_path: Path,
+) -> None:
+    migrations, _, _, migrator_type = _migration_api()
+    assert [migration.version for migration in migrations] == [1, 2]
+    factory = ac.SQLiteConnectionFactory(tmp_path)
+
+    assert migrator_type(factory, migrations=migrations[:1]).migrate() == 1
+    with factory.transaction() as connection:
+        _insert_session(connection)
+        _insert_event(connection)
+        _insert_capsule_snapshot_membership(connection)
+
+    migrator = migrator_type(factory)
+    assert migrator.migrate() == 2
+    assert migrator.migrate() == 2
+
+    with factory.connection(read_only=True) as connection:
+        versions = [
+            row["version"]
+            for row in connection.execute("SELECT version FROM schema_migrations ORDER BY version")
+        ]
+        snapshot_count = connection.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+        record_count = connection.execute(
+            "SELECT COUNT(*) FROM snapshot_reorganization_records"
+        ).fetchone()[0]
+        user_version = connection.execute("PRAGMA user_version").fetchone()[0]
+
+    assert versions == [1, 2]
+    assert snapshot_count == 1
+    assert record_count == 0
+    assert user_version == 2
 
 
 def test_text_primary_identity_columns_are_explicitly_not_null(tmp_path: Path) -> None:
@@ -407,6 +496,36 @@ def test_foreign_keys_identity_and_event_triples_are_enforced(tmp_path: Path) ->
             )
 
         _insert_event(connection)
+
+
+def test_snapshot_reorganization_record_schema_enforces_contract(tmp_path: Path) -> None:
+    migrations, _, _, _ = _migration_api()
+    assert [migration.version for migration in migrations] == [1, 2]
+    factory = _migrated_factory(tmp_path)
+
+    with factory.transaction() as connection:
+        _insert_session(connection)
+        _insert_event(connection)
+        _insert_capsule_snapshot_membership(connection)
+        _insert_snapshot_reorganization_record(connection)
+
+        for overrides in (
+            {"snapshot_id": " "},
+            {"ordinal": -1},
+            {"source_capsule_id": "\t"},
+            {"kind": "\n"},
+            {"item_id": " "},
+            {"status": "unknown"},
+            {"before_tokens": -1},
+            {"after_tokens": -1},
+            {"required": 2},
+            {"required": -1},
+            {"snapshot_id": "missing-snapshot", "ordinal": 1},
+            {"ordinal": 0, "item_id": "different-item"},
+            {"ordinal": 1},
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                _insert_snapshot_reorganization_record(connection, **overrides)
 
 
 @pytest.mark.parametrize(
@@ -500,6 +619,18 @@ def test_nonterminal_job_chain_is_unique_per_session(tmp_path: Path) -> None:
             WHERE snapshot_id = 'snapshot-1' AND ordinal = 0
             """,
         ),
+        (
+            "snapshot_reorganization_records",
+            """
+            UPDATE snapshot_reorganization_records
+            SET after_tokens = 5
+            WHERE snapshot_id = 'snapshot-1' AND ordinal = 0
+            """,
+            """
+            DELETE FROM snapshot_reorganization_records
+            WHERE snapshot_id = 'snapshot-1' AND ordinal = 0
+            """,
+        ),
     ],
 )
 def test_append_only_and_snapshot_content_rows_are_immutable(
@@ -513,6 +644,7 @@ def test_append_only_and_snapshot_content_rows_are_immutable(
         _insert_session(connection)
         _insert_event(connection)
         _insert_capsule_snapshot_membership(connection)
+        _insert_snapshot_reorganization_record(connection)
 
     with (
         pytest.raises(
@@ -546,8 +678,8 @@ def test_concurrent_initializers_converge_on_one_ledger_row(tmp_path: Path) -> N
     with factory.connection(read_only=True) as connection:
         ledger_count = connection.execute("SELECT COUNT(*) FROM schema_migrations").fetchone()[0]
 
-    assert versions == [1, 1, 1, 1]
-    assert ledger_count == 1
+    assert versions == [2, 2, 2, 2]
+    assert ledger_count == 2
 
 
 def test_migrator_retries_transient_busy_before_initialization(tmp_path: Path) -> None:
@@ -567,7 +699,7 @@ def test_migrator_retries_transient_busy_before_initialization(tmp_path: Path) -
 
     transient_factory = TransientBusyFactory()
 
-    assert migrator_type(transient_factory).migrate() == 1
+    assert migrator_type(transient_factory).migrate() == 2
     assert transient_factory.attempts == 3
 
 
@@ -594,9 +726,10 @@ def test_missing_json_functions_raise_a_diagnostic_migration_error(tmp_path: Pat
         migrator_type(MissingJsonFactory()).migrate()
 
 
-def test_applied_migration_checksum_drift_is_rejected(tmp_path: Path) -> None:
+def test_applied_v1_migration_checksum_drift_is_rejected(tmp_path: Path) -> None:
     migrations, migration_type, checksum_error, migrator_type = _migration_api()
-    factory = _migrated_factory(tmp_path)
+    factory = ac.SQLiteConnectionFactory(tmp_path)
+    assert migrator_type(factory, migrations=migrations[:1]).migrate() == 1
     original = migrations[0]
     drifted = migration_type(
         version=original.version,
@@ -608,11 +741,27 @@ def test_applied_migration_checksum_drift_is_rejected(tmp_path: Path) -> None:
         migrator_type(factory, migrations=(drifted,)).migrate()
 
 
+def test_applied_v2_migration_checksum_drift_is_rejected(tmp_path: Path) -> None:
+    migrations, migration_type, checksum_error, migrator_type = _migration_api()
+    assert [migration.version for migration in migrations] == [1, 2]
+    factory = _migrated_factory(tmp_path)
+    original = migrations[1]
+    drifted = migration_type(
+        version=original.version,
+        name=original.name,
+        sql=f"{original.sql}\n-- unauthorized drift\n",
+    )
+
+    with pytest.raises(checksum_error, match="checksum"):
+        migrator_type(factory, migrations=(migrations[0], drifted)).migrate()
+
+
 def test_failed_migration_rolls_back_its_ddl_and_ledger_entry(tmp_path: Path) -> None:
     migrations, migration_type, _, migrator_type = _migration_api()
+    assert [migration.version for migration in migrations] == [1, 2]
     factory = _migrated_factory(tmp_path)
     broken = migration_type(
-        version=2,
+        version=3,
         name="broken_injected_migration",
         sql="""
         CREATE TABLE should_rollback (value INTEGER NOT NULL);
@@ -620,7 +769,7 @@ def test_failed_migration_rolls_back_its_ddl_and_ledger_entry(tmp_path: Path) ->
         """,
     )
 
-    with pytest.raises(ac.MigrationError, match="migration 2"):
+    with pytest.raises(ac.MigrationError, match="migration 3"):
         migrator_type(factory, migrations=(*migrations, broken)).migrate()
 
     with factory.connection(read_only=True) as connection:
@@ -637,16 +786,17 @@ def test_failed_migration_rolls_back_its_ddl_and_ledger_entry(tmp_path: Path) ->
         ).fetchone()
         user_version = connection.execute("PRAGMA user_version").fetchone()[0]
 
-    assert versions == [1]
+    assert versions == [1, 2]
     assert rolled_back_table is None
-    assert user_version == 1
+    assert user_version == 2
 
 
 def test_sql_splitter_preserves_semicolons_and_trailing_comments(tmp_path: Path) -> None:
     migrations, migration_type, _, migrator_type = _migration_api()
+    assert [migration.version for migration in migrations] == [1, 2]
     factory = _migrated_factory(tmp_path)
     syntax_edges = migration_type(
-        version=2,
+        version=3,
         name="sql_syntax_edges",
         sql="""
         -- A line-comment semicolon must not split a statement;
@@ -664,7 +814,7 @@ def test_sql_splitter_preserves_semicolons_and_trailing_comments(tmp_path: Path)
         """,
     )
 
-    assert migrator_type(factory, migrations=(*migrations, syntax_edges)).migrate() == 2
+    assert migrator_type(factory, migrations=(*migrations, syntax_edges)).migrate() == 3
 
     with factory.connection(read_only=True) as connection:
         values = [
