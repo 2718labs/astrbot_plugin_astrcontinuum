@@ -117,6 +117,50 @@ _LEVEL_ORDER = {
 }
 
 
+def canonicalize_reorganization_records(
+    records: Sequence[ReorganizationRecord],
+) -> tuple[ReorganizationRecord, ...]:
+    """Validate closed audit records while preserving caller order and values."""
+
+    canonical_records: list[ReorganizationRecord] = []
+    source_item_keys: set[tuple[str, str, str]] = set()
+    for record in records:
+        if type(record) is not ReorganizationRecord:
+            raise ReorganizationInvariantError("reorganization record must be exact")
+        _require_nonempty_record_identity(record.kind, "kind")
+        _require_nonempty_record_identity(record.item_id, "item_id")
+        _require_nonempty_record_identity(record.source_capsule_id, "source_capsule_id")
+        if type(record.status) is not ReorganizationStatus:
+            raise ReorganizationInvariantError("reorganization record status must be exact")
+        _require_nonnegative_record_tokens(record.before_tokens, "before_tokens")
+        _require_nonnegative_record_tokens(record.after_tokens, "after_tokens")
+        if type(record.required) is not bool:
+            raise ReorganizationInvariantError("reorganization record required flag must be exact")
+        if record.required and record.status is not ReorganizationStatus.RETAINED:
+            raise ReorganizationInvariantError("required reorganization record must be retained")
+
+        source_item_key = (record.source_capsule_id, record.kind, record.item_id)
+        if source_item_key in source_item_keys:
+            raise ReorganizationInvariantError("duplicate reorganization record source item")
+        source_item_keys.add(source_item_key)
+        canonical_records.append(record)
+    return tuple(canonical_records)
+
+
+def _require_nonempty_record_identity(value: object, field_name: str) -> None:
+    if type(value) is not str or not value.strip():
+        raise ReorganizationInvariantError(
+            f"reorganization record {field_name} must be a non-empty string"
+        )
+
+
+def _require_nonnegative_record_tokens(value: object, field_name: str) -> None:
+    if type(value) is not int or value < 0:
+        raise ReorganizationInvariantError(
+            f"reorganization record {field_name} must be a non-negative integer"
+        )
+
+
 def reorganize_capsules(
     capsules: Sequence[ContextCapsuleEnvelope],
     *,
@@ -382,7 +426,7 @@ def _validate_counter(counter: object) -> None:
 def _count_text(counter: TokenCounter, text: str) -> int:
     try:
         value = counter.count_text(text)
-    except Exception as error:  # noqa: BLE001 - fail closed at the boundary.
+    except Exception as error:
         raise ValueError("token counter failed") from error
     if isinstance(value, bool) or not isinstance(value, int) or value < 0:
         raise ValueError("token counter must return a non-negative integer")
@@ -617,5 +661,6 @@ __all__ = [
     "ReorganizationRecord",
     "ReorganizationResult",
     "ReorganizationStatus",
+    "canonicalize_reorganization_records",
     "reorganize_capsules",
 ]

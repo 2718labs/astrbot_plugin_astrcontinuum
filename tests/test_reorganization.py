@@ -1,12 +1,11 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
 import json
+from datetime import datetime, timezone
 
 import pytest
 
 import astrcontinuum as ac
-
 
 NOW = datetime(2026, 8, 2, 12, 0, tzinfo=timezone.utc)
 
@@ -100,6 +99,101 @@ def _capsule(
         ),
         created_at=NOW,
     )
+
+
+def _record(
+    *,
+    kind: str = "goal",
+    item_id: str = "goal-1",
+    source_capsule_id: str = "source-a",
+    status: ac.ReorganizationStatus = ac.ReorganizationStatus.RETAINED,
+    before_tokens: int = 10,
+    after_tokens: int = 10,
+    required: bool = False,
+) -> ac.ReorganizationRecord:
+    return ac.ReorganizationRecord(
+        kind=kind,
+        item_id=item_id,
+        source_capsule_id=source_capsule_id,
+        status=status,
+        before_tokens=before_tokens,
+        after_tokens=after_tokens,
+        required=required,
+    )
+
+
+def test_canonicalize_reorganization_records_preserves_valid_caller_order() -> None:
+    from astrcontinuum.reorganization import canonicalize_reorganization_records
+
+    records = (
+        _record(kind="goal", item_id="goal-1", source_capsule_id="source-a"),
+        _record(
+            kind="progress",
+            item_id="progress-1",
+            source_capsule_id="source-b",
+            status=ac.ReorganizationStatus.APPROXIMATE,
+            before_tokens=20,
+            after_tokens=12,
+        ),
+    )
+
+    assert canonicalize_reorganization_records(records) == records
+
+
+@pytest.mark.parametrize(
+    "record",
+    (
+        object(),
+        _record(kind=" "),
+        _record(item_id="\t"),
+        _record(source_capsule_id="\n"),
+        _record(status="retained"),
+        _record(before_tokens=True),
+        _record(before_tokens=-1),
+        _record(after_tokens=False),
+        _record(after_tokens=-1),
+        _record(status=ac.ReorganizationStatus.APPROXIMATE, required=True),
+        _record(status=ac.ReorganizationStatus.RELEASED, required=True),
+    ),
+    ids=(
+        "non-record",
+        "blank-kind",
+        "blank-item-id",
+        "blank-source-capsule-id",
+        "non-enum-status",
+        "boolean-before-tokens",
+        "negative-before-tokens",
+        "boolean-after-tokens",
+        "negative-after-tokens",
+        "required-approximate",
+        "required-released",
+    ),
+)
+def test_canonicalize_reorganization_records_rejects_invalid_record_shape(
+    record: object,
+) -> None:
+    from astrcontinuum.reorganization import (
+        ReorganizationInvariantError,
+        canonicalize_reorganization_records,
+    )
+
+    with pytest.raises(ReorganizationInvariantError):
+        canonicalize_reorganization_records((record,))
+
+
+def test_canonicalize_reorganization_records_rejects_duplicate_source_item_identity() -> None:
+    from astrcontinuum.reorganization import (
+        ReorganizationInvariantError,
+        canonicalize_reorganization_records,
+    )
+
+    records = (
+        _record(),
+        _record(status=ac.ReorganizationStatus.APPROXIMATE, after_tokens=8),
+    )
+
+    with pytest.raises(ReorganizationInvariantError):
+        canonicalize_reorganization_records(records)
 
 
 def test_reorganize_capsules_is_deterministic_and_preserves_core_edges() -> None:
