@@ -13,6 +13,7 @@ import pytest
 
 import astrcontinuum as ac
 from astrcontinuum.storage import migrations as migrations_module
+from tests.storage.security_testkit import activate_test_storage, storage_test_codec
 
 SESSION_HASH = "a" * 64
 NOW = "2026-07-26T00:00:00Z"
@@ -79,7 +80,7 @@ def _migration_api() -> tuple[Any, Any, Any, Any]:
     )
 
 
-def _migrated_factory(
+def _plain_v1_factory(
     tmp_path: Path,
     *,
     busy_timeout_ms: int = 100,
@@ -90,11 +91,30 @@ def _migrated_factory(
     return factory
 
 
+def _migrated_factory(
+    tmp_path: Path,
+    *,
+    busy_timeout_ms: int = 100,
+) -> Any:
+    migrations, _, _, migrator_type = _migration_api()
+    factory = _plain_v1_factory(tmp_path, busy_timeout_ms=busy_timeout_ms)
+    activate_test_storage(factory)
+    assert migrator_type(factory).migrate() == migrations[-1].version
+    return factory
+
+
 def _insert_session(
     connection: sqlite3.Connection,
     *,
     session_hash: str = SESSION_HASH,
 ) -> None:
+    codec = storage_test_codec()
+
+    def encrypt_identity(column: str, value: str | None) -> str | None:
+        if value is None:
+            return None
+        return codec.encrypt_text("sessions", column, session_hash, value)
+
     connection.execute(
         """
         INSERT INTO sessions (
@@ -114,14 +134,19 @@ def _insert_session(
         """,
         (
             session_hash,
-            SESSION_KEY_JSON,
-            "astrbot-1",
-            "group",
-            "session-1",
-            "group-1",
-            "user-1",
-            "conversation-1",
-            None,
+            codec.encrypt_object_json(
+                "sessions",
+                "canonical_session_key_json",
+                session_hash,
+                SESSION_KEY_JSON,
+            ),
+            encrypt_identity("platform_instance_id", "astrbot-1"),
+            encrypt_identity("message_type", "group"),
+            encrypt_identity("session_id", "session-1"),
+            encrypt_identity("group_id", "group-1"),
+            encrypt_identity("user_id", "user-1"),
+            encrypt_identity("conversation_id", "conversation-1"),
+            encrypt_identity("persona_id", None),
             1,
             NOW,
             NOW,
@@ -130,6 +155,7 @@ def _insert_session(
 
 
 def _insert_event(connection: sqlite3.Connection) -> None:
+    codec = storage_test_codec()
     connection.execute(
         """
         INSERT INTO journal_events (
@@ -141,7 +167,7 @@ def _insert_event(connection: sqlite3.Connection) -> None:
             content,
             source_hook,
             idempotency_key,
-            token_count,
+            token_count_envelope,
             created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
@@ -151,16 +177,17 @@ def _insert_event(connection: sqlite3.Connection) -> None:
             1,
             "USER_MESSAGE",
             "USER",
-            "hello",
+            codec.encrypt_text("journal_events", "content", "event-1", "hello"),
             "ON_LLM_REQUEST",
             "request-1",
-            2,
+            codec.encrypt_non_negative_int("journal_events", "token_count", "event-1", 2),
             NOW,
         ),
     )
 
 
 def _insert_capsule_snapshot_membership(connection: sqlite3.Connection) -> None:
+    codec = storage_test_codec()
     connection.execute(
         """
         INSERT INTO capsules (
@@ -170,7 +197,7 @@ def _insert_capsule_snapshot_membership(connection: sqlite3.Connection) -> None:
             covered_event_start,
             covered_event_end,
             canonical_capsule_json,
-            token_cost,
+            token_cost_envelope,
             source_coverage,
             created_at
         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
@@ -181,8 +208,13 @@ def _insert_capsule_snapshot_membership(connection: sqlite3.Connection) -> None:
             "micro",
             1,
             1,
-            _canonical_capsule_json(),
-            4,
+            codec.encrypt_object_json(
+                "capsules",
+                "canonical_capsule_json",
+                "capsule-1",
+                _canonical_capsule_json(),
+            ),
+            codec.encrypt_non_negative_int("capsules", "token_cost", "capsule-1", 4),
             1.0,
             NOW,
         ),
@@ -197,7 +229,7 @@ def _insert_capsule_snapshot_membership(connection: sqlite3.Connection) -> None:
             source_high_water_mark,
             exact_anchor_ids_json,
             rendered_context,
-            token_cost,
+            token_cost_envelope,
             audit_outcome,
             lifecycle_state,
             created_at,
@@ -210,10 +242,20 @@ def _insert_capsule_snapshot_membership(connection: sqlite3.Connection) -> None:
             None,
             1,
             1,
-            "[]",
-            "context",
-            4,
-            '{"mechanical_passed":true,"semantic_status":"NOT_RUN","failure_codes":[]}',
+            codec.encrypt_array_json(
+                "snapshots",
+                "exact_anchor_ids_json",
+                "snapshot-1",
+                "[]",
+            ),
+            codec.encrypt_text("snapshots", "rendered_context", "snapshot-1", "context"),
+            codec.encrypt_non_negative_int("snapshots", "token_cost", "snapshot-1", 4),
+            codec.encrypt_object_json(
+                "snapshots",
+                "audit_outcome",
+                "snapshot-1",
+                '{"mechanical_passed":true,"semantic_status":"NOT_RUN","failure_codes":[]}',
+            ),
             "COMMITTED",
             NOW,
             NOW,
@@ -225,6 +267,187 @@ def _insert_capsule_snapshot_membership(connection: sqlite3.Connection) -> None:
         VALUES (?, ?, ?, ?)
         """,
         ("snapshot-1", 0, "capsule-1", "primary"),
+    )
+
+
+def _insert_valid_v1_upgrade_fixture(connection: sqlite3.Connection) -> ac.SessionKey:
+    """Seed one canonical format-v1 chain for the keyed security migration."""
+
+    key = ac.SessionKey(**json.loads(SESSION_KEY_JSON))
+    event = ac.EventEnvelope.create(
+        event_id="event-1",
+        session_key=key,
+        sequence=1,
+        event_type=ac.EventType.USER_MESSAGE,
+        content="hello",
+        idempotency_key="request-1",
+        token_count=2,
+        created_at=NOW,
+    )
+    capsule = ac.ContextCapsuleEnvelope.model_validate_json(_canonical_capsule_json())
+    snapshot = ac.SnapshotEnvelope(
+        snapshot_id="snapshot-1",
+        session_key=key,
+        base_snapshot_id=None,
+        covered_event_end=1,
+        source_high_water_mark=1,
+        capsule_ids=(capsule.capsule_id,),
+        exact_anchor_ids=(),
+        rendered_context="context",
+        token_cost=4,
+        audit_outcome=ac.SnapshotAuditOutcome(
+            mechanical_passed=True,
+            semantic_status=ac.SemanticAuditStatus.NOT_RUN,
+            failure_codes=(),
+        ),
+        state=ac.SnapshotState.COMMITTED,
+        created_at=NOW,
+        committed_at=NOW,
+    )
+    canonical_capsule_json = json.dumps(
+        capsule.model_dump(mode="json"),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+    audit_outcome = json.dumps(
+        snapshot.audit_outcome.model_dump(mode="json"),
+        ensure_ascii=False,
+        separators=(",", ":"),
+    )
+
+    connection.execute(
+        """
+        INSERT INTO sessions (
+            session_key_hash, canonical_session_key_json, platform_instance_id,
+            message_type, session_id, group_id, user_id, conversation_id,
+            persona_id, next_event_sequence, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 2, ?, ?)
+        """,
+        (
+            key.session_key_hash,
+            key.canonical_json(),
+            key.platform_instance_id,
+            key.message_type,
+            key.session_id,
+            key.group_id,
+            key.user_id,
+            key.conversation_id,
+            key.persona_id,
+            NOW,
+            NOW,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO journal_events (
+            event_id, session_key_hash, sequence, event_type, role, content,
+            source_hook, idempotency_key, token_count, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            event.event_id,
+            key.session_key_hash,
+            event.sequence,
+            event.event_type.value,
+            event.role.value,
+            event.content,
+            event.source_hook.value,
+            event.idempotency_key,
+            event.token_count,
+            NOW,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO capsules (
+            capsule_id, session_key_hash, level, covered_event_start,
+            covered_event_end, canonical_capsule_json, token_cost,
+            source_coverage, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            capsule.capsule_id,
+            key.session_key_hash,
+            capsule.level.value,
+            capsule.covered_event_start,
+            capsule.covered_event_end,
+            canonical_capsule_json,
+            capsule.token_cost,
+            capsule.quality.source_coverage,
+            NOW,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO snapshots (
+            snapshot_id, session_key_hash, base_snapshot_id, covered_event_end,
+            source_high_water_mark, exact_anchor_ids_json, rendered_context,
+            token_cost, audit_outcome, lifecycle_state, created_at, committed_at
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            snapshot.snapshot_id,
+            key.session_key_hash,
+            snapshot.base_snapshot_id,
+            snapshot.covered_event_end,
+            snapshot.source_high_water_mark,
+            "[]",
+            snapshot.rendered_context,
+            snapshot.token_cost,
+            audit_outcome,
+            snapshot.state.value,
+            NOW,
+            NOW,
+        ),
+    )
+    connection.execute(
+        """
+        INSERT INTO snapshot_capsules (snapshot_id, ordinal, capsule_id, slot)
+        VALUES (?, 0, ?, 'primary')
+        """,
+        (snapshot.snapshot_id, capsule.capsule_id),
+    )
+    return key
+
+
+def _insert_snapshot_reorganization_record(
+    connection: sqlite3.Connection,
+    *,
+    snapshot_id: str = "snapshot-1",
+    ordinal: int = 0,
+    source_capsule_id: str = "source-capsule-1",
+    kind: str = "goal",
+    item_id: str = "goal-1",
+    status: str = "retained",
+    before_tokens: int = 10,
+    after_tokens: int = 10,
+    required: int = 0,
+) -> None:
+    connection.execute(
+        """
+        INSERT INTO snapshot_reorganization_records (
+            snapshot_id,
+            ordinal,
+            source_capsule_id,
+            kind,
+            item_id,
+            status,
+            before_tokens,
+            after_tokens,
+            required
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            snapshot_id,
+            ordinal,
+            source_capsule_id,
+            kind,
+            item_id,
+            status,
+            before_tokens,
+            after_tokens,
+            required,
+        ),
     )
 
 
@@ -306,11 +529,12 @@ def _insert_job(
 
 def test_initial_migration_creates_complete_versioned_schema(tmp_path: Path) -> None:
     migrations, _, _, migrator_type = _migration_api()
-    factory = ac.SQLiteConnectionFactory(tmp_path)
+    factory = _migrated_factory(tmp_path)
     migrator = migrator_type(factory)
 
-    assert migrator.migrate() == 1
-    assert migrator.migrate() == 1
+    assert [migration.version for migration in migrations] == [1, 2, 3]
+    assert migrator.migrate() == 3
+    assert migrator.migrate() == 3
 
     with factory.connection(read_only=True) as connection:
         tables = {
@@ -324,11 +548,22 @@ def test_initial_migration_creates_complete_versioned_schema(tmp_path: Path) -> 
             )
         }
         ledger = connection.execute(
-            "SELECT version, name, checksum FROM schema_migrations"
-        ).fetchone()
+            "SELECT version, name, checksum FROM schema_migrations ORDER BY version"
+        ).fetchall()
         user_version = connection.execute("PRAGMA user_version").fetchone()[0]
+        indexes = {
+            row["name"]
+            for row in connection.execute(
+                """
+                SELECT name
+                FROM sqlite_master
+                WHERE type = 'index'
+                    AND tbl_name = 'snapshot_reorganization_records'
+                """
+            )
+        }
 
-    assert tables == {
+    assert {
         "active_snapshots",
         "capsules",
         "compaction_jobs",
@@ -336,13 +571,108 @@ def test_initial_migration_creates_complete_versioned_schema(tmp_path: Path) -> 
         "schema_migrations",
         "sessions",
         "snapshot_capsules",
+        "snapshot_reorganization_records",
         "snapshots",
-    }
-    assert ledger["version"] == migrations[0].version == 1
-    assert ledger["name"] == migrations[0].name
-    assert ledger["checksum"] == migrations[0].checksum
+        "token_metric_backfill_intents",
+        "token_metrics",
+    }.issubset(tables)
+    assert [row["version"] for row in ledger] == [1, 2, 3]
+    assert [row["name"] for row in ledger] == [migration.name for migration in migrations]
+    assert [row["checksum"] for row in ledger] == [migration.checksum for migration in migrations]
     assert migrations[0].checksum == hashlib.sha256(migrations[0].sql.encode("utf-8")).hexdigest()
-    assert user_version == 1
+    assert "idx_snapshot_reorganization_records_snapshot_ordinal" in indexes
+    assert user_version == 3
+
+
+def test_v1_database_upgrades_through_keyed_v2_to_snapshot_reorganization_ledger_v3(
+    tmp_path: Path,
+) -> None:
+    migrations, _, _, migrator_type = _migration_api()
+    assert [migration.version for migration in migrations] == [1, 2, 3]
+    factory = ac.SQLiteConnectionFactory(tmp_path)
+
+    assert migrator_type(factory, migrations=migrations[:1]).migrate() == 1
+    with factory.transaction() as connection:
+        legacy_key = _insert_valid_v1_upgrade_fixture(connection)
+
+    activation = activate_test_storage(factory)
+    migrator = migrator_type(factory)
+    assert migrator.migrate() == 3
+    assert migrator.migrate() == 3
+
+    with factory.connection(read_only=True) as connection:
+        versions = [
+            row["version"]
+            for row in connection.execute("SELECT version FROM schema_migrations ORDER BY version")
+        ]
+        session = connection.execute(
+            """
+            SELECT session_key_hash, canonical_session_key_json, next_event_sequence
+            FROM sessions
+            """
+        ).fetchone()
+        event = connection.execute(
+            """
+            SELECT event_id, session_key_hash, sequence, content, source_hook
+            FROM journal_events
+            """
+        ).fetchone()
+        capsule = connection.execute(
+            """
+            SELECT capsule_id, session_key_hash, token_cost_envelope, source_coverage
+            FROM capsules
+            """
+        ).fetchone()
+        membership = connection.execute(
+            """
+            SELECT snapshot_id, ordinal, capsule_id, slot
+            FROM snapshot_capsules
+            """
+        ).fetchone()
+        snapshot_count = connection.execute("SELECT COUNT(*) FROM snapshots").fetchone()[0]
+        record_count = connection.execute(
+            "SELECT COUNT(*) FROM snapshot_reorganization_records"
+        ).fetchone()[0]
+        user_version = connection.execute("PRAGMA user_version").fetchone()[0]
+
+    assert versions == [1, 2, 3]
+    assert (
+        session["session_key_hash"],
+        activation.codec.decrypt_object_json(
+            "sessions",
+            "canonical_session_key_json",
+            legacy_key.session_key_hash,
+            session["canonical_session_key_json"],
+        ),
+        session["next_event_sequence"],
+    ) == (legacy_key.session_key_hash, legacy_key.canonical_json(), 2)
+    assert (
+        event["event_id"],
+        event["session_key_hash"],
+        event["sequence"],
+        activation.codec.decrypt_text(
+            "journal_events",
+            "content",
+            "event-1",
+            event["content"],
+        ),
+        event["source_hook"],
+    ) == ("event-1", legacy_key.session_key_hash, 1, "hello", "ON_LLM_REQUEST")
+    assert (
+        capsule["capsule_id"],
+        capsule["session_key_hash"],
+        activation.codec.decrypt_non_negative_int(
+            "capsules",
+            "token_cost",
+            "capsule-1",
+            capsule["token_cost_envelope"],
+        ),
+        capsule["source_coverage"],
+    ) == ("capsule-1", legacy_key.session_key_hash, 4, 1.0)
+    assert tuple(membership) == ("snapshot-1", 0, "capsule-1", "primary")
+    assert snapshot_count == 1
+    assert record_count == 0
+    assert user_version == 3
 
 
 def test_packaged_format_two_migration_is_keyed_and_ordinary_runner_stops_at_v1(
@@ -354,12 +684,15 @@ def test_packaged_format_two_migration_is_keyed_and_ordinary_runner_stops_at_v1(
     assert [(migration.version, migration.name) for migration in migrations] == [
         (1, "initial_schema"),
         (2, "encrypted_token_metrics"),
+        (3, "snapshot_reorganization_ledger"),
     ]
-    assert [migration.requires_codec for migration in migrations] == [False, True]
+    assert [migration.requires_codec for migration in migrations] == [False, True, False]
     assert migrations[1].sql == migrations_module.SECURE_FORMAT_V2_CONTRACT_SQL
     assert "CREATE TABLE token_metrics" in migrations[1].sql
     assert "CREATE TABLE token_metric_backfill_intents" in migrations[1].sql
     assert "CREATE INDEX idx_token_metric_backfill_session" in migrations[1].sql
+    assert "CREATE TABLE snapshot_reorganization_records" in migrations[2].sql
+    assert "idx_snapshot_reorganization_records_snapshot_ordinal" in migrations[2].sql
 
     assert migrator_type(factory).migrate() == 1
     with factory.connection(read_only=True) as connection:
@@ -388,7 +721,7 @@ def test_ordinary_runner_validates_an_already_durable_keyed_ledger(
     tmp_path: Path,
 ) -> None:
     migrations, _, _, migrator_type = _migration_api()
-    factory = _migrated_factory(tmp_path)
+    factory = _plain_v1_factory(tmp_path)
     with factory.transaction(immediate=True) as connection:
         connection.execute(
             """
@@ -399,14 +732,14 @@ def test_ordinary_runner_validates_an_already_durable_keyed_ledger(
         )
         connection.execute("PRAGMA user_version = 2")
 
-    assert migrator_type(factory).migrate() == 2
+    assert migrator_type(factory).migrate() == 3
 
 
 def test_exact_v020_migration_name_alias_is_accepted_without_rewriting_history(
     tmp_path: Path,
 ) -> None:
     migrations, _, _, migrator_type = _migration_api()
-    factory = _migrated_factory(tmp_path)
+    factory = _plain_v1_factory(tmp_path)
     with factory.transaction(immediate=True) as connection:
         connection.execute("DROP TRIGGER schema_migrations_immutable_update")
         connection.execute(
@@ -434,7 +767,7 @@ def test_v1_migration_alias_rejects_wrong_checksum_or_other_names(
     checksum: str | None,
 ) -> None:
     migrations, _, checksum_error, migrator_type = _migration_api()
-    factory = _migrated_factory(tmp_path)
+    factory = _plain_v1_factory(tmp_path)
     with factory.transaction(immediate=True) as connection:
         connection.execute("DROP TRIGGER schema_migrations_immutable_update")
         connection.execute(
@@ -475,6 +808,7 @@ def test_text_primary_identity_columns_are_explicitly_not_null(tmp_path: Path) -
 
 def test_foreign_keys_identity_and_event_triples_are_enforced(tmp_path: Path) -> None:
     factory = _migrated_factory(tmp_path)
+    codec = storage_test_codec()
 
     with factory.transaction() as connection:
         with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
@@ -485,34 +819,144 @@ def test_foreign_keys_identity_and_event_triples_are_enforced(tmp_path: Path) ->
             connection.execute(
                 """
                 INSERT INTO journal_events VALUES (
-                    'orphan', ?, 1, 'USER_MESSAGE', 'USER', 'x',
-                    'ON_LLM_REQUEST', 'orphan', 1, ?
+                    'orphan', ?, 1, 'USER_MESSAGE', 'USER', ?,
+                    'ON_LLM_REQUEST', 'orphan', ?, ?
                 )
                 """,
-                ("b" * 64, NOW),
+                (
+                    "b" * 64,
+                    codec.encrypt_text("journal_events", "content", "orphan", "x"),
+                    codec.encrypt_non_negative_int("journal_events", "token_count", "orphan", 1),
+                    NOW,
+                ),
             )
         with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
             connection.execute(
                 """
                 INSERT INTO journal_events VALUES (
-                    'bad-triple', ?, 1, 'USER_MESSAGE', 'ASSISTANT', 'x',
-                    'ON_LLM_REQUEST', 'bad-triple', 1, ?
+                    'bad-triple', ?, 1, 'USER_MESSAGE', 'ASSISTANT', ?,
+                    'ON_LLM_REQUEST', 'bad-triple', ?, ?
                 )
                 """,
-                (SESSION_HASH, NOW),
+                (
+                    SESSION_HASH,
+                    codec.encrypt_text("journal_events", "content", "bad-triple", "x"),
+                    codec.encrypt_non_negative_int(
+                        "journal_events", "token_count", "bad-triple", 1
+                    ),
+                    NOW,
+                ),
             )
         with pytest.raises(sqlite3.IntegrityError, match="CHECK"):
             connection.execute(
                 """
                 INSERT INTO journal_events VALUES (
-                    'legacy-hook', ?, 1, 'ASSISTANT_MESSAGE', 'ASSISTANT', 'x',
-                    'ON_LLM_RESPONSE', 'legacy-hook', 1, ?
+                    'legacy-hook', ?, 1, 'ASSISTANT_MESSAGE', 'ASSISTANT', ?,
+                    'ON_LLM_RESPONSE', 'legacy-hook', ?, ?
                 )
                 """,
-                (SESSION_HASH, NOW),
+                (
+                    SESSION_HASH,
+                    codec.encrypt_text("journal_events", "content", "legacy-hook", "x"),
+                    codec.encrypt_non_negative_int(
+                        "journal_events", "token_count", "legacy-hook", 1
+                    ),
+                    NOW,
+                ),
             )
 
         _insert_event(connection)
+
+
+def test_snapshot_reorganization_record_schema_enforces_contract(tmp_path: Path) -> None:
+    migrations, _, _, _ = _migration_api()
+    assert [migration.version for migration in migrations] == [1, 2, 3]
+    factory = _migrated_factory(tmp_path)
+
+    with factory.transaction() as connection:
+        _insert_session(connection)
+        _insert_event(connection)
+        _insert_capsule_snapshot_membership(connection)
+        _insert_snapshot_reorganization_record(connection)
+        _insert_snapshot_reorganization_record(
+            connection,
+            ordinal=1,
+            source_capsule_id="source-retained",
+            kind="constraint",
+            item_id="retained-boundary",
+            before_tokens=0,
+            after_tokens=0,
+            required=1,
+        )
+        _insert_snapshot_reorganization_record(
+            connection,
+            ordinal=2,
+            source_capsule_id="source-approximate",
+            kind="constraint",
+            item_id="approximate-boundary",
+            status="approximate",
+            before_tokens=0,
+            after_tokens=0,
+        )
+        _insert_snapshot_reorganization_record(
+            connection,
+            ordinal=3,
+            source_capsule_id="source-released",
+            kind="constraint",
+            item_id="released-boundary",
+            status="released",
+            after_tokens=0,
+        )
+
+        columns = (
+            "snapshot_id",
+            "ordinal",
+            "source_capsule_id",
+            "kind",
+            "item_id",
+            "status",
+            "before_tokens",
+            "after_tokens",
+            "required",
+        )
+        values: list[object] = [
+            "snapshot-1",
+            4,
+            "source-null",
+            "constraint",
+            "null-boundary",
+            "retained",
+            0,
+            0,
+            0,
+        ]
+        for index, column in enumerate(columns):
+            null_values = list(values)
+            null_values[index] = None
+            with pytest.raises(sqlite3.IntegrityError, match="NOT NULL"):
+                connection.execute(
+                    f"INSERT INTO snapshot_reorganization_records ({', '.join(columns)}) "
+                    f"VALUES ({', '.join('?' for _ in columns)})",
+                    tuple(null_values),
+                )
+
+        for overrides in (
+            {"snapshot_id": " "},
+            {"ordinal": -1},
+            {"source_capsule_id": "\t"},
+            {"kind": "\n"},
+            {"item_id": " "},
+            {"status": "unknown"},
+            {"before_tokens": -1},
+            {"after_tokens": -1},
+            {"required": 2},
+            {"required": -1},
+            {"snapshot_id": "missing-snapshot", "ordinal": 1},
+            {"ordinal": 0, "item_id": "different-item"},
+            {"ordinal": 1},
+        ):
+            with pytest.raises(sqlite3.IntegrityError):
+                _insert_snapshot_reorganization_record(connection, **overrides)
 
 
 @pytest.mark.parametrize(
@@ -586,12 +1030,12 @@ def test_nonterminal_job_chain_is_unique_per_session(tmp_path: Path) -> None:
         ),
         (
             "capsules",
-            "UPDATE capsules SET token_cost = 5 WHERE capsule_id = 'capsule-1'",
+            "UPDATE capsules SET token_cost_envelope = 'acenc:v1:changed' WHERE capsule_id = 'capsule-1'",
             "DELETE FROM capsules WHERE capsule_id = 'capsule-1'",
         ),
         (
             "snapshots",
-            "UPDATE snapshots SET token_cost = 5 WHERE snapshot_id = 'snapshot-1'",
+            "UPDATE snapshots SET token_cost_envelope = 'acenc:v1:changed' WHERE snapshot_id = 'snapshot-1'",
             "DELETE FROM snapshots WHERE snapshot_id = 'snapshot-1'",
         ),
         (
@@ -603,6 +1047,18 @@ def test_nonterminal_job_chain_is_unique_per_session(tmp_path: Path) -> None:
             """,
             """
             DELETE FROM snapshot_capsules
+            WHERE snapshot_id = 'snapshot-1' AND ordinal = 0
+            """,
+        ),
+        (
+            "snapshot_reorganization_records",
+            """
+            UPDATE snapshot_reorganization_records
+            SET after_tokens = 5
+            WHERE snapshot_id = 'snapshot-1' AND ordinal = 0
+            """,
+            """
+            DELETE FROM snapshot_reorganization_records
             WHERE snapshot_id = 'snapshot-1' AND ordinal = 0
             """,
         ),
@@ -619,6 +1075,7 @@ def test_append_only_and_snapshot_content_rows_are_immutable(
         _insert_session(connection)
         _insert_event(connection)
         _insert_capsule_snapshot_membership(connection)
+        _insert_snapshot_reorganization_record(connection)
 
     with (
         pytest.raises(
@@ -700,9 +1157,10 @@ def test_missing_json_functions_raise_a_diagnostic_migration_error(tmp_path: Pat
         migrator_type(MissingJsonFactory()).migrate()
 
 
-def test_applied_migration_checksum_drift_is_rejected(tmp_path: Path) -> None:
+def test_applied_v1_migration_checksum_drift_is_rejected(tmp_path: Path) -> None:
     migrations, migration_type, checksum_error, migrator_type = _migration_api()
-    factory = _migrated_factory(tmp_path)
+    factory = ac.SQLiteConnectionFactory(tmp_path)
+    assert migrator_type(factory, migrations=migrations[:1]).migrate() == 1
     original = migrations[0]
     drifted = migration_type(
         version=original.version,
@@ -714,9 +1172,76 @@ def test_applied_migration_checksum_drift_is_rejected(tmp_path: Path) -> None:
         migrator_type(factory, migrations=(drifted,)).migrate()
 
 
+def test_applied_v2_migration_checksum_drift_is_rejected(tmp_path: Path) -> None:
+    migrations, migration_type, checksum_error, migrator_type = _migration_api()
+    assert [migration.version for migration in migrations] == [1, 2, 3]
+    factory = _plain_v1_factory(tmp_path)
+    activate_test_storage(factory)
+    original = migrations[1]
+    drifted = migration_type(
+        version=original.version,
+        name=original.name,
+        sql=f"{original.sql}\n-- unauthorized drift\n",
+    )
+
+    with pytest.raises(checksum_error, match="checksum"):
+        migrator_type(factory, migrations=(migrations[0], drifted)).migrate()
+
+
+def test_applied_v3_migration_checksum_drift_is_rejected(tmp_path: Path) -> None:
+    migrations, migration_type, checksum_error, migrator_type = _migration_api()
+    factory = _migrated_factory(tmp_path)
+    original = migrations[2]
+    drifted = migration_type(
+        version=original.version,
+        name=original.name,
+        sql=f"{original.sql}\n-- unauthorized drift\n",
+    )
+
+    with pytest.raises(checksum_error, match="checksum"):
+        migrator_type(factory, migrations=(*migrations[:2], drifted)).migrate()
+
+
 def test_failed_migration_rolls_back_its_ddl_and_ledger_entry(tmp_path: Path) -> None:
     migrations, migration_type, _, migrator_type = _migration_api()
+    assert [migration.version for migration in migrations] == [1, 2, 3]
     factory = _migrated_factory(tmp_path)
+    broken = migration_type(
+        version=4,
+        name="broken_injected_migration",
+        sql="""
+        CREATE TABLE should_rollback (value INTEGER NOT NULL);
+        INSERT INTO table_that_does_not_exist VALUES (1);
+        """,
+    )
+
+    with pytest.raises(ac.MigrationError, match="migration 4"):
+        migrator_type(factory, migrations=(*migrations, broken)).migrate()
+
+    with factory.connection(read_only=True) as connection:
+        versions = [
+            row["version"]
+            for row in connection.execute("SELECT version FROM schema_migrations ORDER BY version")
+        ]
+        rolled_back_table = connection.execute(
+            """
+            SELECT name
+            FROM sqlite_master
+            WHERE type = 'table' AND name = 'should_rollback'
+            """
+        ).fetchone()
+        user_version = connection.execute("PRAGMA user_version").fetchone()[0]
+
+    assert versions == [1, 2, 3]
+    assert rolled_back_table is None
+    assert user_version == 3
+
+
+def test_failed_migration_rolls_back_its_ddl_and_ledger_entry_from_v1_prefix(
+    tmp_path: Path,
+) -> None:
+    migrations, migration_type, _, migrator_type = _migration_api()
+    factory = _plain_v1_factory(tmp_path)
     broken = migration_type(
         version=2,
         name="broken_injected_migration",
@@ -735,11 +1260,7 @@ def test_failed_migration_rolls_back_its_ddl_and_ledger_entry(tmp_path: Path) ->
             for row in connection.execute("SELECT version FROM schema_migrations ORDER BY version")
         ]
         rolled_back_table = connection.execute(
-            """
-            SELECT name
-            FROM sqlite_master
-            WHERE type = 'table' AND name = 'should_rollback'
-            """
+            "SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'should_rollback'"
         ).fetchone()
         user_version = connection.execute("PRAGMA user_version").fetchone()[0]
 
@@ -750,7 +1271,45 @@ def test_failed_migration_rolls_back_its_ddl_and_ledger_entry(tmp_path: Path) ->
 
 def test_sql_splitter_preserves_semicolons_and_trailing_comments(tmp_path: Path) -> None:
     migrations, migration_type, _, migrator_type = _migration_api()
+    assert [migration.version for migration in migrations] == [1, 2, 3]
     factory = _migrated_factory(tmp_path)
+    syntax_edges = migration_type(
+        version=4,
+        name="sql_syntax_edges",
+        sql="""
+        -- A line-comment semicolon must not split a statement;
+        CREATE TABLE "edge;table" ("value;column" TEXT NOT NULL);
+        /* A block-comment semicolon must not split a statement; */
+        INSERT INTO "edge;table" VALUES ('before;trigger');
+        CREATE TABLE trigger_audit (value TEXT NOT NULL);
+        CREATE TRIGGER edge_table_audit
+        AFTER INSERT ON "edge;table"
+        BEGIN
+            INSERT INTO trigger_audit VALUES (NEW."value;column" || ';trigger');
+        END;
+        INSERT INTO "edge;table" VALUES ('after;trigger');
+        -- A trailing comment is not an incomplete SQL statement.
+        """,
+    )
+
+    assert migrator_type(factory, migrations=(*migrations, syntax_edges)).migrate() == 4
+
+    with factory.connection(read_only=True) as connection:
+        values = [
+            row[0]
+            for row in connection.execute('SELECT "value;column" FROM "edge;table" ORDER BY rowid')
+        ]
+        audit_values = [row[0] for row in connection.execute("SELECT value FROM trigger_audit")]
+
+    assert values == ["before;trigger", "after;trigger"]
+    assert audit_values == ["after;trigger;trigger"]
+
+
+def test_sql_splitter_preserves_semicolons_and_trailing_comments_from_v1_prefix(
+    tmp_path: Path,
+) -> None:
+    migrations, migration_type, _, migrator_type = _migration_api()
+    factory = _plain_v1_factory(tmp_path)
     syntax_edges = migration_type(
         version=2,
         name="sql_syntax_edges",

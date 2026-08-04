@@ -6,6 +6,40 @@ All notable changes to AstrContinuum are documented in this file. The format fol
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/), and version numbers follow
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## v0.3.0 — 2026-08-04
+
+Technical Preview of the durable publication boundary. This entry records repository state; it
+does not claim that CRM/reorganization is wired into normal background compaction, that a
+rollback UI exists, or that a performance or provider-compatibility certification was completed.
+
+### Added
+
+- Immutable `snapshot_reorganization_records` ledger rows as a schema-v3, append-only
+  publication add-on. An explicit publisher may supply canonicalized records; ordinary worker
+  publication uses an empty record set.
+- A permanent publication floor that rejects a non-summary `released` record even when optional
+  semantic review is disabled.
+- A traceable public evidence boundary and separate release workflow, with English and
+  Simplified Chinese companion pages.
+
+### Changed
+
+- The publication chain keeps the existing keyed security and canonical-token metric baseline;
+  the v0.3 ledger is an additive durable contract rather than a replacement for it.
+- Public metadata declares AstrBot `>=4.24.2,<5.0.0`, the organization repository URL, and the
+  AGPL-3.0-or-later license consistently with the release surface.
+- The README is reduced to the released boundary, operations entry points, documentation map,
+  and one explicitly isolated experiment graphic.
+
+### Known limitations
+
+- The standard `CompactionWorker` does not call a reorganization engine and normally publishes
+  an empty ledger.
+- There is no public time-travel, rollback, compaction, key-management, or destructive database
+  administration command.
+- Isolated experiment artifacts are provenance material, not production semantic, performance,
+  or compatibility evidence.
+
 ## v0.2.1 — 2026-07-28
 
 Request budgeting now uses immutable, request-local tokenizer profiles while preserving every
@@ -151,6 +185,32 @@ AstrBot plugin market, tagged as a stable release, or published as a GitHub Rele
 本文件记录 AstrContinuum 的重要变更，格式参考
 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循
 [语义化版本](https://semver.org/lang/zh-CN/)。
+
+### v0.3.0 — 2026-08-04
+
+这是持久化发布边界的技术预览。本条目只记录仓库状态；不表示 CRM/重组已经接入常规后台
+压缩，不表示已经提供回滚界面，也不表示已经完成性能或 Provider 兼容性认证。
+
+#### 新增
+
+- `snapshot_reorganization_records` 不可变账本行：作为 schema-v3 的只追加发布附加契约。
+  显式发布器可以提供规范化记录；普通 worker 发布空记录集。
+- 永久发布质量下限：即使关闭可选语义审计，非摘要 `released` 记录仍会被拒绝。
+- 可追溯的公开证据边界和独立发布工作流，并提供英文与简体中文对应页。
+
+#### 变更
+
+- 发布链保留既有 keyed 安全和规范 token 指标基线；v0.3 账本是加法型持久化契约，并不
+  取代原有基线。
+- 公开元数据统一声明 AstrBot `>=4.24.2,<5.0.0`、组织仓库地址和 AGPL-3.0-or-later
+  许可证。
+- README 收敛为发布边界、运维入口、文档导航及一张明确隔离的实验图。
+
+#### 已知限制
+
+- 标准 `CompactionWorker` 不调用重组引擎，常规情况下发布空账本。
+- 尚无公开的时间旅行、回滚、压缩、密钥管理或破坏性数据库管理命令。
+- 隔离实验产物用于来源追溯，不是生产语义、性能或兼容性证据。
 
 ### v0.2.1 — 2026-07-28
 

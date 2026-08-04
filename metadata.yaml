@@ -1,10 +1,23 @@
 name: astrbot_plugin_astrcontinuum
-display_name: AstrContinuum
-desc: "Pressure-triggered encrypted context runtime for AstrBot with verified fallback."
-short_desc: "Encrypted Journal, verified request-local context, and reversible Provider View."
-version: v0.2.1
+display_name: AstrContinuum / 星续
+desc: "Non-blocking durable long-context runtime for AstrBot / AstrBot 非阻塞、持久化长上下文运行时。"
+short_desc: "Durable context; conversations stay continuous. / 上下文可压缩，对话不断裂。"
+version: v0.3.0
 author: Ayleovelle
 license: AGPL-3.0-or-later
-repo: https://github.com/2718labs/astrbot_plugin_astrcontinuum
+repo: "https://github.com/2718labs/astrbot_plugin_astrcontinuum"
 support_platforms: []
-astrbot_version: ">=4.24.0,<5.0.0"
+astrbot_version: ">=4.24.2,<5.0.0"
+
+compatibility_matrix:
+  min_python: "3.10"
+  max_python: "3.13"
+  tested_platforms: ["linux", "windows"]
+resource_budget:
+  memory_mb: 256
+  cpu_percent: 10
+  disk_mb: 2048
+personality_impact:
+  modifies_personality: false
+  modifies_memory: false
+  modifies_proactive: false

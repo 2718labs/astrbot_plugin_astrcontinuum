@@ -8,11 +8,20 @@ import uuid
 from collections import Counter, OrderedDict
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
+from datetime import timedelta
 from typing import TYPE_CHECKING, Any, TypeVar, cast
 
-from astrbot.api import logger  # type: ignore[import-not-found]
-from astrbot.api.event import AstrMessageEvent, filter  # type: ignore[import-not-found]
-from astrbot.api.star import Context, Star, StarTools, register  # type: ignore[import-not-found]
+from astrbot.api import logger  # type: ignore[import-not-found, import-untyped]
+from astrbot.api.event import (  # type: ignore[import-not-found, import-untyped]
+    AstrMessageEvent,
+    filter,
+)
+from astrbot.api.star import (  # type: ignore[import-not-found, import-untyped]
+    Context,
+    Star,
+    StarTools,
+    register,
+)
 
 if TYPE_CHECKING or not __package__:
     from astrcontinuum.adapters import (
@@ -31,6 +40,9 @@ if TYPE_CHECKING or not __package__:
         CompactionProviderBinding,
         CompactionWorker,
         CompactionWorkerConfig,
+        CompilerBackend,
+        SegmenterConfig,
+        SemanticAuditBackend,
         SessionProviderRegistry,
     )
     from astrcontinuum.context_graph import ContextEngineMode, LiveContextTrace
@@ -51,6 +63,7 @@ if TYPE_CHECKING or not __package__:
         verify_native,
     )
     from astrcontinuum.runtime.types import BudgetErrorCode
+    from astrcontinuum.scheduler import CoalescingCompactionScheduler
     from astrcontinuum.storage import (
         KeySource,
         SecurityErrorCode,
@@ -97,6 +110,9 @@ else:
         CompactionProviderBinding,
         CompactionWorker,
         CompactionWorkerConfig,
+        CompilerBackend,
+        SegmenterConfig,
+        SemanticAuditBackend,
         SessionProviderRegistry,
     )
     from .astrcontinuum.context_graph import ContextEngineMode, LiveContextTrace
@@ -117,6 +133,7 @@ else:
         verify_native,
     )
     from .astrcontinuum.runtime.types import BudgetErrorCode
+    from .astrcontinuum.scheduler import CoalescingCompactionScheduler
     from .astrcontinuum.storage import (
         KeySource,
         SecurityErrorCode,
@@ -341,7 +358,7 @@ def _host_texts(message: object) -> tuple[str, ...]:
     "astrbot_plugin_astrcontinuum",
     "Ayleovelle",
     "Non-blocking infinite context runtime for AstrBot",
-    "0.2.1",
+    "0.3.0",
 )
 class AstrContinuumPlugin(Star):
     """One standards-compliant Star with reversible provider projection."""
@@ -350,6 +367,9 @@ class AstrContinuumPlugin(Star):
         self,
         context: Context,
         config: dict[str, Any] | None = None,
+        *,
+        compiler_backend: CompilerBackend | None = None,
+        semantic_audit_backend: SemanticAuditBackend | None = None,
     ) -> None:
         super().__init__(context, config)
         self.config = config or {}
@@ -357,8 +377,14 @@ class AstrContinuumPlugin(Star):
         self._initialize_lock = asyncio.Lock()
         self._initialized = False
         self._bridge: AstrBotHookBridge | None = None
+        # v0.2.1 checks projection capability during each build.  Keep the
+        # v0.3 lifecycle marker without reviving the removed private probe API.
+        self._capability: object | None = None
+        self._compiler_backend = compiler_backend
+        self._semantic_audit_backend = semantic_audit_backend
         self._providers: SessionProviderRegistry | None = None
         self._worker: CompactionWorker | None = None
+        self._scheduler: CoalescingCompactionScheduler | None = None
         self._thinking_compatibility: ProviderThinkingCompatibility | None = None
         self._tokenizer_registry = TokenizerRegistry()
         self._tokenizer_router = TokenizerRouter()
@@ -765,6 +791,23 @@ class AstrContinuumPlugin(Star):
         except Exception:  # noqa: BLE001 - defer with a stable unavailable code
             return None
 
+    def _provider_runtime_is_available(
+        self,
+        provider_override: CompactionProviderBinding | None,
+    ) -> bool:
+        """Admit the background lane only with public provider evidence."""
+
+        if provider_override is not None:
+            return True
+        resolver = getattr(self.context, "get_current_chat_provider_id", None)
+        catalog = getattr(self.context, "get_all_providers", None)
+        if not callable(resolver) or not callable(catalog):
+            return False
+        try:
+            return bool(tuple(catalog()))
+        except Exception:  # noqa: BLE001 - an opaque host catalog is unavailable.
+            return False
+
     def _invalidate_current_provider_binding(
         self,
         event: AstrMessageEvent,
@@ -887,6 +930,7 @@ class AstrContinuumPlugin(Star):
             self._ensure_thinking_compatibility()
 
             worker: CompactionWorker | None = None
+            scheduler: CoalescingCompactionScheduler | None = None
             key_source = self._configured_key_source_label()
             key_id = "NONE"
             try:
@@ -913,6 +957,7 @@ class AstrContinuumPlugin(Star):
                     counter_provider=self._tokenizer_registry.counter_for,
                     context_engine_mode=self._context_engine_mode,
                 )
+                self._capability = object()
                 configured_provider = self.config.get("compaction_provider_id", "")
                 provider_override_configured = isinstance(configured_provider, str) and bool(
                     configured_provider.strip()
@@ -927,40 +972,114 @@ class AstrContinuumPlugin(Star):
                     provider_override=provider_override,
                     provider_override_configured=provider_override_configured,
                 )
-                backend = AstrBotExtractiveCompilerBackend(
-                    generator=self._generate_compaction,
-                    providers=providers,
-                    compatibility_counter=compatibility_counter,
-                    tokenizer_router=self._tokenizer_router,
-                    counter_provider=self._tokenizer_registry.counter_for,
-                )
-                try:
-                    canonical_counter = await asyncio.to_thread(
-                        self._tokenizer_registry.counter_for,
-                        CANONICAL_O200K,
-                    )
-                except Exception:  # noqa: BLE001 - worker exposes only stable deferral codes
-                    canonical_counter = None
-                worker = CompactionWorker(
-                    repository=repository,
-                    backend=backend,
-                    compatibility_counter=compatibility_counter,
-                    canonical_counter=canonical_counter,
-                    canonical_profile_id=CANONICAL_O200K.profile_id,
-                    provider_bindings=providers,
-                    worker_id=f"astrbot-{uuid.uuid4().hex}",
-                    config=self._worker_config(),
-                    fatal_storage_callback=self._on_worker_storage_failure,
-                )
-                await worker.start()
+                if self._compiler_backend is not None:
+                    # The v0.3 lane is deliberately opt-in.  Its scheduler only
+                    # forwards durable intents to the injected compiler; hooks do
+                    # not execute compaction inline.
+                    try:
+                        worker = CompactionWorker(
+                            repository=repository,
+                            compiler_backend=self._compiler_backend,
+                            counter=Utf8ByteTokenCounter(),
+                            config=CompactionWorkerConfig(
+                                worker_id="astrcontinuum-main",
+                                lease_duration=timedelta(seconds=30),
+                                token_ceiling=130_000,
+                                segmenter_config=SegmenterConfig(),
+                                strict_audit=self._semantic_audit_backend is not None,
+                                max_attempts=3,
+                                retry_delay=timedelta(seconds=5),
+                            ),
+                            audit_backend=self._semantic_audit_backend,
+                        )
+                        active_worker = worker
+
+                        async def wake_compaction_worker(session_key_hash: str) -> None:
+                            await self._wake_compaction_worker(active_worker, session_key_hash)
+
+                        scheduler = CoalescingCompactionScheduler(wake_compaction_worker)
+                        await scheduler.start()
+                    except asyncio.CancelledError:
+                        if scheduler is not None:
+                            await scheduler.close()
+                        raise
+                    except Exception:  # noqa: BLE001 - optional scheduler is fail-open
+                        if scheduler is not None:
+                            try:
+                                await scheduler.close()
+                            except Exception:  # noqa: BLE001 - cleanup is best effort
+                                logger.warning(
+                                    "AstrContinuum fail-open code=%s stage=%s",
+                                    "COMPACTION_SCHEDULER_CLOSE_FAILED",
+                                    "COMPACTION_SCHEDULER",
+                                )
+                        worker = None
+                        scheduler = None
+                        logger.warning(
+                            "AstrContinuum fail-open code=%s stage=%s",
+                            "COMPACTION_SCHEDULER_START_FAILED",
+                            "COMPACTION_SCHEDULER",
+                        )
+                elif self._provider_runtime_is_available(provider_override):
+                    # Keep the established provider-bound runtime active for
+                    # both an explicit override and the current-session binding.
+                    try:
+                        backend = AstrBotExtractiveCompilerBackend(
+                            generator=self._generate_compaction,
+                            providers=providers,
+                            compatibility_counter=compatibility_counter,
+                            tokenizer_router=self._tokenizer_router,
+                            counter_provider=self._tokenizer_registry.counter_for,
+                        )
+                        try:
+                            canonical_counter = await asyncio.to_thread(
+                                self._tokenizer_registry.counter_for,
+                                CANONICAL_O200K,
+                            )
+                        except Exception:  # noqa: BLE001 - stable deferral codes remain available
+                            canonical_counter = None
+                        worker = CompactionWorker(
+                            repository=repository,
+                            backend=backend,
+                            compatibility_counter=compatibility_counter,
+                            canonical_counter=canonical_counter,
+                            canonical_profile_id=CANONICAL_O200K.profile_id,
+                            provider_bindings=providers,
+                            worker_id=f"astrbot-{uuid.uuid4().hex}",
+                            config=self._worker_config(),
+                            fatal_storage_callback=self._on_worker_storage_failure,
+                        )
+                        await worker.start()
+                    except asyncio.CancelledError:
+                        await self._close_worker_safely(worker)
+                        raise
+                    except StorageSecurityError:
+                        await self._close_worker_safely(worker)
+                        raise
+                    except Exception:
+                        await self._close_worker_safely(worker)
+                        raise
             except asyncio.CancelledError:
+                if scheduler is not None:
+                    await scheduler.close()
                 await self._close_worker_safely(worker)
                 raise
             except StorageSecurityError as error:
+                if scheduler is not None:
+                    try:
+                        await scheduler.close()
+                    except Exception:  # noqa: BLE001 - cleanup is best effort
+                        logger.warning(
+                            "AstrContinuum fail-open code=%s stage=%s",
+                            "COMPACTION_SCHEDULER_CLOSE_FAILED",
+                            "COMPACTION_SCHEDULER",
+                        )
                 await self._close_worker_safely(worker)
                 self._bridge = None
                 self._providers = None
                 self._worker = None
+                self._scheduler = None
+                self._capability = None
                 self._storage_status = self._locked_storage_status(
                     error.code.value,
                     key_source=key_source,
@@ -973,10 +1092,21 @@ class AstrContinuumPlugin(Star):
                 )
                 return
             except Exception:  # noqa: BLE001 - startup details stay private
+                if scheduler is not None:
+                    try:
+                        await scheduler.close()
+                    except Exception:  # noqa: BLE001 - cleanup is best effort
+                        logger.warning(
+                            "AstrContinuum fail-open code=%s stage=%s",
+                            "COMPACTION_SCHEDULER_CLOSE_FAILED",
+                            "COMPACTION_SCHEDULER",
+                        )
                 await self._close_worker_safely(worker)
                 self._bridge = None
                 self._providers = None
                 self._worker = None
+                self._scheduler = None
+                self._capability = None
                 self._storage_status = self._locked_storage_status(
                     "STORAGE_STARTUP_FAILED",
                     key_source=key_source,
@@ -992,6 +1122,7 @@ class AstrContinuumPlugin(Star):
             self._bridge = bridge
             self._providers = providers
             self._worker = worker
+            self._scheduler = scheduler
             self._storage_status = _StorageRuntimeStatus(
                 protection=("LOCAL_KEY_DEGRADED" if keys.local_degraded else "ACTIVE"),
                 key_source=key_source,
@@ -1009,15 +1140,28 @@ class AstrContinuumPlugin(Star):
 
     async def _enter_storage_locked(self, error: StorageSecurityError) -> None:
         current_task = asyncio.current_task()
+        scheduler: CoalescingCompactionScheduler | None = None
         async with self._initialize_lock:
             worker = self._worker
+            scheduler = self._scheduler
             self._bridge = None
             self._providers = None
             self._worker = None
+            self._scheduler = None
+            self._capability = None
             self._storage_status = self._locked_storage_status(error.code.value)
             self._initialized = True
             if worker is not None and worker.task is not current_task:
                 await self._close_worker_safely(worker)
+        if scheduler is not None:
+            try:
+                await scheduler.close()
+            except Exception:  # noqa: BLE001 - storage lock cleanup is best effort
+                logger.warning(
+                    "AstrContinuum fail-open code=%s stage=%s",
+                    "COMPACTION_SCHEDULER_CLOSE_FAILED",
+                    "COMPACTION_SCHEDULER",
+                )
         logger.error(
             "AstrContinuum storage locked code=%s",
             error.code.value,
@@ -1029,15 +1173,47 @@ class AstrContinuumPlugin(Star):
     async def terminate(self) -> None:
         """Release request composition state idempotently."""
 
+        scheduler: CoalescingCompactionScheduler | None = None
+        worker: CompactionWorker | None = None
         async with self._initialize_lock:
+            scheduler = self._scheduler
+            self._scheduler = None
             self._terminate_thinking_compatibility()
             worker = self._worker
             self._bridge = None
             self._providers = None
             self._worker = None
+            self._capability = None
             self._initialized = False
             self._storage_status = self._initial_storage_status()
-            await self._close_worker_safely(worker)
+        if scheduler is not None:
+            try:
+                await scheduler.close()
+            except asyncio.CancelledError:
+                raise
+            except Exception:  # noqa: BLE001 - termination remains fail-open.
+                logger.warning(
+                    "AstrContinuum fail-open code=%s stage=%s",
+                    "COMPACTION_SCHEDULER_CLOSE_FAILED",
+                    "COMPACTION_SCHEDULER",
+                )
+        await self._close_worker_safely(worker)
+
+    async def _wake_compaction_worker(
+        self,
+        worker: CompactionWorker,
+        _session_key_hash: str,
+    ) -> None:
+        try:
+            await worker.run_once()
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - callback errors must not kill the scheduler.
+            logger.warning(
+                "AstrContinuum fail-open code=%s stage=%s",
+                "COMPACTION_WORKER_RUN_FAILED",
+                "COMPACTION_WORKER",
+            )
 
     def _record_fault(
         self,
@@ -1401,7 +1577,21 @@ class AstrContinuumPlugin(Star):
                     target_high_water_mark=state.assistant_event.sequence,
                 )
                 state.intent_raised = True
-                if job is not None and self._worker is not None:
+                scheduler = self._scheduler
+                if job is not None and scheduler is not None:
+                    try:
+                        await scheduler.notify(job.session_key.session_key_hash)
+                    except asyncio.CancelledError:
+                        raise
+                    except Exception:  # noqa: BLE001 - durable intent must not roll back.
+                        self._record_fault(
+                            state,
+                            _generic_fault(
+                                "COMPACTION_SCHEDULER_NOTIFY_FAILED",
+                                "COMPACTION_SCHEDULER",
+                            ),
+                        )
+                elif job is not None and self._worker is not None:
                     self._worker.wake()
             except StorageSecurityError as error:
                 await self._enter_storage_locked(error)

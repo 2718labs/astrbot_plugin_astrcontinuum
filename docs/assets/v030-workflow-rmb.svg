@@ -1,0 +1,90 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1560" height="1080" viewBox="0 0 1560 1080" role="img" aria-labelledby="title desc">
+  <title id="title">AstrContinuum v0.3 当前发布链与 CRM 研究目标链</title>
+  <desc id="desc">双泳道工作流。上方实线墨绿为当前 v0.3 claim、compile、optional audit、publish/CAS 发布链；下方虚线暗红为尚未接线的 CRM 研究链。</desc>
+  <defs>
+    <marker id="arrow-green" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#1F6B5B"/></marker>
+    <marker id="arrow-red" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#A44742"/></marker>
+    <marker id="arrow-gray" markerWidth="10" markerHeight="10" refX="9" refY="3" orient="auto"><path d="M0,0 L0,6 L9,3 z" fill="#786F63"/></marker>
+  </defs>
+  <rect width="1560" height="1080" fill="#ffffff"/>
+  <rect x="60" y="55" width="1440" height="425" rx="24" fill="#F8FBF9" stroke="#1F6B5B" stroke-width="3"/>
+  <rect x="60" y="535" width="1440" height="475" rx="24" fill="#FFF9F8" stroke="#A44742" stroke-width="3" stroke-dasharray="14 10"/>
+  <text x="108" y="115" fill="#1F6B5B" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="32" font-weight="700">当前 v0.3 Technical Preview：已实现发布链（实线）</text>
+  <text x="108" y="155" fill="#786F63" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="19">受 fencing、机械校验、永久质量闸门与 CAS 约束；标准 worker 不调用重组器。</text>
+
+  <g font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" text-anchor="middle">
+    <rect x="105" y="225" width="180" height="90" rx="16" fill="#DDD6CC" stroke="#263238" stroke-width="2"/>
+    <text x="195" y="262" fill="#263238" font-size="22" font-weight="700">Journal / Delta</text>
+    <text x="195" y="290" fill="#786F63" font-size="16">captured history</text>
+
+    <rect x="345" y="225" width="180" height="90" rx="16" fill="#E5F2EE" stroke="#1F6B5B" stroke-width="2"/>
+    <text x="435" y="262" fill="#263238" font-size="22" font-weight="700">fenced claim</text>
+    <text x="435" y="290" fill="#786F63" font-size="16">LEASED epoch</text>
+
+    <rect x="585" y="225" width="210" height="90" rx="16" fill="#E5F2EE" stroke="#1F6B5B" stroke-width="2"/>
+    <text x="690" y="262" fill="#263238" font-size="22" font-weight="700">compile</text>
+    <text x="690" y="290" fill="#786F63" font-size="16">candidate Snapshot + Capsules</text>
+
+    <rect x="855" y="225" width="180" height="90" rx="16" fill="#DDD6CC" stroke="#786F63" stroke-width="2"/>
+    <text x="945" y="262" fill="#263238" font-size="22" font-weight="700">optional audit</text>
+    <text x="945" y="290" fill="#786F63" font-size="16">mechanical always</text>
+
+    <rect x="1095" y="225" width="205" height="90" rx="16" fill="#E5F2EE" stroke="#1F6B5B" stroke-width="2"/>
+    <text x="1197" y="262" fill="#263238" font-size="21" font-weight="700">TX_PUBLISH / CAS</text>
+    <text x="1197" y="290" fill="#786F63" font-size="16">one savepoint</text>
+
+    <rect x="1340" y="225" width="135" height="90" rx="16" fill="#1F6B5B" stroke="#263238" stroke-width="2"/>
+    <text x="1407" y="258" fill="#ffffff" font-size="16" font-weight="700">COMMITTED</text>
+    <text x="1407" y="287" fill="#ffffff" font-size="15">Snapshot</text>
+  </g>
+  <g fill="none" stroke="#1F6B5B" stroke-width="4" marker-end="url(#arrow-green)">
+    <path d="M285 270 H345"/><path d="M525 270 H585"/><path d="M795 270 H855"/><path d="M1035 270 H1095"/><path d="M1300 270 H1340"/>
+  </g>
+  <rect x="390" y="358" width="500" height="68" rx="12" fill="#ffffff" stroke="#DDD6CC" stroke-width="2"/>
+  <text x="640" y="386" fill="#263238" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="19" font-weight="700" text-anchor="middle">标准 CompactionWorker：reorganization records = ()</text>
+  <text x="640" y="412" fill="#786F63" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="15" text-anchor="middle">显式账本发布接口已存在；自动重组接线尚未交付</text>
+  <rect x="955" y="358" width="410" height="68" rx="12" fill="#ffffff" stroke="#DDD6CC" stroke-width="2"/>
+  <text x="1160" y="386" fill="#263238" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="18" font-weight="700" text-anchor="middle">失败边界：CAS 冲突 → SUPERSEDED / rollback</text>
+  <text x="1160" y="412" fill="#A44742" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="15" text-anchor="middle">ledger integrity → transaction rollback；pointer 不移动</text>
+  <path d="M1197 315 V358" fill="none" stroke="#786F63" stroke-width="3" marker-end="url(#arrow-gray)"/>
+
+  <text x="108" y="595" fill="#A44742" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="32" font-weight="700">CRM 研究目标：待接线流程（虚线）</text>
+  <text x="108" y="635" fill="#786F63" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="19">有隔离、确定性实验记录；尚不是 v0.3 Worker 或生产能力。</text>
+  <g font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" text-anchor="middle">
+    <rect x="105" y="708" width="150" height="105" rx="16" fill="#FFF4F3" stroke="#A44742" stroke-width="2" stroke-dasharray="9 6"/>
+    <text x="180" y="750" fill="#263238" font-size="20" font-weight="700">旧 Capsule</text>
+    <text x="180" y="779" fill="#263238" font-size="20" font-weight="700">+ 新 Delta</text>
+
+    <rect x="300" y="708" width="145" height="105" rx="16" fill="#FFF4F3" stroke="#A44742" stroke-width="2" stroke-dasharray="9 6"/>
+    <text x="372" y="750" fill="#263238" font-size="20" font-weight="700">Atomizer</text>
+    <text x="372" y="779" fill="#786F63" font-size="15">ID / state / provenance</text>
+
+    <rect x="490" y="708" width="160" height="105" rx="16" fill="#FFF4F3" stroke="#A44742" stroke-width="2" stroke-dasharray="9 6"/>
+    <text x="570" y="750" fill="#263238" font-size="19" font-weight="700">Candidate</text>
+    <text x="570" y="778" fill="#263238" font-size="19" font-weight="700">Composer</text>
+
+    <rect x="695" y="708" width="155" height="105" rx="16" fill="#FFF4F3" stroke="#A44742" stroke-width="2" stroke-dasharray="9 6"/>
+    <text x="772" y="750" fill="#263238" font-size="19" font-weight="700">Matrix Builder</text>
+    <text x="772" y="779" fill="#786F63" font-size="15">F / A / R / H / D</text>
+
+    <rect x="895" y="708" width="165" height="105" rx="16" fill="#FFF4F3" stroke="#A44742" stroke-width="2" stroke-dasharray="9 6"/>
+    <text x="977" y="750" fill="#263238" font-size="18" font-weight="700">budgeted CRM</text>
+    <text x="977" y="778" fill="#263238" font-size="18" font-weight="700">Optimizer</text>
+
+    <rect x="1105" y="708" width="145" height="105" rx="16" fill="#FFF4F3" stroke="#A44742" stroke-width="2" stroke-dasharray="9 6"/>
+    <text x="1177" y="750" fill="#263238" font-size="19" font-weight="700">loss-aware</text>
+    <text x="1177" y="778" fill="#263238" font-size="19" font-weight="700">gate</text>
+
+    <rect x="1295" y="708" width="165" height="105" rx="16" fill="#FFF4F3" stroke="#A44742" stroke-width="2" stroke-dasharray="9 6"/>
+    <text x="1377" y="750" fill="#263238" font-size="19" font-weight="700">atomic swap</text>
+    <text x="1377" y="779" fill="#786F63" font-size="15">new Capsule only</text>
+  </g>
+  <g fill="none" stroke="#A44742" stroke-width="4" stroke-dasharray="10 7" marker-end="url(#arrow-red)">
+    <path d="M255 760 H300"/><path d="M445 760 H490"/><path d="M650 760 H695"/><path d="M850 760 H895"/><path d="M1060 760 H1105"/><path d="M1250 760 H1295"/>
+  </g>
+  <rect x="320" y="866" width="920" height="86" rx="14" fill="#ffffff" stroke="#DDD6CC" stroke-width="2" stroke-dasharray="9 6"/>
+  <text x="780" y="902" fill="#263238" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="21" font-weight="700" text-anchor="middle">query projection 仅读新的 Capsule；释放已消费 Delta 与旧版本</text>
+  <text x="780" y="932" fill="#A44742" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="16" text-anchor="middle">Summary 仅为离线对照，不是运行时主路径或回退；虚线流程需独立接线与发布证据。</text>
+  <path d="M1377 813 V866" fill="none" stroke="#A44742" stroke-width="4" stroke-dasharray="10 7" marker-end="url(#arrow-red)"/>
+  <text x="780" y="1043" fill="#786F63" font-family="Noto Sans CJK SC, Microsoft YaHei, Arial, sans-serif" font-size="16" text-anchor="middle">RMB-inspired academic palette: dark red #A44742 · ink green #1F6B5B · warm gray #DDD6CC · ink #263238</text>
+</svg>

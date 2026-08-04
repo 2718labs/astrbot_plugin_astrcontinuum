@@ -2,8 +2,9 @@
 
 [English](./ARCHITECTURE.md) | 简体中文
 
-本文描述仓库版本 `v0.2.1` 的真实架构、保证安全性的核心不变量，以及“核心已经实现”
-与“AstrBot 插件生命周期已经自动启用”之间的边界。
+本文描述 `v0.3.0` Technical Preview 的真实架构、保证安全性的核心不变量，以及“核心已经
+实现”与“AstrBot 插件生命周期已经自动启用”之间的边界。它以已验证的 `v0.2.1` 运行时为
+基础，新增的重组账本只属于显式 Repository 发布边界，不能据此推导标准 worker 已接线。
 
 ## 1. 范围与成熟度
 
@@ -17,10 +18,18 @@ AstrContinuum 是通过一个 `Star` 组合入口嵌入 AstrBot 的持久化上�
 - 在宿主持久化前恢复 AstrBot 原生消息对象图；
 - 在后台通道编译并原子发布结构化、经过审计的 Snapshot。
 
-在 `v0.2.1` 中，以上六项都已接入 AstrBot 生命周期。`Star` 会启动唯一持久 worker，
-绑定 AstrBot 提供的精确引文式编译后端，在慢模型调用期间续租，并在终止时取消和等待
-受跟踪任务。认证静态加密、离线模型文本计数、AstrBot 上下文窗口自动解析、规范 token
-指标 sidecar 与有界补齐已经启用；Provider 语义审计适配器不属于 `v0.2.1`。
+已验证的 `v0.2.1` 基线会在 Provider 绑定运行时可用时接入以上六项。只有以下任一条件成立，
+`Star` 才会启动唯一持久 worker：显式压缩 Provider 成功解析、宿主公开提供
+`get_current_chat_provider_id`，或注入测试后端。否则宿主路径保持 fail-open：采集与持久化
+意图继续，worker 和 scheduler 则保持缺席。运行时启用后，它绑定 AstrBot 的精确引文式编译
+后端，在慢模型调用期间续租，并在终止时取消和等待受跟踪任务。认证静态加密、离线模型文本
+计数、AstrBot 上下文窗口自动解析、规范 token 指标 sidecar 与有界补齐已经启用；Provider
+语义审计适配器不属于该已验证基线。
+
+`v0.3.0` 增加 schema migration v3 与不可变、有序的 Snapshot 重组账本。Repository 的显式
+发布调用可以提供账本记录；标准 `CompactionWorker` 当前不调用重组器，也不提供记录，因此
+正常后台压缩发布空账本。这是持久化安全边界，不是重组执行、语义质量、性能或公开发布就绪
+声明。
 
 ## 2. 架构目标
 
@@ -64,12 +73,13 @@ AstrBot 原生消息历史。所有注入内容必须标记为临时，并在之
 对宿主请求而言，AstrContinuum 是可选增强。兼容性或投影失败不能演变成 AstrBot
 停服；但系统也绝不会为了可用性接受持久化损坏、虚假覆盖或部分发布的 Snapshot。
 
-## 3. `v0.2.1` 明确不包含的能力
+## 3. `v0.3.0` 明确不包含的能力
 
 - 不提供由仓库管理的 AstrBot 市场分发工作流；
 - 不提供用户可见的回滚或时间旅行指令；
 - 不提供 WebUI 管理页面；
 - 不提供 Provider 驱动的语义审计适配器；
+- 不把重组器接入标准 `CompactionWorker`，也不宣称普通后台压缩具备非空账本覆盖；
 - 不宣称一个 tokenizer profile 对所有 Provider 模型都精确；
 - 不实现平台适配器特定行为，也不声明具体适配器支持；
 - 不把外部 Sylanne 记忆正文导入 AstrContinuum 持久记录。
@@ -90,7 +100,7 @@ flowchart TB
         Project["临时投影"]
         Restore["原生对象恢复"]
         Finalize["助手采集与压缩意图"]
-        Worker["受跟踪的后台归约 worker"]
+        Worker["能力门控的受跟踪后台归约 worker"]
     end
 
     subgraph Core["astrcontinuum 包"]
@@ -161,8 +171,11 @@ flowchart TB
 5. 创建唯一 `SQLiteRepository`；
 6. 使用通过校验的预算配置创建 `AstrBotHookBridge`；
 7. 创建有界的会话 Provider 注册表和精确引文式编译后端；
-8. 创建并启动唯一 `CompactionWorker`；
-9. 对 Provider 消息投影能力执行一次探测。
+8. 仅在注入测试后端、显式 Provider 已解析，或宿主公开提供
+   `get_current_chat_provider_id` 时创建并启动唯一 `CompactionWorker`；否则保持
+   Provider 绑定通道缺席并 fail-open；
+9. 记录生命周期中的投影能力边界而不恢复已移除的私有探测 API；实际投影仍在每次构造时
+   检查宿主能力。
 
 ### 6.2 终止
 
@@ -404,33 +417,38 @@ Provider 执行后，`restore()` 重建精确原生图，只保留 Provider 新�
 | `capsules` | 不可变、封闭信封、同 session 来源 |
 | `snapshots` | 某个已提交前缀的不可变表示 |
 | `snapshot_capsules` | 权威有序成员关系 |
+| `snapshot_reorganization_records` | 仅在显式提供时写入的不可变、有序重组审计账本 |
 | `active_snapshots` | 每 session 至多一个 active pointer |
 | `compaction_jobs` | 持久意图与带 fencing 的状态机 |
 | `token_metrics` | 以 artifact、id 与 profile 为键的加密不可变计数 |
 | `token_metric_backfill_intents` | 为缺失规范指标保存有界、可重试任务 |
 
-每个字段和约束见 [DATABASE_SCHEMA.md](./DATABASE_SCHEMA.md)。
+每个字段和约束见 [DATABASE_SCHEMA.zh-CN.md](./DATABASE_SCHEMA.zh-CN.md)。
 
 ### 14.2 读取可见性
 
 读取器只通过 `active_snapshots` 解析 Snapshot。worker 局部候选信封不是可读 Snapshot。
-已提交 Snapshot、新 Capsule、有序 membership、active pointer 更新和 job 完成构成
-同一个发布结果。
+已提交 Snapshot、新 Capsule、有序 membership、显式提供时的账本记录、规范指标、
+active pointer 更新和 job 完成构成同一个发布结果。账本读取器只接受已提交 Snapshot；
+候选或回滚记录不可见。
 
 ### 14.3 发布 savepoint
 
 `TX_PUBLISH_SNAPSHOT` 打开内层 savepoint：
 
-1. 校验 fence、身份、覆盖、锚点、成员关系和审计结果；
+1. 校验 fence、身份、覆盖、锚点、成员关系、规范指标、可选账本记录和审计结果；
 2. 插入新不可变 Capsule；
 3. 插入 committed-form Snapshot；
 4. 插入有序 membership；
-5. 执行 bootstrap-create 或 existing-pointer CAS；
-6. 标记 job committed。
+5. 仅在显式提供时插入有序重组账本记录；
+6. 写入每个新 Capsule 与 Snapshot 的规范指标，并删除匹配的补齐意图；
+7. 执行 bootstrap-create 或 existing-pointer CAS；
+8. 标记 job committed。
 
 如果 Snapshot 前缀唯一约束或 pointer CAS 遇到并发冲突，内层 savepoint 回滚，不能留下
-任何候选 Capsule、membership 或 Snapshot。带 fence 的外层事务记录 `SUPERSEDED`，
-并把更高的持久意图保留为后续任务。
+任何候选 Capsule、membership、账本记录、规范指标或 Snapshot。带 fence 的外层事务记录
+`SUPERSEDED`，并把更高的持久意图保留为后续任务。账本写入完整性错误或规范指标错误不属于
+该竞争分类器：它们必须回滚整个事务并传播，不能伪装为 `SUPERSEDED`。
 
 ## 15. 压缩通道
 
@@ -457,21 +475,27 @@ CANCELLED
 机械校验永久强制，不能关闭。`strict_audit=false` 最多只能跳过未来的 Provider 语义
 审计，不能绕过身份、来源、覆盖、精确锚点、成员关系、非空输出或审计信封校验。
 
-### 15.1 已实现运行时
+### 15.1 已接线运行时与 v0.3 持久化边界
 
 - 持久化、单调合并的压缩意图；
 - 可领取任务与 lease-epoch fencing；
 - 编译器与结构化 Capsule 类型；
 - 机械候选校验；
 - 可选语义审计协议与证据；
-- Snapshot/Capsule/membership 原子发布；
+- Snapshot/Capsule/membership/规范指标原子发布；
 - 重试/失败状态迁移；
 - 过期 lease 恢复；
 - 周期持久 claim loop 与非阻塞唤醒；
 - 模型调用期间续租；
 - 每个 job 按冻结 base/target 精确读取；
 - 有界脱敏重试与失败隔离；
-- 插件启动时跟踪、终止时取消并等待 worker。
+- Provider 绑定能力可用时启动并跟踪、终止时取消并等待 worker；能力不可用时保持该通道缺席并
+  fail-open。
+
+除上述已接线运行时外，`v0.3.0` 的 Repository 支持为显式发布调用持久化有序重组账本，并对
+非 `narrative_summary` 的 `released` 记录施加永久 `QUALITY_COVERAGE_GAP` 质量闸门。标准
+`CompactionWorker` 仍不调用重组器、不传入记录；这项存储能力不代表普通后台压缩已完成重组
+接线或效果认证。
 
 ### 15.2 编译器信任边界
 
@@ -553,9 +577,10 @@ Capsule 来源或稳定哈希输入。
 绝大多数接入只使用 `astrbot.api.*`。唯一内部例外是 Provider 消息投影，它被封装在
 能力探测和 fail-open 行为之后。
 
-发布归档通过真实公开 AstrBot Provider 与 ProviderRequest 对象探针：
+当前 `metadata.yaml` 声明的 AstrBot 下限是 `>=4.24.2,<5.0.0`。发布归档已有的历史探针
+记录覆盖真实公开 AstrBot Provider 与 ProviderRequest 对象：
 
-- AstrBot `4.24.0`；
+- AstrBot `4.24.0`（低于当前声明下限，只是历史探针，不能作为现行兼容承诺）；
 - AstrBot `4.26.7`；
 - Python `3.12.13`。
 
@@ -563,8 +588,8 @@ Capsule 来源或稳定哈希输入。
 `data.plugins.astrbot_plugin_astrcontinuum.main` 模块加载、全部八个 handler、公开
 `get_using_provider()` 元数据解析、随包离线计数，以及零次 LLM 请求。
 
-AstrBot `4.24.0` 会产生上游 `StarMetadata.pages` 回退警告，但插件生命周期和行为
-仍通过。
+AstrBot `4.24.0` 会产生上游 `StarMetadata.pages` 回退警告，但这条历史结果不能降低当前
+元数据下限。新的兼容声明应至少重新验证 `4.24.2` 和更新的实际样本。
 
 ## 20. 演进约束
 
@@ -584,12 +609,13 @@ AstrBot `4.24.0` 会产生上游 `StarMetadata.pages` 回退警告，但插件�
 
 ## 21. 相关文档
 
-- [DATA_FLOW.md](./DATA_FLOW.md)
-- [DATABASE_SCHEMA.md](./DATABASE_SCHEMA.md)
-- [CONCURRENCY_STATE_MACHINE.md](./CONCURRENCY_STATE_MACHINE.md)
-- [CONTEXT_MODEL.md](./CONTEXT_MODEL.md)
-- [COMPACTION_PROTOCOL.md](./COMPACTION_PROTOCOL.md)
-- [TEST_MATRIX.md](./TEST_MATRIX.md)
-- [ADR-001-NONBLOCKING.md](./ADR-001-NONBLOCKING.md)
-- [ADR-006-ASTRBOT-HOOK-OWNERSHIP.md](./ADR-006-ASTRBOT-HOOK-OWNERSHIP.md)
-- [ADR-007-V1-CAPSULE-PERSISTENCE.md](./ADR-007-V1-CAPSULE-PERSISTENCE.md)
+- [DATA_FLOW.zh-CN.md](./DATA_FLOW.zh-CN.md)
+- [DATABASE_SCHEMA.zh-CN.md](./DATABASE_SCHEMA.zh-CN.md)
+- [CONCURRENCY_STATE_MACHINE.zh-CN.md](./CONCURRENCY_STATE_MACHINE.zh-CN.md)
+- [CONTEXT_MODEL.zh-CN.md](./CONTEXT_MODEL.zh-CN.md)
+- [COMPACTION_PROTOCOL.zh-CN.md](./COMPACTION_PROTOCOL.zh-CN.md)
+- [TEST_MATRIX.zh-CN.md](./TEST_MATRIX.zh-CN.md)
+- [ADR-001-NONBLOCKING.zh-CN.md](./ADR-001-NONBLOCKING.zh-CN.md)
+- [ADR-006-ASTRBOT-HOOK-OWNERSHIP.zh-CN.md](./ADR-006-ASTRBOT-HOOK-OWNERSHIP.zh-CN.md)
+- [ADR-007-V1-CAPSULE-PERSISTENCE.zh-CN.md](./ADR-007-V1-CAPSULE-PERSISTENCE.zh-CN.md)
+- [ADR-008-REORGANIZATION-LEDGER.zh-CN.md](./ADR-008-REORGANIZATION-LEDGER.zh-CN.md)

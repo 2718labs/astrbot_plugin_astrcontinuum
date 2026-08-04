@@ -198,9 +198,9 @@ def _validate_versions(archive: zipfile.ZipFile, expected_version: str) -> None:
     if _register_version(_read_text(archive, "main.py")) != package_version:
         raise ArchiveContractError("main.py register version does not match expected version")
 
-    badge = f"version-{expected_version}-blue"
+    badge = re.compile(rf"version-{re.escape(expected_version)}-[A-Za-z0-9]+")
     for readme in ("README.md", "README.zh-CN.md"):
-        if badge not in _read_text(archive, readme):
+        if badge.search(_read_text(archive, readme)) is None:
             raise ArchiveContractError(f"{readme} version badge does not match expected version")
 
     changelog_match = _CHANGELOG_VERSION.search(_read_text(archive, "CHANGELOG.md"))

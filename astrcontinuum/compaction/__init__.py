@@ -28,13 +28,14 @@ from .types import (
     SemanticAuditRequest,
 )
 from .validator import validate_candidate
-from .worker import CompactionWorker, CompactionWorkerConfig
+from .worker import CompactionRunResult, CompactionWorker, CompactionWorkerConfig
 
 __all__ = [
     "AstrBotExtractiveCompilerBackend",
     "AuditedCandidate",
     "CompactionFitProvenance",
     "CompactionProviderBinding",
+    "CompactionRunResult",
     "CompactionWorker",
     "CompactionWorkerConfig",
     "CompilationCandidate",

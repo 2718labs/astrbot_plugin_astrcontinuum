@@ -10,7 +10,7 @@ import sys
 from dataclasses import fields
 from pathlib import Path
 from types import ModuleType, SimpleNamespace
-from typing import Any
+from typing import Any, ClassVar
 
 import pytest
 
@@ -151,6 +151,75 @@ class FakeEvent:
         return ("plain", text)
 
 
+class RecordingCompiler:
+    def __init__(self) -> None:
+        self.calls = 0
+
+    async def compile(self, _request: object) -> object:
+        self.calls += 1
+        raise AssertionError("main hook must not invoke the compiler")
+
+
+class RecordingWorker:
+    instances: ClassVar[list[RecordingWorker]] = []
+    fail_construction = False
+    fail_run_once = False
+
+    def __init__(self, **kwargs: object) -> None:
+        if self.__class__.fail_construction:
+            raise RuntimeError("worker construction secret")
+        self.kwargs = kwargs
+        self.run_once_calls = 0
+        self.__class__.instances.append(self)
+
+    async def run_once(self) -> None:
+        self.run_once_calls += 1
+        if self.__class__.fail_run_once:
+            raise RuntimeError("worker run secret")
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.instances = []
+        cls.fail_construction = False
+        cls.fail_run_once = False
+
+
+class RecordingScheduler:
+    instances: ClassVar[list[RecordingScheduler]] = []
+    fail_start = False
+    fail_notify = False
+    fail_close = False
+
+    def __init__(self, callback: object) -> None:
+        self.callback = callback
+        self.start_calls = 0
+        self.notify_calls: list[str] = []
+        self.close_calls = 0
+        self.__class__.instances.append(self)
+
+    @classmethod
+    def reset(cls) -> None:
+        cls.instances = []
+        cls.fail_start = False
+        cls.fail_notify = False
+        cls.fail_close = False
+
+    async def start(self) -> None:
+        self.start_calls += 1
+        if self.__class__.fail_start:
+            raise RuntimeError("start secret")
+
+    async def notify(self, session_key_hash: str) -> None:
+        self.notify_calls.append(session_key_hash)
+        if self.__class__.fail_notify:
+            raise RuntimeError("notify secret")
+
+    async def close(self) -> None:
+        self.close_calls += 1
+        if self.__class__.fail_close:
+            raise RuntimeError("close secret")
+
+
 def fake_request(
     prompt: str = "current input",
     *,
@@ -257,6 +326,15 @@ class FakeContext:
             "anchors": [],
         }
         return SimpleNamespace(completion_text=json.dumps(response, ensure_ascii=False))
+
+
+def background_runtime_context() -> FakeContext:
+    return FakeContext(
+        provider=SimpleNamespace(
+            get_model=lambda: "gpt-4o",
+            provider_config={"max_context_tokens": 262_144},
+        )
+    )
 
 
 class ThinkingCompatibilityProvider:
@@ -387,6 +465,29 @@ def load_main(
     return imported, logger
 
 
+def install_compaction_fakes(
+    module: ModuleType,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    RecordingWorker.reset()
+    RecordingScheduler.reset()
+    monkeypatch.setattr(module, "CompactionWorker", RecordingWorker, raising=False)
+    monkeypatch.setattr(module, "CoalescingCompactionScheduler", RecordingScheduler, raising=False)
+
+
+async def finalize_intent(module: ModuleType, plugin: object) -> tuple[FakeEvent, object]:
+    event = FakeEvent()
+    await plugin.on_llm_request(event, fake_request())
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    await plugin.on_agent_done_finalize(
+        event,
+        SimpleNamespace(messages=[]),
+        SimpleNamespace(completion_text="assistant completion"),
+    )
+    return event, state
+
+
 def test_host_text_extractors_never_read_private_thinking_fields(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -468,7 +569,7 @@ def test_main_declares_one_star_and_exact_hook_priorities(
         "astrbot_plugin_astrcontinuum",
         "Ayleovelle",
         "Non-blocking infinite context runtime for AstrBot",
-        "0.2.1",
+        "0.3.0",
     )
     assert plugin_type.on_llm_request.__astrbot_priority__ == 2000
     assert plugin_type.on_agent_begin_guard.__astrbot_priority__ == 2000
@@ -502,7 +603,13 @@ async def test_lifecycle_command_and_llm_response_are_idempotent_and_observation
     tmp_path: Path,
 ) -> None:
     module, _logger = load_main(monkeypatch, tmp_path)
-    plugin = module.AstrContinuumPlugin(object(), {"enabled": True})
+    plugin = module.AstrContinuumPlugin(
+        background_runtime_context(),
+        {
+            "enabled": True,
+            "compaction_provider_id": "test-compactor",
+        },
+    )
 
     await plugin.initialize()
     first_bridge = plugin._bridge
@@ -521,26 +628,29 @@ async def test_lifecycle_command_and_llm_response_are_idempotent_and_observation
         assert connection.execute("SELECT count(*) FROM journal_events").fetchone()[0] == 0
 
     results = [item async for item in plugin.context_status(event)]
-    expected_status = (
-        "AstrContinuum：运行中\n"
-        "数据保护：ACTIVE\n"
-        "加密格式：AES-256-GCM / envelope-v1\n"
-        "密钥来源：环境变量\n"
-        f"活动密钥标识：{TEST_MASTER_KEY_ID}\n"
-        "存储维护：ACTIVE\n"
-        "安全代码：NONE\n"
-        "上下文引擎：ACTIVE\n"
-        "最近引擎状态：NONE\n"
-        "预算诊断：尚无已完成请求\n"
-        "归约模型：FOLLOW_CURRENT\n"
-        "Canonical 计数：完成 0·待补 0\n"
-        "后台归约：运行中\n"
-        "已记录事件：0\n"
-        "已发布 Checkpoint：0\n"
-        "待处理任务：0"
-    )
-    assert results == [("plain", expected_status)]
-    assert event.plain_results == [expected_status]
+    assert len(results) == 1
+    assert results[0][0] == "plain"
+    status_text = results[0][1]
+    assert event.plain_results == [status_text]
+    for expected in (
+        "AstrContinuum：运行中",
+        "数据保护：ACTIVE",
+        "加密格式：AES-256-GCM / envelope-v1",
+        "密钥来源：环境变量",
+        f"活动密钥标识：{TEST_MASTER_KEY_ID}",
+        "存储维护：ACTIVE",
+        "安全代码：NONE",
+        "上下文引擎：ACTIVE",
+        "最近引擎状态：NONE",
+        "预算诊断：尚无已完成请求",
+        "Canonical 计数：完成 0·待补 0",
+        "后台归约：运行中",
+        "已记录事件：0",
+        "已发布 Checkpoint：0",
+        "待处理任务：0",
+    ):
+        assert expected in status_text
+    assert "test-compactor" not in status_text
     assert plugin.context_status.__func__.__astrbot_permission__ == "ADMIN"
 
     await plugin.terminate()
@@ -906,7 +1016,10 @@ async def test_finalizer_closes_a_tool_round_before_raising_its_compaction_inten
     tmp_path: Path,
 ) -> None:
     module, _logger = load_main(monkeypatch, tmp_path)
-    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    plugin = module.AstrContinuumPlugin(
+        background_runtime_context(),
+        {"enabled": True, "compaction_provider_id": "test-compactor"},
+    )
     await plugin.initialize()
     event = FakeEvent(message_id="closed-tool-finalizer")
     await plugin.on_llm_request(event, fake_request("opening input"))
@@ -994,7 +1107,10 @@ async def test_finalizer_intent_target_remains_the_assistant_high_water_mark(
     tmp_path: Path,
 ) -> None:
     module, _logger = load_main(monkeypatch, tmp_path)
-    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    plugin = module.AstrContinuumPlugin(
+        background_runtime_context(),
+        {"enabled": True, "compaction_provider_id": "test-compactor"},
+    )
     await plugin.initialize()
     event = FakeEvent(message_id="assistant-high-water")
     await plugin.on_llm_request(event, fake_request("opening input"))
@@ -1048,7 +1164,10 @@ async def test_initialize_injects_dedicated_canonical_o200k_counter(
     tmp_path: Path,
 ) -> None:
     module, _logger = load_main(monkeypatch, tmp_path)
-    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    plugin = module.AstrContinuumPlugin(
+        background_runtime_context(),
+        {"enabled": True, "compaction_provider_id": "test-compactor"},
+    )
 
     await plugin.initialize()
 
@@ -1161,7 +1280,11 @@ async def test_live_request_only_refreshes_binding_without_running_compaction_la
     module, _logger = load_main(monkeypatch, tmp_path)
     plugin = module.AstrContinuumPlugin(
         context,
-        {"enabled": True, "model_context_limit": 0},
+        {
+            "enabled": True,
+            "compaction_provider_id": "test-compactor",
+            "model_context_limit": 0,
+        },
     )
     await plugin.initialize()
     worker = plugin._worker
@@ -1170,7 +1293,9 @@ async def test_live_request_only_refreshes_binding_without_running_compaction_la
     async def forbidden_lane(*_args: object, **_kwargs: object) -> None:
         pytest.fail("live request awaited the background compaction lane")
 
-    monkeypatch.setattr(worker, "_backfill_metrics", forbidden_lane)
+    runtime = worker._runtime
+    assert runtime is not None
+    monkeypatch.setattr(runtime, "_backfill_metrics", forbidden_lane)
     event = FakeEvent(message_id="binding-only")
 
     await plugin.on_llm_request(event, fake_request(model="gpt-4o"))
@@ -1292,7 +1417,10 @@ async def test_canonical_counter_construction_failure_never_uses_byte_fallback(
             raise RuntimeError("private tokenizer construction detail")
 
     monkeypatch.setattr(module, "TokenizerRegistry", FailingRegistry)
-    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    plugin = module.AstrContinuumPlugin(
+        background_runtime_context(),
+        {"enabled": True, "compaction_provider_id": "test-compactor"},
+    )
 
     await plugin.initialize()
 
@@ -1675,7 +1803,7 @@ async def test_soft_pressure_wakes_worker_and_publishes_checkpoint(
     tmp_path: Path,
 ) -> None:
     module, _logger = load_main(monkeypatch, tmp_path)
-    context = FakeContext()
+    context = background_runtime_context()
     plugin = module.AstrContinuumPlugin(
         context,
         {
@@ -1801,7 +1929,8 @@ async def test_missing_key_latches_locked_without_touching_sqlite(
     await plugin.terminate()
     await plugin.initialize()
     assert plugin._bridge is not None
-    assert plugin._worker is not None
+    assert plugin._worker is None
+    assert plugin._scheduler is None
     await plugin.terminate()
 
 
@@ -1964,7 +2093,10 @@ async def test_runtime_authentication_failure_locks_plugin_and_stops_worker(
     tmp_path: Path,
 ) -> None:
     module, _logger = load_main(monkeypatch, tmp_path)
-    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    plugin = module.AstrContinuumPlugin(
+        background_runtime_context(),
+        {"enabled": True, "compaction_provider_id": "test-compactor"},
+    )
     await plugin.initialize()
     bridge = plugin._bridge
     worker = plugin._worker
@@ -2077,7 +2209,10 @@ async def test_context_status_rechecks_lifecycle_after_count_query(
     tmp_path: Path,
 ) -> None:
     module, _logger = load_main(monkeypatch, tmp_path)
-    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    plugin = module.AstrContinuumPlugin(
+        background_runtime_context(),
+        {"enabled": True, "compaction_provider_id": "test-compactor"},
+    )
     await plugin.initialize()
     query_finished = asyncio.Event()
     release_query = asyncio.Event()
@@ -2154,7 +2289,10 @@ async def test_partial_worker_start_failure_leaks_no_background_task(
         raise RuntimeError("DO-NOT-LEAK-worker-start-detail")
 
     monkeypatch.setattr(module.CompactionWorker, "start", fail_after_start)
-    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+    plugin = module.AstrContinuumPlugin(
+        background_runtime_context(),
+        {"enabled": True, "compaction_provider_id": "test-compactor"},
+    )
 
     await plugin.initialize()
 
@@ -2676,4 +2814,248 @@ async def test_canonical_metric_status_reports_durable_backfill_pending(
     inspect_text = (await anext(plugin.context_inspect(FakeEvent(message_id="inspect"))))[1]
     assert "Canonical 计数：完成 0·待补 1" in status_text
     assert "Canonical 计数：完成 0·待补 1" in inspect_text
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_v030_default_lifecycle_persists_intent_without_background_runtime(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    plugin = module.AstrContinuumPlugin(FakeContext(), {"enabled": True})
+
+    await plugin.initialize()
+    bridge = plugin._bridge
+    assert bridge is not None
+    assert plugin._worker is None
+    assert plugin._scheduler is None
+
+    event = FakeEvent()
+    await plugin.on_llm_request(event, fake_request())
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    state.pressure = SimpleNamespace(should_compact=True)
+    await plugin.on_agent_done_finalize(
+        event,
+        SimpleNamespace(messages=[]),
+        SimpleNamespace(completion_text="assistant completion"),
+    )
+
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0] == 1
+    assert state.intent_raised is True
+
+    await plugin.terminate()
+    stopped = [item async for item in plugin.context_status(FakeEvent())]
+    assert len(stopped) == 1
+    assert stopped[0][0] == "plain"
+    assert "AstrContinuum：" in stopped[0][1]
+    assert "后台归约：未启动" in stopped[0][1]
+
+
+@pytest.mark.asyncio
+async def test_v030_explicit_backend_starts_once_notifies_intent_without_hook_compilation(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    install_compaction_fakes(module, monkeypatch)
+    backend = RecordingCompiler()
+    plugin = module.AstrContinuumPlugin(
+        FakeContext(),
+        {"enabled": True},
+        compiler_backend=backend,
+    )
+
+    await plugin.initialize()
+    await plugin.initialize()
+    event = FakeEvent()
+    await plugin.on_llm_request(event, fake_request())
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    state.pressure = SimpleNamespace(should_compact=True)
+    await plugin.on_agent_done_finalize(
+        event,
+        SimpleNamespace(messages=[]),
+        SimpleNamespace(completion_text="assistant completion"),
+    )
+    await plugin.on_agent_done_finalize(
+        event,
+        SimpleNamespace(messages=[]),
+        SimpleNamespace(completion_text="ignored"),
+    )
+
+    assert len(RecordingWorker.instances) == 1
+    assert len(RecordingScheduler.instances) == 1
+    scheduler = RecordingScheduler.instances[0]
+    assert scheduler.start_calls == 1
+    assert scheduler.notify_calls == [state.prepared.turn.session_key.session_key_hash]
+    assert backend.calls == 0
+    assert RecordingWorker.instances[0].run_once_calls == 0
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_v030_scheduler_start_and_notify_fail_open_without_losing_durable_intent(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, logger = load_main(monkeypatch, tmp_path)
+    install_compaction_fakes(module, monkeypatch)
+    RecordingScheduler.fail_start = True
+    plugin = module.AstrContinuumPlugin(
+        FakeContext(),
+        {"enabled": True},
+        compiler_backend=RecordingCompiler(),
+    )
+
+    await plugin.initialize()
+    event = FakeEvent()
+    await plugin.on_llm_request(event, fake_request())
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    state.pressure = SimpleNamespace(should_compact=True)
+    await plugin.on_agent_done_finalize(
+        event,
+        SimpleNamespace(messages=[]),
+        SimpleNamespace(completion_text="assistant completion"),
+    )
+
+    assert plugin._bridge is not None
+    assert plugin._worker is None
+    assert plugin._scheduler is None
+    assert state.intent_raised is True
+    assert any("COMPACTION_SCHEDULER_START_FAILED" in str(args) for _, args in logger.records)
+    await plugin.terminate()
+
+    module, logger = load_main(monkeypatch, tmp_path / "notify")
+    install_compaction_fakes(module, monkeypatch)
+    RecordingScheduler.fail_notify = True
+    plugin = module.AstrContinuumPlugin(
+        FakeContext(),
+        {"enabled": True},
+        compiler_backend=RecordingCompiler(),
+    )
+    await plugin.initialize()
+    event = FakeEvent()
+    await plugin.on_llm_request(event, fake_request())
+    state = plugin._state(event)
+    assert state is not None and state.prepared is not None
+    state.pressure = SimpleNamespace(should_compact=True)
+    await plugin.on_agent_done_finalize(
+        event,
+        SimpleNamespace(messages=[]),
+        SimpleNamespace(completion_text="assistant completion"),
+    )
+
+    assert state.intent_raised is True
+    bridge = plugin._bridge
+    assert bridge is not None
+    with bridge.repository.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM compaction_jobs").fetchone()[0] == 1
+    assert any("COMPACTION_SCHEDULER_NOTIFY_FAILED" in str(args) for _, args in logger.records)
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_v030_worker_setup_and_background_callback_fail_open(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, logger = load_main(monkeypatch, tmp_path)
+    install_compaction_fakes(module, monkeypatch)
+    RecordingWorker.fail_construction = True
+    plugin = module.AstrContinuumPlugin(
+        FakeContext(),
+        {"enabled": True},
+        compiler_backend=RecordingCompiler(),
+    )
+
+    await plugin.initialize()
+
+    assert plugin._bridge is not None
+    assert plugin._worker is None
+    assert plugin._scheduler is None
+    assert any("COMPACTION_SCHEDULER_START_FAILED" in str(args) for _, args in logger.records)
+    await plugin.terminate()
+
+    module, logger = load_main(monkeypatch, tmp_path / "callback")
+    install_compaction_fakes(module, monkeypatch)
+    RecordingWorker.fail_run_once = True
+    plugin = module.AstrContinuumPlugin(
+        FakeContext(),
+        {"enabled": True},
+        compiler_backend=RecordingCompiler(),
+    )
+    await plugin.initialize()
+
+    scheduler = plugin._scheduler
+    assert scheduler is not None
+    await scheduler.callback("session-key-hash")
+
+    assert any("COMPACTION_WORKER_RUN_FAILED" in str(args) for _, args in logger.records)
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_v030_stale_scheduler_never_targets_reinitialized_worker(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, _logger = load_main(monkeypatch, tmp_path)
+    install_compaction_fakes(module, monkeypatch)
+    plugin = module.AstrContinuumPlugin(
+        FakeContext(),
+        {"enabled": True},
+        compiler_backend=RecordingCompiler(),
+    )
+
+    await plugin.initialize()
+    old_scheduler = plugin._scheduler
+    old_worker = plugin._worker
+    assert old_scheduler is not None and old_worker is not None
+    await plugin.terminate()
+    await plugin.initialize()
+    new_worker = plugin._worker
+    assert new_worker is not None and new_worker is not old_worker
+
+    await old_scheduler.callback("old-session-key-hash")
+
+    assert old_worker.run_once_calls == 1
+    assert new_worker.run_once_calls == 0
+    await plugin.terminate()
+
+
+@pytest.mark.asyncio
+async def test_v030_terminate_detaches_scheduler_fail_open_and_reinitializes(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    module, logger = load_main(monkeypatch, tmp_path)
+    install_compaction_fakes(module, monkeypatch)
+    RecordingScheduler.fail_close = True
+    plugin = module.AstrContinuumPlugin(
+        FakeContext(),
+        {"enabled": True},
+        compiler_backend=RecordingCompiler(),
+    )
+
+    await plugin.initialize()
+    first_scheduler = plugin._scheduler
+    await plugin.terminate()
+    await plugin.terminate()
+
+    assert first_scheduler is not None
+    assert first_scheduler.close_calls == 1
+    assert plugin._bridge is None
+    assert plugin._worker is None
+    assert plugin._scheduler is None
+    assert plugin._capability is None
+    assert any("COMPACTION_SCHEDULER_CLOSE_FAILED" in str(args) for _, args in logger.records)
+
+    RecordingScheduler.fail_close = False
+    await plugin.initialize()
+    assert plugin._scheduler is not None
+    assert plugin._scheduler is not first_scheduler
     await plugin.terminate()

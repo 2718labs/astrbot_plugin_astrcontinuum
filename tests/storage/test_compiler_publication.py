@@ -19,6 +19,7 @@ _PUBLICATION_TABLE_ORDER = {
     "capsules": "capsule_id",
     "snapshots": "snapshot_id",
     "snapshot_capsules": "snapshot_id, ordinal",
+    "snapshot_reorganization_records": "snapshot_id, ordinal",
     "active_snapshots": "session_key_hash",
 }
 

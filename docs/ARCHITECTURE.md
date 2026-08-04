@@ -2,9 +2,11 @@
 
 English | [简体中文](./ARCHITECTURE.zh-CN.md)
 
-This document describes the architecture that exists at repository version `v0.2.1`, the
-invariants that make it safe, and the difference between implemented core capabilities and
-capabilities currently activated by the AstrBot plugin lifecycle.
+This document describes the `v0.3.0` Technical Preview architecture, the invariants that make it
+safe, and the difference between implemented core capabilities and capabilities currently
+activated by the AstrBot plugin lifecycle. It retains the verified `v0.2.1` runtime baseline;
+the new reorganization ledger belongs only to the explicit Repository publication boundary and
+does not mean that the standard worker is wired to a reorganizer.
 
 ## 1. Scope and maturity
 
@@ -18,12 +20,22 @@ root. It is designed to:
 - restore AstrBot's native message graph before host persistence;
 - compile and atomically publish structured, audited Snapshots in a background lane.
 
-At `v0.2.1`, all six items are wired into the AstrBot lifecycle. The `Star` starts one durable
-worker, binds an AstrBot-backed extractive compiler, renews fenced leases during slow model
-calls, and cancels the tracked task during termination. Authenticated at-rest encryption,
-offline model-aware text counting, automatic AstrBot context-limit resolution, canonical
-token-metric sidecars, and bounded metric backfill are active. A provider-backed
-semantic-audit adapter is not part of `v0.2.1`.
+The verified `v0.2.1` baseline wires all six items into the AstrBot lifecycle when the
+provider-bound runtime is available. The `Star` starts one durable worker only when an explicit
+compaction provider resolves, the host exposes the public
+`get_current_chat_provider_id` capability, or an injected test backend is supplied. Otherwise
+the host path remains fail-open: capture and durable intent continue, while the worker and
+scheduler remain absent. When active, the runtime binds an AstrBot-backed extractive compiler,
+renews fenced leases during slow model calls, and cancels the tracked task during termination.
+Authenticated at-rest encryption, offline model-aware text counting, automatic AstrBot
+context-limit resolution, canonical token-metric sidecars, and bounded metric backfill are
+active. A provider-backed semantic-audit adapter is not part of the verified baseline.
+
+`v0.3.0` adds schema migration v3 and an immutable, ordered Snapshot reorganization ledger.
+An explicit Repository publication may supply ledger entries; the standard `CompactionWorker`
+does not invoke a reorganizer or supply entries, so ordinary background compaction publishes an
+empty ledger. This is a durable-storage safety boundary, not a claim of reorganization execution,
+semantic quality, performance, or public-release readiness.
 
 ## 2. Architectural goals
 
@@ -71,12 +83,14 @@ AstrContinuum is optional to the host request. Compatibility or enhancement fail
 turn into an AstrBot outage. Durable corruption, false coverage, and partially published
 Snapshots are never accepted as the price of availability.
 
-## 3. Non-goals in `v0.2.1`
+## 3. Non-goals in `v0.3.0`
 
 - no repository-managed AstrBot-market distribution workflow;
 - no user-facing rollback or time-travel command;
 - no WebUI administration page;
 - no provider-backed semantic-audit adapter;
+- no standard-worker reorganization call or claim that ordinary background compaction has
+  non-empty ledger coverage;
 - no claim that one tokenizer profile is accurate for every provider model;
 - no platform-adapter-specific behavior or declared adapter support;
 - no import of external Sylanne memory payloads into durable AstrContinuum records.
@@ -97,7 +111,7 @@ flowchart TB
         Project["temporary projection"]
         Restore["native restoration"]
         Finalize["assistant capture and intent"]
-        Worker["tracked compaction worker"]
+        Worker["capability-gated tracked compaction worker"]
     end
 
     subgraph Core["astrcontinuum package"]
@@ -168,8 +182,11 @@ The domain layer must remain importable without AstrBot.
 5. Construct one `SQLiteRepository`.
 6. Construct `AstrBotHookBridge` with the validated budget configuration.
 7. Construct the bounded per-session provider registry and exact-span compiler backend.
-8. Construct and start one tracked `CompactionWorker`.
-9. Probe the internal provider-message projection capability once.
+8. Start one tracked `CompactionWorker` only for an injected test backend, a resolved explicit
+   provider, or a host exposing public `get_current_chat_provider_id`; otherwise keep the
+   provider-bound lane absent and fail open.
+9. Mark the lifecycle projection capability boundary without reviving a removed private probe
+   API; projection itself checks host capability on each build.
 
 ### 6.2 Termination
 
@@ -426,6 +443,7 @@ foreign plugin's objects.
 | `capsules` | immutable, closed envelope, same-session provenance |
 | `snapshots` | committed immutable prefix representation |
 | `snapshot_capsules` | authoritative ordered membership |
+| `snapshot_reorganization_records` | immutable, ordered reorganization audit ledger written only when explicitly supplied |
 | `active_snapshots` | at most one active pointer per session |
 | `compaction_jobs` | durable intent and fenced state machine |
 | `token_metrics` | encrypted immutable count keyed by artifact, id, and profile |
@@ -437,22 +455,30 @@ See [DATABASE_SCHEMA.md](./DATABASE_SCHEMA.md) for every column and constraint.
 
 Readers resolve a Snapshot only through `active_snapshots`. Worker-local candidate envelopes are
 not inserted as readable Snapshots. A committed Snapshot, its new Capsules, ordered membership,
-active-pointer update, and job completion form one publication outcome.
+explicitly supplied ledger entries, canonical metrics, active-pointer update, and job completion
+form one publication outcome. Ledger readers accept only committed Snapshots; candidate or rolled
+back entries are invisible.
 
 ### 14.3 Publication savepoint
 
 `TX_PUBLISH_SNAPSHOT` opens an inner savepoint:
 
-1. validate fence, identity, coverage, anchors, membership, and audit outcome;
+1. validate fence, identity, coverage, anchors, membership, canonical metrics, optional ledger
+   entries, and audit outcome;
 2. insert new immutable Capsules;
 3. insert the committed-form Snapshot;
 4. insert ordered membership;
-5. perform bootstrap-create or existing-pointer CAS;
-6. mark the job committed.
+5. insert ordered reorganization-ledger rows when an explicit publication supplies them;
+6. write canonical metrics for every new Capsule and Snapshot, then remove matching backfill
+   intents;
+7. perform bootstrap-create or existing-pointer CAS;
+8. mark the job committed.
 
 If Snapshot prefix uniqueness or pointer CAS loses a race, the inner savepoint is rolled back so
-no candidate Capsule, membership, or Snapshot remains. The fenced outer transaction records
-`SUPERSEDED` and preserves any higher durable intent as follow-up work.
+no candidate Capsule, membership, ledger row, canonical metric, or Snapshot remains. The fenced
+outer transaction records `SUPERSEDED` and preserves any higher durable intent as follow-up work.
+Ledger-integrity and canonical-metric errors are not races: they roll back the whole transaction
+and propagate rather than being relabelled as `SUPERSEDED`.
 
 ## 15. Compaction lane
 
@@ -480,7 +506,7 @@ Mechanical validation is permanent and cannot be disabled. `strict_audit=false` 
 future provider-backed semantic audit; it cannot bypass identity, source, coverage, anchor,
 membership, non-empty-output, or audit-envelope checks.
 
-### 15.1 Implemented runtime
+### 15.1 Implemented runtime and v0.3 persistence boundary
 
 - durable monotonic intent coalescing;
 - eligible job claim and lease epoch fencing;
@@ -494,7 +520,13 @@ membership, non-empty-output, or audit-envelope checks.
 - lease renewal while a model call is in flight;
 - exact frozen-base/target reads for every claimed job;
 - bounded redacted retry and failure isolation;
-- tracked startup and cancellation during plugin termination.
+- capability-gated tracked startup and cancellation during plugin termination.
+
+In addition to that wired runtime, `v0.3.0` lets an explicit Repository publication persist an
+ordered reorganization ledger and applies the permanent `QUALITY_COVERAGE_GAP` quality gate to
+non-`narrative_summary` `released` entries. The standard `CompactionWorker` still does not call a
+reorganizer or pass entries. This storage capability is not evidence that ordinary background
+compaction has wired or validated reorganization behavior.
 
 ### 15.2 Compiler trust boundary
 

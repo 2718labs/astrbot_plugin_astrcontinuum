@@ -2,10 +2,13 @@
 
 English | [简体中文](./ASTRBOT_INTEGRATION.zh-CN.md)
 
-This document defines the boundary between AstrContinuum and AstrBot at repository version
-`v0.2.1`. It is a runtime contract, not a list of intended APIs. Any change to hook ownership,
-priority, message projection, request identity, or plugin lifecycle must update this document
-and include a real `PluginManager` compatibility probe.
+This document defines the boundary between AstrContinuum and AstrBot in the `v0.3.0` Technical
+Preview. It retains the verified `v0.2.1` wired-runtime baseline; the added reorganization ledger
+is persisted only at an explicit Repository publication boundary. It does not change the AstrBot
+hook graph or mean that the standard worker is wired to a reorganizer. This is a runtime contract,
+not a list of intended APIs. Any change to hook ownership, priority, message projection, request
+identity, or plugin lifecycle must update this document and include a real `PluginManager`
+compatibility probe.
 
 ## 1. Composition root
 
@@ -19,7 +22,7 @@ and include a real `PluginManager` compatibility probe.
 - bounded request assembly and temporary projection;
 - final restoration verification and compaction-intent persistence;
 - current-provider affinity and the AstrBot extractive generator adapter;
-- tracked worker startup, wake-up, and closure during plugin termination.
+- capability-gated worker startup, wake-up, and closure during plugin termination.
 
 The domain, runtime, compaction, and storage packages do not import AstrBot. Private host objects
 are isolated behind `astrcontinuum.adapters.astrbot`.
@@ -29,19 +32,20 @@ are isolated behind `astrcontinuum.adapters.astrbot`.
 Public metadata declares:
 
 ```yaml
-astrbot_version: ">=4.24.0,<5.0.0"
+astrbot_version: ">=4.24.2,<5.0.0"
 ```
 
-The committed plugin archive has been loaded through official AstrBot distributions:
+The committed plugin archive retains these historical probes:
 
 | AstrBot | Python | Verification |
 | --- | --- | --- |
-| `4.24.0` | `3.12.13` | Star load, eight hooks, real Provider/ProviderRequest metadata, offline count, zero LLM calls |
-| `4.26.7` | `3.12.13` | Same release probe |
+| `4.24.0` | `3.12.13` | Historical Star-load probe; below the declared floor and not a current compatibility claim |
+| `4.26.7` | `3.12.13` | Same historical release probe |
 
-AstrBot `4.24.0` emits an upstream fallback warning for missing `StarMetadata.pages`; this does
-not change AstrContinuum loading or runtime behavior. Compatibility through a sample version is
-evidence, not a guarantee for every later `4.x` build.
+AstrBot `4.24.0` emits an upstream fallback warning for missing `StarMetadata.pages`; that
+historical result cannot lower the `>=4.24.2` metadata floor. `4.26.7` is a newer retained sample.
+Until a `4.24.2` probe is rerun, do not rewrite the historical `4.24.0` result as lower-bound
+evidence. A sampled version is evidence coverage, not a guarantee for every later `4.x` build.
 
 ## 3. Authoritative hooks
 
@@ -174,13 +178,17 @@ counts, never message content or object representations. The live request remain
 
 ## 9. Lifecycle and current limitation
 
-Initialization migrates the database, constructs durable services and the exact-span compiler,
-then starts one tracked worker. The finalizer raises and wakes durable compaction intent only
-when pressure requires it. Termination cancels and awaits the worker before clearing services.
+Initialization migrates the database and constructs durable services. It starts a tracked worker
+only for an injected test backend, a resolved explicit compaction provider, or a host exposing
+public `get_current_chat_provider_id`; otherwise the provider-bound lane stays absent and the
+host path fails open. The finalizer raises and wakes durable compaction intent only when pressure
+requires it. Termination cancels and awaits an active worker before clearing services.
 
 The remaining integration limitation is the optional provider-backed semantic-audit adapter.
 Mandatory exact-span validation, mechanical validation, fencing, atomic publication, offline
-token profiles, and canonical metric sidecars are active.
+token profiles, and canonical metric sidecars are active. The `v0.3.0` reorganization ledger is
+storage-only for explicit Repository publications: the standard `CompactionWorker` does not call
+a reorganizer or pass records, so it is not an AstrBot-lifecycle reorganization capability.
 
 ## 10. Change checklist
 
@@ -189,7 +197,8 @@ For every integration change:
 1. inspect the target AstrBot source/signatures rather than relying on remembered APIs;
 2. update adapter capability probes before using a private host field;
 3. run unit and SQLite integration tests;
-4. run `scripts/probe_astrbot.py` against AstrBot `4.24.0` and `4.26.7`;
+4. run `scripts/probe_astrbot.py` against the declared AstrBot lower bound `4.24.2` and the
+   newest actual sample;
 5. assert the eight handlers, public Provider/ProviderRequest metadata path, offline counting,
    and zero LLM requests;
 6. exercise at least the declared lower bound and newest verified sample for compatibility

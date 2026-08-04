@@ -1,7 +1,7 @@
 # ADR-006: AstrBot Hook Ownership and Adapter Boundary
 
-- Status: Accepted for repository `v0.1.0`
-- Real PluginManager probes: v4.24.0, v4.24.2, and v4.26.7
+- Status: Accepted; maintenance update for `v0.3.0`
+- Real PluginManager probes: historical v4.24.0, v4.24.2, and v4.26.7
 - Indexed source observation: v4.26.7 (`fed29848ca0b3912ab6a8200a10cd0f2cb080f85`)
 
 ## Unique Writers
@@ -39,11 +39,13 @@ from astrbot.core.agent.message import TextPart
 It is used with `ProviderRequest.extra_user_content_parts`; `TextPart.mark_as_temp()` marks injected context as temporary. No verified `astrbot.api.*` equivalent is asserted.
 
 The complete plugin archive and capability path have been exercised through real AstrBot
-`PluginManager` lifecycles at v4.24.0, v4.24.2, and v4.26.7. The declared lower bound is
-therefore `>=4.24.0`. AstrBot v4.24.0 emits an upstream `StarMetadata.pages` fallback warning,
-but initialization, handler registration, projection/restoration, durable Journal behavior, and
-termination pass. Observation through v4.26.7 is evidence for sampled versions, not a guarantee
-for every intervening or future build, and this ADR MUST NOT claim untested compatibility.
+`PluginManager` lifecycles at historical v4.24.0, v4.24.2, and v4.26.7. The current declared
+compatibility range is `>=4.24.2,<5.0.0`; the v4.24.0 observation is retained only as historical
+probe evidence. AstrBot v4.24.0 emits an upstream `StarMetadata.pages` fallback warning, but its
+initialization, handler registration, projection/restoration, durable Journal behavior, and
+termination passed at the time of that probe. Observation through v4.26.7 is evidence for sampled
+versions, not a guarantee for every intervening or future build, and this ADR MUST NOT claim
+untested compatibility.
 
 This exception MUST be isolated in the AstrBot adapter module. The adapter MUST perform a version/capability check for the import, `extra_user_content_parts`, and `mark_as_temp`. If import or attribute lookup fails, it MUST fail open by skipping enhanced-context injection and recording a redacted compatibility error. Core persistence, compiler, and scheduling code MUST NOT import `astrbot.core.*` or depend on `TextPart`.
 

@@ -1,7 +1,9 @@
-# ADR-001：压缩永不进入回复关键路径
+# ADR-001: Compaction Never Enters the Reply Critical Path
 
-状态：Accepted
+Status: Accepted
 
-用户请求必须使用最近 committed snapshot、未压缩 Delta 和本地检索立即装配。任何 LLM 压缩只在后台执行。
+User requests MUST be assembled immediately from the latest committed Snapshot, the
+uncompacted Delta, and local retrieval. Any LLM-backed compaction runs only in the background.
 
-后果：系统必须允许快照落后；Delta 始终可用；需要 emergency assembly、后台队列和故障恢复。
+Consequences: the system MUST tolerate a lagging Snapshot; the Delta remains available; and
+emergency assembly, a background queue, and failure recovery are required.

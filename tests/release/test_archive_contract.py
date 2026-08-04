@@ -94,7 +94,7 @@ def test_archive_is_deterministic_strict_and_below_market_limit(tmp_path: Path) 
         assert all(info.date_time == (1980, 1, 1, 0, 0, 0) for info in infos)
         assert {name.split("/", 1)[0] for name in archive.namelist()} == {ARCHIVE_PREFIX}
 
-    report = verifier.verify_plugin_archive(first, expected_version="v0.2.1")
+    report = verifier.verify_plugin_archive(first, expected_version="v0.3.0")
     assert report.members == tuple(sorted(_expected_members()))
     assert report.compressed_size == first.stat().st_size
     assert report.uncompressed_size > report.compressed_size
@@ -143,7 +143,7 @@ def test_verifier_rejects_unsafe_or_unapproved_members(
         archive.writestr(member, b"unsafe")
 
     with pytest.raises(verifier.ArchiveContractError):
-        verifier.verify_plugin_archive(archive_path, expected_version="v0.2.1")
+        verifier.verify_plugin_archive(archive_path, expected_version="v0.3.0")
 
 
 def test_verifier_rejects_version_mismatch(tmp_path: Path) -> None:

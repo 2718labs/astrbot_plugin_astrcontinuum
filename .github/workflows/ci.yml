@@ -111,10 +111,10 @@ jobs:
       - name: Build and verify deterministic plugin archive
         shell: bash
         run: |
-          archive="${RUNNER_TEMP}/astrbot_plugin_astrcontinuum-v0.2.1.zip"
+          archive="${RUNNER_TEMP}/astrbot_plugin_astrcontinuum-v0.3.0.zip"
           uv run python scripts/build_plugin_archive.py --output "${archive}"
-          uv run python scripts/verify_plugin_archive.py --archive "${archive}" --expected-version v0.2.1
-          uv run python -c "import os, zipfile; archive=os.path.join(os.environ['RUNNER_TEMP'], 'astrbot_plugin_astrcontinuum-v0.2.1.zip'); zipfile.ZipFile(archive).extractall(os.path.join(os.environ['RUNNER_TEMP'], 'plugin-archive'))"
+          uv run python scripts/verify_plugin_archive.py --archive "${archive}" --expected-version v0.3.0
+          uv run python -c "import os, zipfile; archive=os.path.join(os.environ['RUNNER_TEMP'], 'astrbot_plugin_astrcontinuum-v0.3.0.zip'); zipfile.ZipFile(archive).extractall(os.path.join(os.environ['RUNNER_TEMP'], 'plugin-archive'))"
           uv run python scripts/vendor/2718lab_validate_plugin.py "${RUNNER_TEMP}/plugin-archive/astrbot_plugin_astrcontinuum"
 
       - name: Confirm tracked checkout stayed clean

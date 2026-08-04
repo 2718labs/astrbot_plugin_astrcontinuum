@@ -128,6 +128,27 @@ def memberships(
     )
 
 
+def reorganization_record(
+    *,
+    source_capsule_id: str = "source-capsule-1",
+    kind: str = "goal",
+    item_id: str = "goal-1",
+    status: ac.ReorganizationStatus = ac.ReorganizationStatus.RETAINED,
+    before_tokens: int = 10,
+    after_tokens: int = 10,
+    required: bool = False,
+) -> ac.ReorganizationRecord:
+    return ac.ReorganizationRecord(
+        source_capsule_id=source_capsule_id,
+        kind=kind,
+        item_id=item_id,
+        status=status,
+        before_tokens=before_tokens,
+        after_tokens=after_tokens,
+        required=required,
+    )
+
+
 def candidate_snapshot(
     snapshot_id: str,
     members: tuple[ac.SnapshotCapsuleMembership, ...],
@@ -210,6 +231,7 @@ def publish(
     members: tuple[ac.SnapshotCapsuleMembership, ...],
     *,
     owner: str = "worker-1",
+    reorganization_records: tuple[ac.ReorganizationRecord, ...] = (),
     canonical_metrics: tuple[TokenMetric, ...] | None = None,
 ) -> Any:
     selected_metrics = (
@@ -239,6 +261,7 @@ def publish(
         lease_epoch=job.lease_epoch,
         candidate_snapshot=snapshot,
         memberships=members,
+        reorganization_records=reorganization_records,
         canonical_metrics=selected_metrics,
         token_ceiling=1_000,
         now=NOW + timedelta(minutes=1),
@@ -298,11 +321,196 @@ def test_bootstrap_publish_commits_candidate_pointer_and_job_atomically(
     assert view.snapshot == result.winner
     assert view.capsules == (item,)
     assert view.delta == ()
+    assert store.read_snapshot_reorganization_records(snapshot.snapshot_id) == ()
     with store.factory.connection(read_only=True) as connection:
         assert connection.execute("SELECT count(*) FROM capsules").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM snapshots").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM snapshot_capsules").fetchone()[0] == 1
         assert connection.execute("SELECT count(*) FROM active_snapshots").fetchone()[0] == 1
+        assert (
+            connection.execute("SELECT count(*) FROM snapshot_reorganization_records").fetchone()[0]
+            == 0
+        )
+
+
+def test_publish_persists_ordered_reorganization_records_and_reads_them_back(
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    capture(store, 1)
+    item = capsule(1)
+    members = memberships(item)
+    snapshot = candidate_snapshot("snapshot-ledger", members, target=1)
+    job = ready_job(
+        store,
+        target=1,
+        candidate_snapshot_id=snapshot.snapshot_id,
+        job_id="job-ledger",
+    )
+    records = (
+        reorganization_record(
+            source_capsule_id="source-capsule-required",
+            kind="goal",
+            item_id="goal-required",
+            before_tokens=15,
+            after_tokens=15,
+            required=True,
+        ),
+        reorganization_record(
+            source_capsule_id="source-capsule-approximate",
+            kind="progress",
+            item_id="progress-approximate",
+            status=ac.ReorganizationStatus.APPROXIMATE,
+            before_tokens=13,
+            after_tokens=8,
+        ),
+        reorganization_record(
+            source_capsule_id="source-capsule-summary",
+            kind="narrative_summary",
+            item_id="summary-1",
+            status=ac.ReorganizationStatus.RELEASED,
+            before_tokens=20,
+            after_tokens=0,
+        ),
+    )
+
+    result = publish(
+        store,
+        job,
+        snapshot,
+        members,
+        reorganization_records=records,
+    )
+
+    assert result.outcome is ac.PublishOutcome.COMMITTED
+    assert store.read_snapshot_reorganization_records(snapshot.snapshot_id) == records
+    with store.factory.connection(read_only=True) as connection:
+        rows = connection.execute(
+            """
+            SELECT ordinal, source_capsule_id, kind, item_id, status,
+                   before_tokens, after_tokens, required
+            FROM snapshot_reorganization_records
+            WHERE snapshot_id = ?
+            ORDER BY ordinal
+            """,
+            (snapshot.snapshot_id,),
+        ).fetchall()
+    assert [tuple(row) for row in rows] == [
+        (0, "source-capsule-required", "goal", "goal-required", "retained", 15, 15, 1),
+        (
+            1,
+            "source-capsule-approximate",
+            "progress",
+            "progress-approximate",
+            "approximate",
+            13,
+            8,
+            0,
+        ),
+        (2, "source-capsule-summary", "narrative_summary", "summary-1", "released", 20, 0, 0),
+    ]
+
+
+def test_non_summary_released_reorganization_record_is_permanently_rejected(
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    capture(store, 1)
+    item = capsule(1)
+    members = memberships(item)
+    snapshot = candidate_snapshot("snapshot-released", members, target=1)
+    job = ready_job(
+        store,
+        target=1,
+        candidate_snapshot_id=snapshot.snapshot_id,
+        job_id="job-released",
+    )
+    record = reorganization_record(
+        status=ac.ReorganizationStatus.RELEASED,
+        after_tokens=0,
+    )
+
+    with pytest.raises(ac.PublicationRejected) as captured:
+        publish(
+            store,
+            job,
+            snapshot,
+            members,
+            reorganization_records=(record,),
+        )
+
+    assert captured.value.report.passed is False
+    assert captured.value.report.coverage_gap == 1
+    assert ac.PermanentFailureCode.QUALITY_COVERAGE_GAP in captured.value.report.failure_codes
+    with store.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM capsules").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM snapshots").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT count(*) FROM snapshot_reorganization_records").fetchone()[0]
+            == 0
+        )
+        assert connection.execute("SELECT state FROM compaction_jobs").fetchone()[0] == (
+            "READY_TO_COMMIT"
+        )
+
+
+def test_publish_rejects_malformed_reorganization_records_without_candidate_writes(
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    capture(store, 1)
+    item = capsule(1)
+    members = memberships(item)
+    snapshot = candidate_snapshot("snapshot-malformed-record", members, target=1)
+    job = ready_job(
+        store,
+        target=1,
+        candidate_snapshot_id=snapshot.snapshot_id,
+        job_id="job-malformed-record",
+    )
+    malformed = ac.ReorganizationRecord(
+        source_capsule_id="source-capsule-1",
+        kind="goal",
+        item_id="goal-1",
+        status="retained",
+        before_tokens=10,
+        after_tokens=10,
+        required=False,
+    )
+
+    with pytest.raises(ac.RepositoryInvariantError, match="reorganization records"):
+        publish(
+            store,
+            job,
+            snapshot,
+            members,
+            reorganization_records=(malformed,),
+        )
+
+    with store.factory.connection(read_only=True) as connection:
+        assert connection.execute("SELECT count(*) FROM capsules").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM snapshots").fetchone()[0] == 0
+        assert connection.execute("SELECT count(*) FROM snapshot_capsules").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT count(*) FROM snapshot_reorganization_records").fetchone()[0]
+            == 0
+        )
+        assert connection.execute("SELECT state FROM compaction_jobs").fetchone()[0] == (
+            "READY_TO_COMMIT"
+        )
+
+
+def test_read_snapshot_reorganization_records_rejects_missing_and_candidate_snapshot(
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    item = capsule(1)
+    candidate = candidate_snapshot("snapshot-candidate", memberships(item), target=1)
+
+    with pytest.raises(ac.RepositoryInvariantError, match="committed Snapshot"):
+        store.read_snapshot_reorganization_records("snapshot-missing")
+    with pytest.raises(ac.RepositoryInvariantError, match="committed Snapshot"):
+        store.read_snapshot_reorganization_records(candidate.snapshot_id)
 
 
 def test_publication_commits_canonical_metrics_without_changing_compatibility_identity(
@@ -884,6 +1092,12 @@ def test_pointer_cas_loss_rolls_back_candidate_and_uses_winner_for_follow_up(
         candidate_snapshot_id=second_snapshot.snapshot_id,
         job_id="job-2",
     )
+    records = (
+        reorganization_record(
+            source_capsule_id="source-capsule-loser",
+            item_id="goal-loser",
+        ),
+    )
     with store.factory.transaction(immediate=True) as connection:
         connection.execute(
             """
@@ -894,7 +1108,13 @@ def test_pointer_cas_loss_rolls_back_candidate_and_uses_winner_for_follow_up(
             (session_key().session_key_hash,),
         )
 
-    result = publish(store, second_job, second_snapshot, second_members)
+    result = publish(
+        store,
+        second_job,
+        second_snapshot,
+        second_members,
+        reorganization_records=records,
+    )
 
     assert result.outcome == ac.PublishOutcome.SUPERSEDED
     assert result.winner == first_result.winner
@@ -909,6 +1129,16 @@ def test_pointer_cas_loss_rolls_back_candidate_and_uses_winner_for_follow_up(
         assert (
             connection.execute(
                 "SELECT count(*) FROM capsules WHERE capsule_id = 'capsule-2'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                """
+                SELECT count(*)
+                FROM snapshot_reorganization_records
+                WHERE snapshot_id = 'snapshot-loser'
+                """
             ).fetchone()[0]
             == 0
         )
@@ -1090,7 +1320,9 @@ def test_immutable_capsule_collision_preserves_winner_and_supersedes_loser(
         )
 
 
-def test_stale_fence_precedes_candidate_membership_validation(tmp_path: Path) -> None:
+def test_stale_fence_precedes_candidate_membership_and_record_validation(
+    tmp_path: Path,
+) -> None:
     store = repository(tmp_path)
     capture(store, 1)
     item = capsule(1)
@@ -1115,9 +1347,24 @@ def test_stale_fence_precedes_candidate_membership_validation(tmp_path: Path) ->
         lease_expires_at=LEASE_END + timedelta(minutes=5),
     )
     assert reclaimed is not None
+    malformed = ac.ReorganizationRecord(
+        source_capsule_id="source-capsule-1",
+        kind="goal",
+        item_id="goal-1",
+        status="retained",
+        before_tokens=10,
+        after_tokens=10,
+        required=False,
+    )
 
     with pytest.raises(ac.StaleLeaseError):
-        publish(store, old_job, candidate, invalid_members)
+        publish(
+            store,
+            old_job,
+            candidate,
+            invalid_members,
+            reorganization_records=(malformed,),
+        )
 
     with store.factory.connection(read_only=True) as connection:
         row = connection.execute(

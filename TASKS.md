@@ -1,44 +1,56 @@
-# Codex 任务清单
+# AstrContinuum task register
 
-## Phase 0：侦察
-- [ ] 核对 AstrBot 插件 API、hook 顺序与锁语义
-- [ ] 核对上下文持久化、Provider 和 tokenizer 接口
-- [ ] 核对 Sylanne 稳定公共 API
-- [ ] 写 ADR、风险和差距报告
+English | [简体中文](./TASKS.zh-CN.md)
 
-## Phase 1：基础一致性
-- [ ] SQLite Event Journal、WAL、migration
-- [ ] Snapshot Store 与 atomic pointer
-- [ ] Job lease 与 crash recovery
-- [ ] Session key normalization
+> **Planning boundary.** This is a forward-looking task register, not a completion report. The
+> current release is the `v0.3.0` Technical Preview; use the [roadmap](docs/ROADMAP.md),
+> [test matrix](docs/TEST_MATRIX.md), and current reproducible evidence for release claims.
 
-## Phase 2：主链路
-- [ ] Real token counter
-- [ ] Snapshot + Delta assembler
-- [ ] Turn boundary preservation
-- [ ] Emergency assembly
-- [ ] Assembly Trace 和 P95 benchmark
+## Phase 0 — reconnaissance
 
-## Phase 3：压缩
-- [ ] Episode segmenter
-- [ ] Exact anchor extractor
-- [ ] Schema-constrained compiler
-- [ ] Capsule merger 与 decision conflict resolver
-- [ ] Dependency graph
-- [ ] Loss auditor
+- [ ] Verify AstrBot plugin APIs, hook order, and lock semantics for each supported host probe.
+- [ ] Verify context persistence, Provider, and tokenizer interfaces against current sources.
+- [ ] Verify stable public Sylanne APIs before any durable integration.
+- [ ] Record ADRs, risks, and gap reports for material contract changes.
 
-## Phase 4：恢复
-- [ ] Hybrid retrieval
-- [ ] Query reference classifier
-- [ ] Resolution selector
-- [ ] Evidence Source Trace
-- [ ] Tool artifact retrieval
+## Phase 1 — foundational consistency
 
-## Phase 5：集成与发布
-- [ ] AstrBot hooks
-- [ ] custom compressor failsafe
-- [ ] Sylanne adapter
-- [ ] Commands / Web Inspector
-- [ ] Million-token benchmark
-- [ ] 30-second nonblocking demo
-- [ ] Crash and decision reversal demos
+- [ ] SQLite Event Journal, WAL, and migration evolution.
+- [ ] Snapshot store and atomic active pointer.
+- [ ] Job leases and crash recovery.
+- [ ] Session-key normalization.
+
+## Phase 2 — primary request path
+
+- [ ] Model-aware token counter with an offline, reproducible contract.
+- [ ] Snapshot + Delta assembly.
+- [ ] Turn-boundary preservation.
+- [ ] Emergency assembly.
+- [ ] Assembly trace and a bounded performance benchmark.
+
+## Phase 3 — compaction
+
+- [ ] Episode segmenter.
+- [ ] Exact-anchor extractor.
+- [ ] Schema-constrained compiler.
+- [ ] Capsule merger and decision-conflict resolver.
+- [ ] Dependency graph.
+- [ ] Loss auditor.
+
+## Phase 4 — retrieval and recovery
+
+- [ ] Hybrid retrieval.
+- [ ] Query-reference classifier.
+- [ ] Resolution selector.
+- [ ] Evidence source trace.
+- [ ] Tool-artifact retrieval.
+
+## Phase 5 — integration and release
+
+- [ ] AstrBot host-probe coverage.
+- [ ] Custom-compressor fail-safe evidence.
+- [ ] Sylanne adapter wiring only after stable public API evidence.
+- [ ] Commands / Web Inspector with bounded operator authority.
+- [ ] Million-token benchmark only after a reproducible protocol is approved.
+- [ ] Non-blocking demonstration with a recorded test boundary.
+- [ ] Crash and decision-reversal demonstrations.

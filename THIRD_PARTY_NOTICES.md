@@ -1,5 +1,7 @@
 # Third-Party Notices
 
+English | [简体中文](./THIRD_PARTY_NOTICES.zh-CN.md)
+
 AstrContinuum is distributed under the GNU Affero General Public License version 3 or later.
 The strict release ZIP contains the `tiktoken` encoding assets described below. The source tree
 additionally vendors a CI-only validator described separately; it is not a release-ZIP member.

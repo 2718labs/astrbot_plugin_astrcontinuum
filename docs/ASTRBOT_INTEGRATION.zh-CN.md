@@ -2,9 +2,11 @@
 
 [English](./ASTRBOT_INTEGRATION.md) | 简体中文
 
-本文规定仓库版本 `v0.2.1` 中 AstrContinuum 与 AstrBot 的真实边界。它不是“计划使用的
-API 清单”。凡是修改 Hook 职责、优先级、消息投影、请求身份或插件生命周期，都必须同步
-更新本文，并通过真实 `PluginManager` 兼容探针。
+本文规定 `v0.3.0` Technical Preview 中 AstrContinuum 与 AstrBot 的真实边界。它保留
+`v0.2.1` 已验证的接线运行时；新增重组账本仅在显式 Repository 发布边界持久化，不改变
+AstrBot Hook 图，也不表示标准 worker 已接线重组器。它不是“计划使用的 API 清单”。凡是
+修改 Hook 职责、优先级、消息投影、请求身份或插件生命周期，都必须同步更新本文，并通过
+真实 `PluginManager` 兼容探针。
 
 ## 1. 组合入口
 
@@ -18,22 +20,24 @@ API 清单”。凡是修改 Hook 职责、优先级、消息投影、请求身�
 - 执行有界上下文装配与临时投影；
 - 验证恢复、写入助手事件并持久化压缩意图；
 - 维护当前 Provider 亲和性并适配 AstrBot 精确引文生成；
-- 启动、唤醒并在插件终止时关闭受跟踪 worker。
+- 在能力满足时启动、唤醒并在插件终止时关闭受跟踪 worker。
 
 领域、运行时、压缩和存储包不导入 AstrBot。宿主私有对象统一隔离在
 `astrcontinuum.adapters.astrbot` 后面。
 
 ## 2. 已验证宿主范围
 
-公开元数据声明 `>=4.24.0,<5.0.0`。提交态插件归档已通过官方 AstrBot 分发包验证：
+公开元数据声明 `>=4.24.2,<5.0.0`，这是现行兼容下限。已有提交态插件归档的历史探针记录：
 
 | AstrBot | Python | 验证范围 |
 | --- | --- | --- |
-| `4.24.0` | `3.12.13` | Star 加载、八个 Hook、真实 Provider/ProviderRequest 元数据、离线计数、零次 LLM 调用 |
-| `4.26.7` | `3.12.13` | 同一发布探针 |
+| `4.24.0` | `3.12.13` | 历史 Star 加载探针；低于当前声明下限，不能作为现行兼容承诺 |
+| `4.26.7` | `3.12.13` | 同一历史发布探针 |
 
-AstrBot `4.24.0` 会对缺失的 `StarMetadata.pages` 打印宿主自身回退警告，但不影响本插件
-加载或行为。通过一个抽样版本只代表证据覆盖，不能推导所有后续 `4.x` 都已经验证。
+AstrBot `4.24.0` 会对缺失的 `StarMetadata.pages` 打印宿主自身回退警告，但这条历史结果
+不能降低 `metadata.yaml` 的 `>=4.24.2` 下限。`4.26.7` 是已有的较新样本；在没有重新运行
+`4.24.2` 探针前，不把历史 `4.24.0` 记录改写为下界验证。通过一个抽样版本只代表证据覆盖，
+不能推导所有后续 `4.x` 都已经验证。
 
 ## 3. 权威事件 Hook
 
@@ -134,12 +138,15 @@ Provider 投影。tokenizer 构造或任一计数失败时，所有部分结果�
 
 ## 9. 生命周期与当前限制
 
-初始化阶段迁移数据库、构造持久服务与精确引文式编译器，并启动唯一受跟踪 worker。
-finalizer 只在上下文压力需要时提高并唤醒持久归约意图；终止阶段先取消和等待 worker，
-再清理服务。
+初始化阶段迁移数据库并构造持久服务。仅在注入测试后端、显式压缩 Provider 已解析，或宿主
+公开提供 `get_current_chat_provider_id` 时，才启动唯一受跟踪 worker；否则 Provider 绑定通道
+保持缺席，宿主路径 fail-open。finalizer 只在上下文压力需要时提高并唤醒持久归约意图；终止
+阶段先取消和等待已启动的 worker，再清理服务。
 
-剩余接入限制是可选的 Provider 语义审计适配器。逐字来源校验、机械校验、fencing、
-原子发布、离线 token profile 与规范指标 sidecar 已经启用。
+剩余接入限制包括可选的 Provider 语义审计适配器。逐字来源校验、机械校验、fencing、
+原子发布、离线 token profile 与规范指标 sidecar 已经启用。`v0.3.0` 的重组账本是显式
+Repository 发布时的 storage-only 记录：标准 `CompactionWorker` 不调用重组器、不传入记录，
+因此它不是 AstrBot 生命周期中已接线的重组能力。
 
 ## 10. 修改核对
 
@@ -148,10 +155,11 @@ finalizer 只在上下文压力需要时提高并唤醒持久归约意图；终�
 1. 查目标 AstrBot 的真实源码与签名，不凭记忆写 API；
 2. 使用私有字段前先更新能力探测；
 3. 跑单元和 SQLite 集成测试；
-4. 在 AstrBot `4.24.0` 与 `4.26.7` 运行 `scripts/probe_astrbot.py`；
+4. 在 `metadata.yaml` 的当前下限 `4.24.2` 与最新实际样本上运行
+   `scripts/probe_astrbot.py`；
 5. 断言八个 handler、公开 Provider/ProviderRequest 元数据路径、离线计数和零次 LLM 请求；
 6. 兼容声明至少覆盖下界与最新验证样本；
 7. 同步更新中英文本文及测试矩阵。
 
-相关文档：[架构](./ARCHITECTURE.zh-CN.md)、[数据流](./DATA_FLOW.md)、
-[测试矩阵](./TEST_MATRIX.md)和 [ADR-006](./ADR-006-ASTRBOT-HOOK-OWNERSHIP.md)。
+相关文档：[架构](./ARCHITECTURE.zh-CN.md)、[数据流](./DATA_FLOW.zh-CN.md)、
+[测试矩阵](./TEST_MATRIX.zh-CN.md)和 [ADR-006](./ADR-006-ASTRBOT-HOOK-OWNERSHIP.zh-CN.md)。

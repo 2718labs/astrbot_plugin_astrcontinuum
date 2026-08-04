@@ -446,16 +446,18 @@ async def test_worker_captures_provider_binding_immediately_after_claim(
     )
     entered_backfill = asyncio.Event()
     release_backfill = asyncio.Event()
-    original_backfill = instance._backfill_metrics
+    runtime = instance._runtime
+    assert runtime is not None
+    original_backfill = runtime._backfill_metrics
 
     async def blocked_backfill(claimed_session: ac.SessionKey) -> None:
         entered_backfill.set()
         await release_backfill.wait()
         await original_backfill(claimed_session)
 
-    instance._backfill_metrics = blocked_backfill  # type: ignore[method-assign]
+    runtime._backfill_metrics = blocked_backfill  # type: ignore[method-assign]
     first_iteration = asyncio.create_task(instance.run_iteration())
-    await entered_backfill.wait()
+    await asyncio.wait_for(entered_backfill.wait(), timeout=1)
 
     providers.remember(session_key, second_binding)
     release_backfill.set()
@@ -618,6 +620,8 @@ async def test_worker_survives_python_310_asyncio_timeout_identity(
 ) -> None:
     store = repository(tmp_path)
     instance = worker(store, ExactBackend())
+    runtime = instance._runtime
+    assert runtime is not None
     wait_calls = 0
 
     class LegacyAsyncioTimeout(Exception):
@@ -629,13 +633,13 @@ async def test_worker_survives_python_310_asyncio_timeout_identity(
         close = getattr(awaitable, "close", None)
         if close is not None:
             close()
-        instance._closed = True
+        runtime._closed = True
         raise LegacyAsyncioTimeout
 
     monkeypatch.setattr(worker_module.asyncio, "TimeoutError", LegacyAsyncioTimeout)
     monkeypatch.setattr(worker_module.asyncio, "wait_for", legacy_wait_for)
 
-    await instance._run()
+    await runtime._run()
 
     assert wait_calls == 1
 
@@ -861,7 +865,9 @@ async def test_iteration_cancellation_wins_over_heartbeat_authentication_failure
         heartbeat_failed.set()
         raise ac.StorageSecurityError(ac.SecurityErrorCode.STORAGE_AUTHENTICATION_FAILED)
 
-    monkeypatch.setattr(instance, "_renew_lease", fail_heartbeat)
+    runtime = instance._runtime
+    assert runtime is not None
+    monkeypatch.setattr(runtime, "_renew_lease", fail_heartbeat)
     iteration = asyncio.create_task(instance.run_iteration())
     await asyncio.wait_for(heartbeat_failed.wait(), timeout=1)
     iteration.cancel()
@@ -904,8 +910,10 @@ async def test_primary_storage_error_wins_over_heartbeat_authentication_failure(
         heartbeat_failed.set()
         raise ac.StorageSecurityError(ac.SecurityErrorCode.STORAGE_AUTHENTICATION_FAILED)
 
+    runtime = instance._runtime
+    assert runtime is not None
     monkeypatch.setattr(store, "transition_job", fail_transition)
-    monkeypatch.setattr(instance, "_renew_lease", fail_heartbeat)
+    monkeypatch.setattr(runtime, "_renew_lease", fail_heartbeat)
 
     with pytest.raises(ac.StorageSecurityError) as captured:
         await instance.run_iteration()
@@ -948,7 +956,9 @@ async def test_unopposed_heartbeat_authentication_failure_reaches_fatal_callback
         heartbeat_failed.set()
         raise ac.StorageSecurityError(ac.SecurityErrorCode.STORAGE_AUTHENTICATION_FAILED)
 
-    monkeypatch.setattr(instance, "_renew_lease", fail_heartbeat)
+    runtime = instance._runtime
+    assert runtime is not None
+    monkeypatch.setattr(runtime, "_renew_lease", fail_heartbeat)
     await instance.start()
     task = instance.task
     assert task is not None
@@ -989,7 +999,9 @@ async def test_caller_exception_context_does_not_hide_heartbeat_authentication_f
         heartbeat_failed.set()
         raise ac.StorageSecurityError(ac.SecurityErrorCode.STORAGE_AUTHENTICATION_FAILED)
 
-    monkeypatch.setattr(instance, "_renew_lease", fail_heartbeat)
+    runtime = instance._runtime
+    assert runtime is not None
+    monkeypatch.setattr(runtime, "_renew_lease", fail_heartbeat)
 
     try:
         raise LookupError("caller exception context")

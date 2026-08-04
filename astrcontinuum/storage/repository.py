@@ -9,6 +9,7 @@ from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from enum import Enum
+from typing import TYPE_CHECKING
 
 from ..domain import (
     CompactionJobEnvelope,
@@ -17,6 +18,7 @@ from ..domain import (
     EventEnvelope,
     EventRole,
     EventType,
+    PermanentFailureCode,
     PermanentValidationReport,
     SessionKey,
     SnapshotAuditOutcome,
@@ -26,6 +28,7 @@ from ..domain import (
     validate_permanent,
 )
 from .crypto import SecureCodec
+from .migrations import SQLiteMigrator
 from .sqlite import SQLiteConnectionFactory
 from .token_metrics import (
     ArtifactKind,
@@ -33,6 +36,9 @@ from .token_metrics import (
     TokenMetric,
     TokenMetricStore,
 )
+
+if TYPE_CHECKING:
+    from ..reorganization import ReorganizationRecord
 
 FaultInjector = Callable[[str], None]
 
@@ -187,6 +193,33 @@ def _canonical_model_json(
     )
 
 
+def _apply_reorganization_record_quality_floor(
+    report: PermanentValidationReport,
+    records: tuple[ReorganizationRecord, ...],
+) -> PermanentValidationReport:
+    """Derive the non-configurable quality failure for released source records."""
+
+    from ..reorganization import ReorganizationStatus
+
+    non_summary_release_count = sum(
+        record.status is ReorganizationStatus.RELEASED and record.kind != "narrative_summary"
+        for record in records
+    )
+    if not non_summary_release_count:
+        return report
+
+    failures = set(report.failure_codes)
+    failures.add(PermanentFailureCode.QUALITY_COVERAGE_GAP)
+    return PermanentValidationReport(
+        passed=False,
+        failure_codes=tuple(code for code in PermanentFailureCode if code in failures),
+        source_coverage=report.source_coverage,
+        anchor_recall=report.anchor_recall,
+        coverage_gap=max(report.coverage_gap, non_summary_release_count),
+        unsupported_critical_claims=report.unsupported_critical_claims,
+    )
+
+
 class SQLiteRepository:
     """Execute the stable durable transactions over one SQLite database."""
 
@@ -199,6 +232,10 @@ class SQLiteRepository:
     ) -> None:
         if not isinstance(codec, SecureCodec):
             raise TypeError("codec must be a SecureCodec")
+        # Storage security owns keyed v2.  Once that immutable step has
+        # completed, apply the non-keyed v3 ledger extension as the next plan
+        # prefix before any repository transaction can reference it.
+        SQLiteMigrator(factory).migrate()
         self._factory = factory
         self._codec = codec
         self._metric_store = TokenMetricStore(codec)
@@ -326,6 +363,101 @@ class SQLiteRepository:
                 connection.commit()
                 return view
 
+    def read_snapshot_reorganization_records(
+        self,
+        snapshot_id: str,
+    ) -> tuple[ReorganizationRecord, ...]:
+        """Read the immutable audit ledger of one committed Snapshot only."""
+
+        with self._factory.connection(read_only=True) as connection:
+            connection.execute("BEGIN")
+            try:
+                snapshot_row = connection.execute(
+                    """
+                    SELECT lifecycle_state
+                    FROM snapshots
+                    WHERE snapshot_id = ?
+                    """,
+                    (snapshot_id,),
+                ).fetchone()
+                if (
+                    snapshot_row is None
+                    or snapshot_row["lifecycle_state"] != SnapshotState.COMMITTED.value
+                ):
+                    raise RepositoryInvariantError(
+                        "reorganization ledger requires a committed Snapshot"
+                    )
+                from ..reorganization import (
+                    ReorganizationInvariantError,
+                    ReorganizationRecord,
+                    ReorganizationStatus,
+                    canonicalize_reorganization_records,
+                )
+
+                rows = connection.execute(
+                    """
+                    SELECT
+                        source_capsule_id,
+                        kind,
+                        item_id,
+                        status,
+                        before_tokens,
+                        after_tokens,
+                        required
+                    FROM snapshot_reorganization_records
+                    WHERE snapshot_id = ?
+                    ORDER BY ordinal
+                    """,
+                    (snapshot_id,),
+                ).fetchall()
+                try:
+                    records_list: list[ReorganizationRecord] = []
+                    for row in rows:
+                        required = row["required"]
+                        if type(required) is not int or required not in (0, 1):
+                            raise ReorganizationInvariantError(
+                                "durable reorganization ledger required flag is invalid"
+                            )
+                        records_list.append(
+                            ReorganizationRecord(
+                                source_capsule_id=row["source_capsule_id"],
+                                kind=row["kind"],
+                                item_id=row["item_id"],
+                                status=ReorganizationStatus(row["status"]),
+                                before_tokens=row["before_tokens"],
+                                after_tokens=row["after_tokens"],
+                                required=bool(required),
+                            )
+                        )
+                    records = canonicalize_reorganization_records(tuple(records_list))
+                except (ReorganizationInvariantError, TypeError, ValueError) as error:
+                    raise RepositoryInvariantError(
+                        "durable reorganization ledger rows are invalid"
+                    ) from error
+            except BaseException:
+                connection.rollback()
+                raise
+            else:
+                connection.commit()
+                return records
+
+    def read_claimed_request_view(
+        self,
+        *,
+        job_id: str,
+        owner: str,
+        lease_epoch: int,
+        now: datetime,
+    ) -> RequestView:
+        """Compatibility spelling retained for the fenced v0.3 worker."""
+
+        return self.read_compaction_view(
+            job_id=job_id,
+            owner=owner,
+            lease_epoch=lease_epoch,
+            now=now,
+        )
+
     def read_compaction_view(
         self,
         *,
@@ -360,13 +492,24 @@ class SQLiteRepository:
                     snapshot = None
                     memberships: tuple[SnapshotCapsuleMembership, ...] = ()
                     covered_event_end = 0
+                    if job.base_pointer_version != 0:
+                        raise RepositoryInvariantError(
+                            "empty Job base must have pointer version zero"
+                        )
                 else:
                     snapshot, memberships = self._snapshot_bundle_by_id(
                         connection,
                         job.base_snapshot_id,
                         session_key=job.session_key,
                     )
+                    if snapshot.state != SnapshotState.COMMITTED:
+                        raise RepositoryInvariantError("Job base Snapshot is not committed")
                     covered_event_end = snapshot.covered_event_end
+
+                if covered_event_end > job.target_high_water_mark:
+                    raise RepositoryInvariantError(
+                        "Job base Snapshot coverage exceeds its frozen target"
+                    )
                 delta = self._events_between(
                     connection,
                     session_key=job.session_key,
@@ -376,9 +519,9 @@ class SQLiteRepository:
                 expected_sequences = tuple(
                     range(covered_event_end + 1, job.target_high_water_mark + 1)
                 )
-                if tuple(item.sequence for item in delta) != expected_sequences:
+                if tuple(event.sequence for event in delta) != expected_sequences:
                     raise RepositoryInvariantError(
-                        "frozen compaction input is not a contiguous complete Delta"
+                        "claimed request Delta is not contiguous through the frozen target"
                     )
                 view = RequestView(
                     session_key=job.session_key,
@@ -1179,7 +1322,8 @@ class SQLiteRepository:
         lease_epoch: int,
         candidate_snapshot: SnapshotEnvelope,
         memberships: Sequence[SnapshotCapsuleMembership],
-        canonical_metrics: Sequence[TokenMetric],
+        canonical_metrics: Sequence[TokenMetric] | None = None,
+        reorganization_records: Sequence[ReorganizationRecord] = (),
         token_ceiling: int,
         now: datetime,
     ) -> PublishResult:
@@ -1189,7 +1333,8 @@ class SQLiteRepository:
             raise ValueError("token_ceiling must be non-negative")
         now_text = _normalize_datetime(now)
         membership_tuple = tuple(memberships)
-        canonical_metric_tuple = tuple(canonical_metrics)
+        record_tuple = tuple(reorganization_records)
+        canonical_metric_tuple = tuple(canonical_metrics) if canonical_metrics is not None else None
 
         with self._factory.transaction(immediate=True) as connection:
             fence_row = self._require_live_fence(
@@ -1212,11 +1357,23 @@ class SQLiteRepository:
             if candidate_snapshot.session_key != job.session_key:
                 raise JobTransitionError("candidate Snapshot belongs to a different Job session")
             self._validate_candidate_memberships(candidate_snapshot, membership_tuple)
-            self._validate_candidate_metrics(
-                candidate_snapshot,
-                membership_tuple,
-                canonical_metric_tuple,
+            from ..reorganization import (
+                ReorganizationInvariantError,
+                canonicalize_reorganization_records,
             )
+
+            try:
+                canonical_records = canonicalize_reorganization_records(record_tuple)
+            except ReorganizationInvariantError as error:
+                raise RepositoryInvariantError(
+                    "candidate reorganization records are invalid"
+                ) from error
+            if canonical_metric_tuple is not None:
+                self._validate_candidate_metrics(
+                    candidate_snapshot,
+                    membership_tuple,
+                    canonical_metric_tuple,
+                )
 
             if job.base_snapshot_id is None:
                 previous_snapshot = None
@@ -1245,6 +1402,7 @@ class SQLiteRepository:
                 target_high_water_mark=job.target_high_water_mark,
                 token_ceiling=token_ceiling,
             )
+            report = _apply_reorganization_record_quality_floor(report, canonical_records)
             if not report.passed:
                 raise PublicationRejected(report)
 
@@ -1302,26 +1460,55 @@ class SQLiteRepository:
                     self._inject("publish.after_membership")
 
             if not conflict:
-                for metric in canonical_metric_tuple:
-                    self._metric_store.put_in_transaction(
-                        connection,
-                        metric,
-                        created_at=_parse_datetime(now_text),
-                    )
+                for ordinal, record in enumerate(canonical_records):
                     connection.execute(
                         """
-                        DELETE FROM token_metric_backfill_intents
-                        WHERE artifact_kind = ?
-                          AND artifact_id = ?
-                          AND tokenizer_profile_id = ?
+                        INSERT INTO snapshot_reorganization_records (
+                            snapshot_id,
+                            ordinal,
+                            source_capsule_id,
+                            kind,
+                            item_id,
+                            status,
+                            before_tokens,
+                            after_tokens,
+                            required
+                        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
                         """,
                         (
-                            metric.artifact_kind.value,
-                            metric.artifact_id,
-                            metric.tokenizer_profile_id,
+                            committed_snapshot.snapshot_id,
+                            ordinal,
+                            record.source_capsule_id,
+                            record.kind,
+                            record.item_id,
+                            record.status.value,
+                            record.before_tokens,
+                            record.after_tokens,
+                            int(record.required),
                         ),
                     )
-                    self._inject("publish.after_metric")
+                    self._inject("publish.after_ledger")
+                if canonical_metric_tuple is not None:
+                    for metric in canonical_metric_tuple:
+                        self._metric_store.put_in_transaction(
+                            connection,
+                            metric,
+                            created_at=_parse_datetime(now_text),
+                        )
+                        connection.execute(
+                            """
+                            DELETE FROM token_metric_backfill_intents
+                            WHERE artifact_kind = ?
+                              AND artifact_id = ?
+                              AND tokenizer_profile_id = ?
+                            """,
+                            (
+                                metric.artifact_kind.value,
+                                metric.artifact_id,
+                                metric.tokenizer_profile_id,
+                            ),
+                        )
+                        self._inject("publish.after_metric")
 
             if not conflict:
                 conflict = not self._cas_active_pointer(

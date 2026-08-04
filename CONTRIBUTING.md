@@ -1,6 +1,6 @@
 # Contributing to AstrContinuum
 
-English | [简体中文](#简体中文)
+English | [简体中文](./CONTRIBUTING.zh-CN.md)
 
 Thank you for helping improve AstrContinuum. This plugin changes how conversation state is
 captured, assembled, temporarily projected, restored, and eventually compacted. A change that
@@ -101,11 +101,12 @@ languages.
 
 ## Release contract
 
-`v0.2.1` has a deterministic AstrBot package contract. Before a release decision:
+`v0.3.0` has a deterministic AstrBot package contract. Before a release decision:
 
 - run the frozen quality gate and the dedicated release tests;
 - run the vendored 2718lab validator on the tracked tree and unpacked archive;
-- probe the public AstrBot Provider/ProviderRequest path on `4.24.0` and `4.26.7`;
+- probe the public AstrBot Provider/ProviderRequest path on the declared lower bound `4.24.2`
+  and the newest verified sample `4.26.7`;
 - build with `scripts/build_plugin_archive.py` and verify with
   `scripts/verify_plugin_archive.py`;
 - confirm that the archive has one `astrbot_plugin_astrcontinuum/` top-level directory, only
@@ -113,47 +114,3 @@ languages.
 
 AstrBot-market distribution is a separate maintainer process. The CI archive job does not submit
 to the market, create tags, or publish remote releases.
-
-## 简体中文
-
-感谢你参与 AstrContinuum。这个插件会影响会话事件如何落盘、组装、临时投影、恢复并最终
-压缩，因此看似局部的修改也可能破坏持久历史或 AstrBot 原生请求对象。修改运行时前，请先
-阅读[中文架构文档](./docs/ARCHITECTURE.zh-CN.md)和相关 ADR。
-
-### 开发环境
-
-```bash
-git clone https://github.com/2718labs/astrbot_plugin_astrcontinuum
-cd astrbot_plugin_astrcontinuum
-uv sync --frozen --extra dev
-uv run ruff check .
-uv run ruff format --check .
-uv run mypy astrcontinuum main.py
-uv run pytest -q
-```
-
-凡是修改 `main.py`、元数据、配置、Hook、请求投影或 AstrBot 适配层，还必须通过真实
-AstrBot `PluginManager` 加载验证。
-
-### 架构变更必须提交的证据
-
-以下任一内容变化都属于架构变更：持久化 Schema、事件权威来源、会话身份、Hook
-职责/优先级、投影与恢复、预算语义、Snapshot 覆盖、压缩状态迁移、租约/fencing 或发布事务。
-
-对应 PR 必须说明：
-
-1. 影响了[测试矩阵](./docs/TEST_MATRIX.md)中的哪些 `INV-*`；
-2. 旧数据的迁移、回滚和恢复策略；
-3. 异常与进程崩溃边界下的持久结果；
-4. 重复回调、并发发布冲突、过期租约等并发证据；
-5. 验证过的真实 AstrBot 版本和适配器；
-6. 同步更新的架构、数据流、数据库、ADR、配置和 Changelog 文档。
-
-只看日志或返回值不算持久化正确性证据；必须断言数据库行、活动指针、覆盖范围和状态迁移。
-
-### 发布规则
-
-`v0.2.1` 具有确定性的 AstrBot 安装包契约。发布决策前必须通过
-冻结依赖的完整质量门、发布契约测试、2718lab 校验器、AstrBot `4.24.0`/`4.26.7` 公共
-Provider 探针，以及归档 allowlist、固定 tokenizer 资产和 `<16 MiB` 门禁。市场提交、稳定
-标签或 GitHub Release 由维护者决定；AstrBot 市场分发是独立流程，CI 不会自动执行这些动作。

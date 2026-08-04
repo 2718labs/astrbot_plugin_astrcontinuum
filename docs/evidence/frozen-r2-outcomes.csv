@@ -1,0 +1,5 @@
+arm,structural_valid,denominator,answer_delivered,claim_v2_end_to_end,scope_note
+Full capsule,27,36,27,21,"Frozen synthetic R2; research-only"
+Projection,36,36,36,25,"Frozen synthetic R2; research-only"
+Summary,36,36,36,27,"Offline comparison only; not a runtime fallback"
+Oracle floor,36,36,,,"Registered encoding floor; no answer metric"

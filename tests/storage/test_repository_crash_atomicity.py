@@ -108,6 +108,27 @@ def capsule(sequence: int = 1) -> ac.ContextCapsuleEnvelope:
     )
 
 
+def reorganization_record(
+    *,
+    source_capsule_id: str = "source-capsule-1",
+    kind: str = "goal",
+    item_id: str = "goal-1",
+    status: ac.ReorganizationStatus = ac.ReorganizationStatus.RETAINED,
+    before_tokens: int = 10,
+    after_tokens: int = 10,
+    required: bool = False,
+) -> ac.ReorganizationRecord:
+    return ac.ReorganizationRecord(
+        source_capsule_id=source_capsule_id,
+        kind=kind,
+        item_id=item_id,
+        status=status,
+        before_tokens=before_tokens,
+        after_tokens=after_tokens,
+        required=required,
+    )
+
+
 def candidate_bundle(
     snapshot_id: str = "snapshot-1",
     *,
@@ -196,6 +217,8 @@ def publish(
     job: ac.CompactionJobEnvelope,
     snapshot: ac.SnapshotEnvelope,
     memberships: tuple[ac.SnapshotCapsuleMembership, ...],
+    *,
+    reorganization_records: tuple[ac.ReorganizationRecord, ...] = (),
 ) -> ac.PublishResult:
     return store.publish_snapshot(
         job_id=job.job_id,
@@ -203,6 +226,7 @@ def publish(
         lease_epoch=job.lease_epoch,
         candidate_snapshot=snapshot,
         memberships=memberships,
+        reorganization_records=reorganization_records,
         canonical_metrics=(
             *(
                 TokenMetric(
@@ -256,6 +280,10 @@ def assert_candidate_writes_absent(
         assert connection.execute("SELECT count(*) FROM capsules").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM snapshots").fetchone()[0] == 0
         assert connection.execute("SELECT count(*) FROM snapshot_capsules").fetchone()[0] == 0
+        assert (
+            connection.execute("SELECT count(*) FROM snapshot_reorganization_records").fetchone()[0]
+            == 0
+        )
         assert connection.execute("SELECT count(*) FROM active_snapshots").fetchone()[0] == 0
         assert (
             connection.execute(
@@ -354,6 +382,16 @@ def assert_conflict_crash_rolled_back(
         assert (
             connection.execute(
                 "SELECT count(*) FROM capsules WHERE capsule_id = 'capsule-2'"
+            ).fetchone()[0]
+            == 0
+        )
+        assert (
+            connection.execute(
+                """
+                SELECT count(*)
+                FROM snapshot_reorganization_records
+                WHERE snapshot_id = 'snapshot-2'
+                """
             ).fetchone()[0]
             == 0
         )
@@ -490,6 +528,75 @@ def test_publish_crash_rolls_back_every_candidate_and_terminal_boundary(
     assert_candidate_writes_absent(factory)
     recovered = publish(stable, job, snapshot, memberships)
     assert recovered.outcome == ac.PublishOutcome.COMMITTED
+
+
+def test_publish_after_ledger_crash_rolls_back_partial_ledger_insert(
+    tmp_path: Path,
+) -> None:
+    factory = migrated_factory(tmp_path)
+    stable = secure_repository(factory)
+    capture(stable, 1)
+    snapshot, memberships = candidate_bundle()
+    job = ready_job(stable, candidate_snapshot_id=snapshot.snapshot_id)
+    records = (
+        reorganization_record(),
+        reorganization_record(
+            source_capsule_id="source-capsule-2",
+            kind="progress",
+            item_id="progress-2",
+            status=ac.ReorganizationStatus.APPROXIMATE,
+            before_tokens=12,
+            after_tokens=8,
+        ),
+    )
+    crashing = secure_repository(factory, fault_injector=fail_at("publish.after_ledger"))
+
+    with pytest.raises(InjectedCrash, match="publish.after_ledger"):
+        publish(
+            crashing,
+            job,
+            snapshot,
+            memberships,
+            reorganization_records=records,
+        )
+
+    assert_candidate_writes_absent(factory)
+    recovered = publish(
+        stable,
+        job,
+        snapshot,
+        memberships,
+        reorganization_records=records,
+    )
+    assert recovered.outcome == ac.PublishOutcome.COMMITTED
+    assert stable.read_snapshot_reorganization_records(snapshot.snapshot_id) == records
+
+
+def test_injected_ledger_integrity_error_is_not_misclassified_as_publish_conflict(
+    tmp_path: Path,
+) -> None:
+    factory = migrated_factory(tmp_path)
+    stable = secure_repository(factory)
+    capture(stable, 1)
+    snapshot, memberships = candidate_bundle()
+    job = ready_job(stable, candidate_snapshot_id=snapshot.snapshot_id)
+
+    def crash_after_ledger(name: str) -> None:
+        if name == "publish.after_ledger":
+            raise sqlite3.IntegrityError("injected crash after ledger insert")
+
+    crashing = secure_repository(factory, fault_injector=crash_after_ledger)
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected crash"):
+        publish(
+            crashing,
+            job,
+            snapshot,
+            memberships,
+            reorganization_records=(reorganization_record(),),
+        )
+
+    assert_candidate_writes_absent(factory)
 
 
 def test_follow_up_creation_crash_rolls_back_publication_and_pending_job(

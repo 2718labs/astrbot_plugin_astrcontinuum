@@ -131,9 +131,9 @@ def _source_version(source_root: Path) -> str:
     if lock_match is None or lock_match.group(1) != package_version:
         raise ArchiveContractError("uv.lock root package version does not match metadata")
 
-    badge = f"version-{version}-blue"
+    badge = re.compile(rf"version-{re.escape(version)}-[A-Za-z0-9]+")
     for readme in ("README.md", "README.zh-CN.md"):
-        if badge not in _read_text(source_root / readme):
+        if badge.search(_read_text(source_root / readme)) is None:
             raise ArchiveContractError(f"{readme} version badge does not match metadata")
 
     changelog_match = _CHANGELOG_VERSION.search(_read_text(source_root / "CHANGELOG.md"))
