@@ -91,6 +91,13 @@ def test_v030_version_is_consistent_across_release_surfaces() -> None:
     assert chinese_heading.group(1) == EXPECTED_RELEASE_VERSION
 
 
+def test_ci_release_archive_contract_matches_public_version() -> None:
+    workflow = (ROOT / ".github/workflows/ci.yml").read_text(encoding="utf-8")
+
+    assert f"astrbot_plugin_astrcontinuum-{EXPECTED_RELEASE_VERSION}.zip" in workflow
+    assert f"--expected-version {EXPECTED_RELEASE_VERSION}" in workflow
+
+
 def test_readmes_publish_one_bounded_evidence_chart() -> None:
     for readme_path in README_PATHS:
         text = readme_path.read_text(encoding="utf-8")
