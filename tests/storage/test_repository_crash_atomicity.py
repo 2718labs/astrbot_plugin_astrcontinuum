@@ -505,6 +505,33 @@ def test_publish_after_ledger_crash_rolls_back_partial_ledger_insert(
     assert stable.read_snapshot_reorganization_records(snapshot.snapshot_id) == records
 
 
+def test_injected_ledger_integrity_error_is_not_misclassified_as_publish_conflict(
+    tmp_path: Path,
+) -> None:
+    factory = migrated_factory(tmp_path)
+    stable = ac.SQLiteRepository(factory)
+    capture(stable, 1)
+    snapshot, memberships = candidate_bundle()
+    job = ready_job(stable, candidate_snapshot_id=snapshot.snapshot_id)
+
+    def crash_after_ledger(name: str) -> None:
+        if name == "publish.after_ledger":
+            raise sqlite3.IntegrityError("injected crash after ledger insert")
+
+    crashing = ac.SQLiteRepository(factory, fault_injector=crash_after_ledger)
+
+    with pytest.raises(sqlite3.IntegrityError, match="injected crash"):
+        publish(
+            crashing,
+            job,
+            snapshot,
+            memberships,
+            reorganization_records=(reorganization_record(),),
+        )
+
+    assert_candidate_writes_absent(factory)
+
+
 def test_follow_up_creation_crash_rolls_back_publication_and_pending_job(
     tmp_path: Path,
 ) -> None:
