@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import ast
+import csv
 import json
 import re
 from pathlib import Path
@@ -105,10 +106,38 @@ def test_readmes_publish_one_bounded_evidence_chart() -> None:
         assert text.count("docs/assets/evidence-r2-outcomes-rmb.svg") == 1
         assert "CompactionWorker" in text
         assert (
+            "冻结的 R2 合成评测" in text
+            if readme_path.name.endswith(".zh-CN.md")
+            else "frozen synthetic R2 evaluation" in text
+        )
+        assert (
             "技术预览" in text
             if readme_path.name.endswith(".zh-CN.md")
             else "Technical Preview" in text
         )
+
+
+def test_r2_evidence_figure_is_a_fixed_denominator_plot() -> None:
+    figure = (ROOT / "docs/assets/evidence-r2-outcomes-rmb.svg").read_text(encoding="utf-8")
+    with (ROOT / "docs/evidence/frozen-r2-outcomes.csv").open(
+        encoding="utf-8", newline=""
+    ) as source:
+        outcomes = list(csv.DictReader(source))
+
+    assert "Successful units / fixed denominator (%)" in figure
+    assert "No uncertainty interval or hypothesis test is available" in figure
+    assert "structural-only reference" in figure
+
+    for outcome in outcomes:
+        denominator = int(outcome["denominator"])
+        for metric in (
+            "structural_valid",
+            "answer_delivered",
+            "claim_v2_end_to_end",
+        ):
+            if outcome[metric]:
+                numerator = int(outcome[metric])
+                assert f"{numerator}/{denominator} ({numerator / denominator * 100:.1f}%)" in figure
 
 
 def test_readmes_link_public_configuration_evidence_and_workflow() -> None:

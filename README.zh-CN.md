@@ -25,9 +25,11 @@
 
 ## 隔离实验数据
 
-下图是**隔离、确定性的 CRM 实验**，不是生产基准、语义质量结论，也不能证明 v0.3 已接线重组功能。它被保留在文档中，是为了让发布内容拥有可追溯的可视化参考，同时不掩盖其边界。
+下图是**隔离、冻结的 R2 合成评测**，不是生产基准、语义质量结论，也不能证明 v0.3 已接线重组功能。它被保留在文档中，是为了让发布内容拥有可追溯的可视化参考，同时不掩盖其边界。
 
-<img src="./docs/assets/evidence-r2-outcomes-rmb.svg" width="720" alt="隔离确定性实验的结果率；不是 v0.3 生产能力声明。">
+<img src="./docs/assets/evidence-r2-outcomes-rmb.svg" width="860" alt="图 R2：冻结 R2 聚合结果的双面板点图，固定分母 n=36；仅限研究，不是 v0.3 生产能力证据。">
+
+<sub>图 R2｜冻结合成聚合结果；数值为计数/36（%），公开聚合数据不提供不确定性区间或假设检验。</sub>
 
 实验来源、哈希、修订、排除项及配套流程见 [Evidence](./docs/EVIDENCE.md) / [证据说明](./docs/EVIDENCE.zh-CN.md) 与 [Workflow](./docs/WORKFLOW.md) / [工作流](./docs/WORKFLOW.zh-CN.md)。
 

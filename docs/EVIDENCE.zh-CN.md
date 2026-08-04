@@ -6,16 +6,19 @@
 > 真实语义模型评测、Provider 基准、生产性能基准或发布就绪门槛。
 
 <p align="center">
-  <img src="assets/evidence-r2-outcomes-rmb.svg" width="720"
-       alt="冻结 R2 合成结果；仅限研究，不构成 v0.3 生产就绪证据 / Frozen R2 synthetic outcomes; research-only and not evidence of v0.3 production readiness">
+  <img src="assets/evidence-r2-outcomes-rmb.svg" width="860"
+       alt="图 R2：冻结 R2 聚合结果的双面板点图，固定分母 n=36；仅限研究，不构成 v0.3 生产就绪证据 / Figure R2: two-panel dot plot of fixed-denominator frozen R2 aggregate outcomes, n=36; research-only and not evidence of v0.3 production readiness">
 </p>
 
 <p align="center"><em>
-冻结 R2 合成评测（12 个场景 × 3 次试验，n=36）。仅限研究，不构成 v0.3
-生产性能或发布就绪声明。
+冻结 R2 合成评测（12 个场景 × 3 次试验，n=36）。数值为已提交的聚合计数，以
+计数/36（%）表示；公开聚合数据不提供不确定性区间或假设检验。仅限研究，不构成
+v0.3 生产性能或发布就绪声明。
 <br>
-Frozen R2 synthetic evaluation (12 scenarios × 3 trials, n=36). Research-only;
-not a v0.3 production-performance or release-readiness claim.
+Frozen R2 synthetic evaluation (12 scenarios × 3 trials, n=36). Values are
+committed aggregates shown as count/36 (%); no uncertainty interval or
+hypothesis test is available from the published aggregate. Research-only; not
+a v0.3 production-performance or release-readiness claim.
 </em></p>
 
 ## 如何阅读这些证据

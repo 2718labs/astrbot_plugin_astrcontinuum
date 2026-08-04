@@ -25,9 +25,11 @@ The durable core and the AstrBot composition root are deliberately separate. “
 
 ## Experimental evidence, kept separate
 
-The chart below is an **isolated, deterministic CRM experiment**, not a production benchmark, semantic-quality result, or evidence that reorganization is wired into v0.3. It is included so that the released documentation has a traceable visual reference without hiding its boundary.
+The chart below reports an **isolated, frozen synthetic R2 evaluation**, not a production benchmark, semantic-quality result, or evidence that reorganization is wired into v0.3. It is included so that the released documentation has a traceable visual reference without hiding its boundary.
 
-<img src="./docs/assets/evidence-r2-outcomes-rmb.svg" width="720" alt="Outcome rates for an isolated deterministic experiment; this is not a v0.3 production claim.">
+<img src="./docs/assets/evidence-r2-outcomes-rmb.svg" width="860" alt="Figure R2: two-panel dot plot of fixed-denominator frozen R2 aggregate outcomes, n=36; research-only and not v0.3 production evidence.">
+
+<sub>Figure R2 — frozen synthetic aggregate; values are count/36 (%), with no uncertainty interval or hypothesis test available from the published aggregate.</sub>
 
 Source provenance, hashes, revisions, exclusions, and the companion workflow are recorded in [Evidence](./docs/EVIDENCE.md) / [证据说明](./docs/EVIDENCE.zh-CN.md) and [Workflow](./docs/WORKFLOW.md) / [工作流](./docs/WORKFLOW.zh-CN.md).
 
