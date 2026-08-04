@@ -1,4 +1,3 @@
-#!/usr/bin/env python3
 """Render the frozen R2 aggregate evidence as a deterministic SVG figure."""
 
 from __future__ import annotations
