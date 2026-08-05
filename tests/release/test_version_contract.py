@@ -173,6 +173,113 @@ def test_r2_evidence_figure_exporter_reproduces_committed_svg(tmp_path: Path) ->
                 assert f"{numerator}/{denominator} ({numerator / denominator * 100:.1f}%)" in figure
 
 
+def test_versioned_evidence_figure_exporter_reproduces_committed_svg(tmp_path: Path) -> None:
+    output_path = tmp_path / "evidence-r2-v03-evidence.svg"
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/render_versioned_evidence_figure.py",
+            "--r2-input",
+            "docs/evidence/frozen-r2-outcomes.csv",
+            "--gate-a-input",
+            "docs/evidence/v03-update-gate-a/aggregate.csv",
+            "--output",
+            str(output_path),
+        ],
+        capture_output=True,
+        cwd=ROOT,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode == 0, completed.stderr
+    figure_bytes = output_path.read_bytes()
+    assert figure_bytes == (ROOT / "docs/assets/evidence-r2-v03-evidence.svg").read_bytes()
+    assert b"\r\n" not in figure_bytes
+    figure = figure_bytes.decode("utf-8")
+    assert "Pre-v0.3 / R2 historical evidence" in figure
+    assert "v0.3 / Gate A wiring verification" in figure
+    assert "NOT A PERFORMANCE COMPARISON" in figure
+    assert "No shared outcome axis" in figure
+    assert "Structural / ledger only; not an E2E outcome" in figure
+    assert "E2E versus refreshed Summary: BLOCKED" in figure
+    assert "Ordinary Provider runtime wired: false" in figure
+    assert "Non-summary released records: 0" in figure
+    assert "docs/evidence/frozen-r2-outcomes.csv" in figure
+    assert "docs/evidence/v03-update-gate-a/aggregate.csv" in figure
+
+    with (ROOT / "docs/evidence/frozen-r2-outcomes.csv").open(
+        encoding="utf-8", newline=""
+    ) as source:
+        r2_outcomes = list(csv.DictReader(source))
+    for outcome in r2_outcomes:
+        denominator = int(outcome["denominator"])
+        assert f"{outcome['structural_valid']}/{denominator} ({int(outcome['structural_valid']) / denominator * 100:.1f}%)" in figure
+
+    with (ROOT / "docs/evidence/v03-update-gate-a/aggregate.csv").open(
+        encoding="utf-8", newline=""
+    ) as source:
+        gate_a = next(csv.DictReader(source))
+    for field in (
+        "baseline_committed",
+        "update_committed",
+        "pointer_advanced",
+        "durable_ledger",
+        "required_core_edges",
+    ):
+        count = int(gate_a[field])
+        denominator = int(gate_a["denominator"])
+        assert f"{count} / {denominator} verified units" in figure
+
+
+def test_versioned_evidence_figure_rejects_an_e2e_gate_a_claim(tmp_path: Path) -> None:
+    gate_a_input = tmp_path / "invalid-gate-a.csv"
+    gate_a_input.write_text(
+        (ROOT / "docs/evidence/v03-update-gate-a/aggregate.csv")
+        .read_text(encoding="utf-8")
+        .replace(",BLOCKED,", ",REPORTED,", 1),
+        encoding="utf-8",
+        newline="\n",
+    )
+    output_path = tmp_path / "evidence.svg"
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "scripts/render_versioned_evidence_figure.py",
+            "--r2-input",
+            "docs/evidence/frozen-r2-outcomes.csv",
+            "--gate-a-input",
+            str(gate_a_input),
+            "--output",
+            str(output_path),
+        ],
+        capture_output=True,
+        cwd=ROOT,
+        text=True,
+        check=False,
+    )
+
+    assert completed.returncode != 0
+    assert "e2e_summary_status must remain BLOCKED" in completed.stderr
+    assert not output_path.exists()
+
+
+def test_versioned_evidence_figure_is_documented_as_separate_versioned_evidence() -> None:
+    for evidence_path in (ROOT / "docs/EVIDENCE.md", ROOT / "docs/EVIDENCE.zh-CN.md"):
+        evidence = evidence_path.read_text(encoding="utf-8")
+        assert "assets/evidence-r2-v03-evidence.svg" in evidence
+        assert "BLOCKED" in evidence
+        assert "performance comparison" in evidence or "性能比较" in evidence
+    for manifest_path in (
+        ROOT / "docs/evidence/README.md",
+        ROOT / "docs/evidence/README.zh-CN.md",
+    ):
+        manifest = manifest_path.read_text(encoding="utf-8")
+        assert "evidence-r2-v03-evidence.svg" in manifest
+        assert "render_versioned_evidence_figure.py" in manifest
+
+
 def test_committed_v03_gate_a_evidence_is_redacted_and_matches_its_aggregate() -> None:
     evidence_root = ROOT / "docs/evidence/v03-update-gate-a"
     aggregate_path = evidence_root / "aggregate.csv"

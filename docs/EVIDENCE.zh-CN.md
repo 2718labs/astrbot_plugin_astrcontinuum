@@ -6,8 +6,8 @@
 > 真实语义模型评测、Provider 基准、生产性能基准或发布就绪门槛。
 
 > **Gate A 分类。** `V03-WIRE-001` 是确定性的集成验证（12 个冻结场景 × 3 次
-> 试验），以下以表格和脱敏回执公开。它的全通过结构结果不会被包装成模型性能图，
-> 也不是 v0.3 对比 Summary 的结论。
+> 试验）。下文只会把它放入独立框出的结构验证面板、表格和脱敏回执；它绝不是模型
+> 性能图，也不是 v0.3 对比 Summary 的结论。
 
 ## 如何阅读这些证据
 
@@ -28,18 +28,23 @@
    必需核心边保留；它不测量语义回答质量、Provider 行为、生产行为，也不产生
    v0.3 对比 Summary 的结论。
 
-## v0.3 前的历史 R2 基线
+## 版本分区证据图
 
 <p align="center">
-  <img src="assets/evidence-r2-outcomes-rmb.svg" width="860"
-       alt="图 R2：冻结 R2 聚合结果的双面板点图，固定分母 n=36；仅限研究，不是 v0.3 对比">
+  <img src="assets/evidence-r2-v03-evidence.svg" width="960"
+       alt="图 EV-01：v0.3 前历史 R2 结果与 v0.3 Gate A 结构接线验证的独立面板；没有共享结果轴或性能比较">
 </p>
 
 <p align="center"><em>
-冻结 R2 合成评测（12 个场景 × 3 次试验，n=36）。数值为已提交的聚合计数，以
-计数/36（%）表示；公开聚合数据不提供不确定性区间或假设检验。该历史记录不是
-v0.3 评测或版本间比较。
+图 EV-01 将 v0.3 前冻结 R2 聚合和 v0.3 Gate A 放入独立面板。A 面板以计数/36（%）
+报告历史 R2 结果；B 面板只报告结构／账本的已验证单元，不共享结果轴。相同分母不
+使两面板可比较；Gate B 对重新生成 Summary 的端到端比较仍为 BLOCKED。
 </em></p>
+
+左侧面板刻意标为 **v0.3 前历史 R2**，而不是“v0.2 发布实测”：已提交摘录只标识
+冻结研究来源及其哈希，并没有把该聚合绑定到 v0.2 发布标签。
+
+## v0.3 前的历史 R2 基线
 
 冻结研究来源标识为 results.json，SHA-256：
 
@@ -65,8 +70,14 @@ Summary，也不能证明已启用 v0.3 更新／重组机制。
 
 ### 可复现实验图导出
 
-发布 SVG 由已提交的聚合数据自动生成，并非手工维护的绘图作品。经批准的实验更新
-CSV 后，执行以下命令即可重建实验图：
+版本分区 SVG 由两份已提交摘录自动生成，并非手工维护的绘图作品。执行以下命令可
+重建该图：
+
+```bash
+uv run python scripts/render_versioned_evidence_figure.py
+```
+
+R2 专用辅助 SVG 仍可由历史聚合单独复现：
 
 ```bash
 uv run python scripts/render_r2_evidence_figure.py
@@ -115,9 +126,10 @@ uv run python experiments/v03_update_benchmark.py `
   --workspace D:\bun\tmp\codex\AstrContinuum-v03-experiment\workspace
 ```
 
-Gate A 刻意不生成性能图：它的固定确定性全通过结果属于发布契约验证，而不是科学结果
-曲线。只有在配对 Gate B 数据集同时包含两臂的同一模型、评分器、阶段历史、更新深度
-横轴以及配对的准确率／陈旧率／上下文成本／延迟结果后，才可收录真正的 E2E 实验图。
+Gate A 在图 EV-01 中只能作为独立框出的结构验证面板：它的固定确定性全通过结果属于
+发布契约验证，而不是科学结果曲线。只有在配对 Gate B 数据集同时包含两臂的同一
+模型、评分器、阶段历史、更新深度横轴以及配对的准确率／陈旧率／上下文成本／延迟
+结果后，才可收录真正的 E2E 实验图。
 
 **解读约束。** Gate A 只证明 opt-in、注入式、围栏化 worker 的接线路径。常规
 Provider 绑定运行时及当前 AstrBot 组合配置未设置 `reorganization_token_budget`，

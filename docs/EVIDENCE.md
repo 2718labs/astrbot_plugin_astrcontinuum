@@ -8,9 +8,9 @@ English | [简体中文](EVIDENCE.zh-CN.md)
 > or a release-readiness gate.
 
 > **Gate A classification.** `V03-WIRE-001` is a deterministic integration
-> verification (12 frozen scenarios × 3 trials), published below as a table
-> and redacted receipts. Its all-pass structural result is not presented as a
-> model-performance figure or a v0.3-versus-Summary result.
+> verification (12 frozen scenarios × 3 trials). It may appear below only as a
+> separately boxed structural-verification panel, table, and redacted receipts;
+> it is never a model-performance figure or a v0.3-versus-Summary result.
 
 ## How to read this evidence
 
@@ -36,19 +36,26 @@ Three bounded evidence records are included:
    quality, Provider behavior, production behavior, or a v0.3-versus-Summary
    outcome.
 
-## Pre-v0.3 historical R2 baseline
+## Version-separated evidence map
 
 <p align="center">
-  <img src="assets/evidence-r2-outcomes-rmb.svg" width="860"
-       alt="Figure R2: two-panel dot plot of fixed-denominator frozen R2 aggregate outcomes, n=36; research-only and not a v0.3 comparison">
+  <img src="assets/evidence-r2-v03-evidence.svg" width="960"
+       alt="Figure EV-01: separate panels for pre-v0.3 historical R2 outcomes and v0.3 Gate A structural wiring verification; no shared outcome axis or performance comparison">
 </p>
 
 <p align="center"><em>
-Frozen R2 synthetic evaluation (12 scenarios × 3 trials, n=36). Values are
-committed aggregates shown as count/36 (%); no uncertainty interval or
-hypothesis test is available from the published aggregate. This historical
-record is not a v0.3 evaluation or release-to-release comparison.
+Figure EV-01 puts the pre-v0.3 frozen R2 aggregate and v0.3 Gate A in separate
+panels. Panel A reports historical R2 outcomes as count/36 (%). Panel B reports
+only structural/ledger verified units, without a shared outcome axis. The same
+denominator does not make the panels comparable; Gate B E2E versus refreshed
+Summary remains BLOCKED.
 </em></p>
+
+The left panel is deliberately labelled **pre-v0.3 historical R2**, rather than
+as a v0.2 release benchmark: the committed extract identifies a frozen research
+source and source hash, but does not bind the aggregate to a v0.2 release tag.
+
+## Pre-v0.3 historical R2 baseline
 
 The frozen research source is identified as results.json with SHA-256:
 
@@ -75,11 +82,17 @@ not use it as a main path or degraded runtime fallback.
 ranking. This aggregate cannot establish that Full capsule is better than
 Summary, or that the v0.3 update/reorganization mechanism was enabled.
 
-### Reproducible figure export
+### Reproducible figure exports
 
-The released SVG is generated from the committed aggregate, not maintained as
-hand-drawn artwork. After an approved experiment updates the CSV, rebuild the
-figure with:
+The version-separated SVG is generated from both committed extracts, not
+maintained as hand-drawn artwork. Rebuild it with:
+
+```bash
+uv run python scripts/render_versioned_evidence_figure.py
+```
+
+The R2-only supporting SVG remains separately reproducible from the historical
+aggregate:
 
 ```bash
 uv run python scripts/render_r2_evidence_figure.py
@@ -133,11 +146,12 @@ uv run python experiments/v03_update_benchmark.py `
   --workspace D:\bun\tmp\codex\AstrContinuum-v03-experiment\workspace
 ```
 
-Gate A intentionally has no performance figure: its fixed deterministic
-all-pass outcome is a release-contract verification, not a scientific outcome
-curve. A future E2E figure is admitted only after the paired Gate B dataset
-includes the same model, scorer, staged histories, update-depth axis, and
-paired accuracy/staleness/context-cost/latency outcomes for both arms.
+Gate A appears in Figure EV-01 only as a separately boxed structural
+verification panel: its fixed deterministic all-pass result is a
+release-contract verification, not a scientific outcome curve. A future E2E
+figure is admitted only after the paired Gate B dataset includes the same
+model, scorer, staged histories, update-depth axis, and paired
+accuracy/staleness/context-cost/latency outcomes for both arms.
 
 **Interpretation guard.** Gate A establishes only an opt-in, injected, fenced
 worker wiring path. The ordinary Provider-bound runtime and current AstrBot

@@ -16,6 +16,11 @@ Provider 的结构验证记录。三类数据都只作为有边界的实验文�
 证据、Provider 基准或 v0.3 发布门槛。已提交摘录可让读者复算本仓库中的图和聚合，
 但不能重建未公开的原始研究输入，也不意味着存在 E2E 结果。
 
+`docs/assets/evidence-r2-v03-evidence.svg` 由
+`scripts/render_versioned_evidence_figure.py` 使用
+`frozen-r2-outcomes.csv` 和 `v03-update-gate-a/aggregate.csv` 生成。它把历史 R2
+结果面板和 v0.3 Gate A 结构验证面板严格分开：没有共享结果轴、性能比较或 E2E 声明。
+
 Gate A 的逐单元回执与聚合一同提交：`v03-update-gate-a/receipt.csv`（SHA-256
 D4382A3778CCEC510EE510716482D67C4BBEFAC1D5630DF2A2488E1B0354EA1D）和
 `v03-update-gate-a/receipt.json`（SHA-256
