@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import sqlite3
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -10,6 +11,7 @@ from typing import Any
 import pytest
 
 import astrcontinuum as ac
+import astrcontinuum.storage.repository as repository_module
 from astrcontinuum.storage import CanonicalMetricObservation
 from astrcontinuum.tokenization import CANONICAL_O200K
 from tests.storage.security_testkit import secure_repository, storage_test_codec
@@ -300,6 +302,132 @@ def test_missing_session_has_an_empty_non_durable_view(tmp_path: Path) -> None:
     assert view.covered_event_end == 0
     assert view.high_water_mark == 0
     assert view.delta == ()
+
+
+def test_read_view_retries_a_transient_sqlite_lock(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = repository(tmp_path)
+    key = session_key()
+    first = capture(store, 1, key=key)
+    original_read = store._read_request_view
+    attempts = 0
+    delays: list[float] = []
+
+    class FakeTime:
+        @staticmethod
+        def sleep(seconds: float) -> None:
+            delays.append(seconds)
+
+    def locked_once(
+        connection: sqlite3.Connection,
+        requested_key: ac.SessionKey,
+    ) -> ac.RequestView:
+        nonlocal attempts
+        attempts += 1
+        if attempts == 1:
+            raise sqlite3.OperationalError("database is locked")
+        return original_read(connection, requested_key)
+
+    monkeypatch.setattr(repository_module, "time", FakeTime, raising=False)
+    monkeypatch.setattr(store, "_read_request_view", locked_once)
+
+    view = store.read_request_view(key)
+
+    assert attempts == 2
+    assert delays == [0.01]
+    assert view.delta == (first,)
+
+
+def test_read_view_does_not_retry_non_lock_operational_error(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = repository(tmp_path)
+    key = session_key()
+    attempts = 0
+
+    def broken_read(
+        _connection: sqlite3.Connection,
+        _requested_key: ac.SessionKey,
+    ) -> ac.RequestView:
+        nonlocal attempts
+        attempts += 1
+        raise sqlite3.OperationalError("disk I/O error")
+
+    monkeypatch.setattr(store, "_read_request_view", broken_read)
+
+    with pytest.raises(sqlite3.OperationalError, match="disk I/O error"):
+        store.read_request_view(key)
+
+    assert attempts == 1
+
+
+def test_read_view_does_not_retry_non_lock_error_code_despite_lock_text(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = repository(tmp_path)
+    key = session_key()
+    attempts = 0
+    delays: list[float] = []
+    error = sqlite3.OperationalError("database is locked")
+    error.sqlite_errorcode = sqlite3.SQLITE_IOERR
+
+    class FakeTime:
+        @staticmethod
+        def sleep(seconds: float) -> None:
+            delays.append(seconds)
+
+    def misleading_error(
+        _connection: sqlite3.Connection,
+        _requested_key: ac.SessionKey,
+    ) -> ac.RequestView:
+        nonlocal attempts
+        attempts += 1
+        raise error
+
+    monkeypatch.setattr(repository_module, "time", FakeTime)
+    monkeypatch.setattr(store, "_read_request_view", misleading_error)
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        store.read_request_view(key)
+
+    assert attempts == 1
+    assert delays == []
+
+
+def test_read_view_re_raises_after_bounded_sqlite_lock_retries(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    store = repository(tmp_path)
+    key = session_key()
+    attempts = 0
+    delays: list[float] = []
+
+    class FakeTime:
+        @staticmethod
+        def sleep(seconds: float) -> None:
+            delays.append(seconds)
+
+    def always_locked(
+        _connection: sqlite3.Connection,
+        _requested_key: ac.SessionKey,
+    ) -> ac.RequestView:
+        nonlocal attempts
+        attempts += 1
+        raise sqlite3.OperationalError("database is locked")
+
+    monkeypatch.setattr(repository_module, "time", FakeTime, raising=False)
+    monkeypatch.setattr(store, "_read_request_view", always_locked)
+
+    with pytest.raises(sqlite3.OperationalError, match="database is locked"):
+        store.read_request_view(key)
+
+    assert attempts == 3
+    assert delays == [0.01, 0.025]
 
 
 def test_read_transaction_fixes_high_water_before_concurrent_append(
