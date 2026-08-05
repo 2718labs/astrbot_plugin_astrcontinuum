@@ -373,7 +373,7 @@ def test_read_view_does_not_retry_non_lock_error_code_despite_lock_text(
     attempts = 0
     delays: list[float] = []
     error = sqlite3.OperationalError("database is locked")
-    error.sqlite_errorcode = sqlite3.SQLITE_IOERR
+    error.sqlite_errorcode = 10  # SQLITE_IOERR
 
     class FakeTime:
         @staticmethod

@@ -72,10 +72,11 @@ _ALLOWED_WORKER_TRANSITIONS = {
 }
 _MAX_METRIC_BACKFILL_BATCH = 1024
 _READ_REQUEST_VIEW_RETRY_DELAYS_SECONDS = (0.01, 0.025)
+# SQLite primary result codes; Python 3.10 does not export these constants.
 _TRANSIENT_SQLITE_LOCK_PRIMARY_CODES = frozenset(
     {
-        sqlite3.SQLITE_BUSY,
-        sqlite3.SQLITE_LOCKED,
+        5,  # SQLITE_BUSY
+        6,  # SQLITE_LOCKED
     }
 )
 
