@@ -214,7 +214,10 @@ def test_versioned_evidence_figure_exporter_reproduces_committed_svg(tmp_path: P
         r2_outcomes = list(csv.DictReader(source))
     for outcome in r2_outcomes:
         denominator = int(outcome["denominator"])
-        assert f"{outcome['structural_valid']}/{denominator} ({int(outcome['structural_valid']) / denominator * 100:.1f}%)" in figure
+        assert (
+            f"{outcome['structural_valid']}/{denominator} ({int(outcome['structural_valid']) / denominator * 100:.1f}%)"
+            in figure
+        )
 
     with (ROOT / "docs/evidence/v03-update-gate-a/aggregate.csv").open(
         encoding="utf-8", newline=""

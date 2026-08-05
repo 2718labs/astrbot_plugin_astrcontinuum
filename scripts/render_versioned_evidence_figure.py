@@ -96,9 +96,7 @@ def _read_gate_a(input_path: Path) -> GateAOutcome:
     denominator = _parse_nonnegative(row, "denominator")
     if denominator != FIXED_DENOMINATOR:
         raise EvidenceFigureError(f"Gate A fixed denominator must be {FIXED_DENOMINATOR}")
-    check_counts = tuple(
-        (label, _parse_nonnegative(row, field)) for label, field in GATE_A_CHECKS
-    )
+    check_counts = tuple((label, _parse_nonnegative(row, field)) for label, field in GATE_A_CHECKS)
     if any(count > denominator for _, count in check_counts):
         raise EvidenceFigureError("Gate A check count exceeds its denominator")
     non_summary_released_record_count = _parse_nonnegative(
@@ -171,7 +169,9 @@ def _render_svg(
         x = _point_x(count, denominator, start=382, end=760)
         r2_labels.append(f'      <text x="360" y="{y + 5}">{html.escape(label)}</text>')
         r2_markers.append(_marker(marker=marker, x=x, y=y, colour=colour))
-        r2_values.append(f'      <text x="778" y="{y + 5}">{_rate_label(count, denominator)}</text>')
+        r2_values.append(
+            f'      <text x="778" y="{y + 5}">{_rate_label(count, denominator)}</text>'
+        )
 
     gate_rows: list[str] = []
     for index, (label, count) in enumerate(gate_a.check_counts):
