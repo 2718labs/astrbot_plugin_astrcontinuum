@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 import sqlite3
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
@@ -70,6 +71,23 @@ _ALLOWED_WORKER_TRANSITIONS = {
     CompactionJobState.READY_TO_COMMIT: frozenset(),
 }
 _MAX_METRIC_BACKFILL_BATCH = 1024
+_READ_REQUEST_VIEW_RETRY_DELAYS_SECONDS = (0.01, 0.025)
+# SQLite primary result codes; Python 3.10 does not export these constants.
+_TRANSIENT_SQLITE_LOCK_PRIMARY_CODES = frozenset(
+    {
+        5,  # SQLITE_BUSY
+        6,  # SQLITE_LOCKED
+    }
+)
+
+
+def _is_transient_sqlite_lock(error: sqlite3.OperationalError) -> bool:
+    error_code = getattr(error, "sqlite_errorcode", None)
+    if isinstance(error_code, int):
+        return (error_code & 0xFF) in _TRANSIENT_SQLITE_LOCK_PRIMARY_CODES
+
+    message = str(error).lower()
+    return "locked" in message or "busy" in message
 
 
 class RepositoryError(RuntimeError):
@@ -350,18 +368,28 @@ class SQLiteRepository:
         )
 
     def read_request_view(self, session_key: SessionKey) -> RequestView:
-        """Run ``TX_READ_REQUEST_VIEW`` in one read transaction."""
+        """Run ``TX_READ_REQUEST_VIEW`` with bounded transient-lock retries."""
 
-        with self._factory.connection(read_only=True) as connection:
-            connection.execute("BEGIN")
+        for attempt in range(len(_READ_REQUEST_VIEW_RETRY_DELAYS_SECONDS) + 1):
             try:
-                view = self._read_request_view(connection, session_key)
-            except BaseException:
-                connection.rollback()
-                raise
-            else:
-                connection.commit()
-                return view
+                with self._factory.connection(read_only=True) as connection:
+                    connection.execute("BEGIN")
+                    try:
+                        view = self._read_request_view(connection, session_key)
+                    except BaseException:
+                        connection.rollback()
+                        raise
+                    else:
+                        connection.commit()
+                        return view
+            except sqlite3.OperationalError as error:
+                if not _is_transient_sqlite_lock(error) or attempt == len(
+                    _READ_REQUEST_VIEW_RETRY_DELAYS_SECONDS
+                ):
+                    raise
+                time.sleep(_READ_REQUEST_VIEW_RETRY_DELAYS_SECONDS[attempt])
+
+        raise AssertionError("unreachable read-request-view retry state")
 
     def read_snapshot_reorganization_records(
         self,

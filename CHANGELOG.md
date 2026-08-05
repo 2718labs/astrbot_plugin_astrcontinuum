@@ -12,6 +12,11 @@ Technical Preview of the durable publication boundary. This entry records reposi
 does not claim that CRM/reorganization is wired into normal background compaction, that a
 rollback UI exists, or that a performance or provider-compatibility certification was completed.
 
+> **Follow-up validation note.** `V03-WIRE-001` adds an opt-in injected/fenced
+> Gate A integration verification to the repository. It does not alter the ordinary
+> Provider-bound/AstrBot runtime or turn the experiment into a Provider,
+> semantic-quality, performance, or Summary-comparison result.
+
 ### Added
 
 - Immutable `snapshot_reorganization_records` ledger rows as a schema-v3, append-only
@@ -21,6 +26,9 @@ rollback UI exists, or that a performance or provider-compatibility certificatio
   semantic review is disabled.
 - A traceable public evidence boundary and separate release workflow, with English and
   Simplified Chinese companion pages.
+- An opt-in injected compiler-backend fence for the synthetic Gate A worker path, with a
+  deterministic 36-unit receipt/aggregate table. This is experimental validation infrastructure,
+  not an AstrBot composition change or a model-performance result.
 
 ### Changed
 
@@ -29,12 +37,13 @@ rollback UI exists, or that a performance or provider-compatibility certificatio
 - Public metadata declares AstrBot `>=4.24.2,<5.0.0`, the organization repository URL, and the
   AGPL-3.0-or-later license consistently with the release surface.
 - The README is reduced to the released boundary, operations entry points, documentation map,
-  and one explicitly isolated experiment graphic.
+  and links to explicitly bounded technical verification.
 
 ### Known limitations
 
-- The standard `CompactionWorker` does not call a reorganization engine and normally publishes
-  an empty ledger.
+- The ordinary Provider-bound runtime and current AstrBot composition leave
+  `reorganization_token_budget` unset and publish an empty ledger. Reorganization is available
+  only to an injected compiler backend with an explicit budget in the fenced Gate A path.
 - There is no public time-travel, rollback, compaction, key-management, or destructive database
   administration command.
 - Isolated experiment artifacts are provenance material, not production semantic, performance,
@@ -191,12 +200,18 @@ AstrBot plugin market, tagged as a stable release, or published as a GitHub Rele
 这是持久化发布边界的技术预览。本条目只记录仓库状态；不表示 CRM/重组已经接入常规后台
 压缩，不表示已经提供回滚界面，也不表示已经完成性能或 Provider 兼容性认证。
 
+> **后续验证说明。** `V03-WIRE-001` 在仓库中加入 opt-in、注入式、围栏化的 Gate A
+> 集成验证。它不改变常规 Provider 绑定／AstrBot 运行时，也不把该验证变成 Provider、
+> 语义质量、性能或 Summary 对比结果。
+
 #### 新增
 
 - `snapshot_reorganization_records` 不可变账本行：作为 schema-v3 的只追加发布附加契约。
   显式发布器可以提供规范化记录；普通 worker 发布空记录集。
 - 永久发布质量下限：即使关闭可选语义审计，非摘要 `released` 记录仍会被拒绝。
 - 可追溯的公开证据边界和独立发布工作流，并提供英文与简体中文对应页。
+- 合成 Gate A worker 路径的 opt-in 注入式 compiler-backend 围栏，配套确定性 36 单元
+  回执／聚合表。这是实验验证基础设施，不是 AstrBot 组合变更或模型性能结果。
 
 #### 变更
 
@@ -204,11 +219,12 @@ AstrBot plugin market, tagged as a stable release, or published as a GitHub Rele
   取代原有基线。
 - 公开元数据统一声明 AstrBot `>=4.24.2,<5.0.0`、组织仓库地址和 AGPL-3.0-or-later
   许可证。
-- README 收敛为发布边界、运维入口、文档导航及一张明确隔离的实验图。
+- README 收敛为发布边界、运维入口、文档导航及有明确边界的技术验证链接。
 
 #### 已知限制
 
-- 标准 `CompactionWorker` 不调用重组引擎，常规情况下发布空账本。
+- 常规 Provider 绑定运行时及当前 AstrBot 组合配置未设置 `reorganization_token_budget`，
+  因而发布空账本。重组只允许带显式预算的注入式 compiler backend 在围栏 Gate A 路径中使用。
 - 尚无公开的时间旅行、回滚、压缩、密钥管理或破坏性数据库管理命令。
 - 隔离实验产物用于来源追溯，不是生产语义、性能或兼容性证据。
 

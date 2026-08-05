@@ -6,9 +6,11 @@
 
 ## 图例
 
-- **实线墨绿：** 已由当前 v0.3.0 契约实现并约束的发布链。
-- **虚线暗红：** CRM 研究目标链。它有隔离确定性记录，但尚未接入标准
-  CompactionWorker，不能视为当前运行能力。
+- **实线墨绿：** 由当前 v0.3.0 契约实现并约束的常规 Provider 绑定／默认 AstrBot 发布链。
+- **暖灰说明框：** 窄范围、可选的注入式／围栏 Gate A 验证通道。它只有在显式预算下才可重组候选；
+  这是合成证据，不是 Provider 或生产能力。
+- **虚线暗红：** 更广的 CRM 研究目标链。Gate A 并未把其完整路径接入常规运行时，也不能证明
+  端到端质量。
 - **暖灰：** 账本、质量与失败边界。它们约束状态迁移，不能被可选语义审计设置绕过。
 
 图采用暗红 #A44742、墨绿 #1F6B5B、暖灰 #DDD6CC 与墨色 #263238 的学术配色；
@@ -27,8 +29,12 @@
    后才变为 active/read-visible。CAS 冲突会回滚候选行并返回 SUPERSEDED；账本
    完整性错误会传播并回滚事务，且不会移动 active pointer。
 
-标准 CompactionWorker 当前**不**调用 reorganize_capsules()。普通后台发布传入空的
-重组记录元组。图中的 ledger 是已实现的**显式发布接口**，不是自动重组已经接线的声明。
+常规 Provider 绑定／默认 AstrBot 路径不设置 `reorganization_token_budget`，并传入空的重组
+记录元组。图中的 ledger 对该常规路径仍是已实现的**显式发布接口**。
+
+可选的注入式／围栏 Gate A 路径可设置显式预算、调用 `reorganize_capsules()`、重建候选，
+并通过同一永久校验与 CAS 边界持久化规范账本记录。它的合成回执只说明接线，不是 Provider 接入、
+语义质量结果、对比 Summary 的结论或生产声明。
 
 ## CRM：虚线研究目标链
 
@@ -41,8 +47,8 @@ Optimizer → loss-aware gate → atomic swap → query projection。
 目标 swap 只让 query projection 读取新 Capsule，并释放已消费的 Delta / 旧材料。
 Summary 只能用于离线比较，不能作为运行时主路径或降级回退。
 
-这条虚线路径需要独立的 claim → compile → audit → publish/CAS worker 接线、永久验证
-和发布证据，才能成为生产能力。
+这条虚线路径仍需要其更广的方法契约、常规 Provider 运行时接入、获准的端到端评测和发布证据，
+才能成为生产能力。
 
 ## 相关页面
 

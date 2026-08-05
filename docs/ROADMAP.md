@@ -23,11 +23,12 @@ storage-safety contract. The retained runtime baseline includes:
 
 `v0.3.0` adds migration v3 and immutable ordered reorganization-ledger storage at the explicit
 repository-publication boundary. The permanent quality floor rejects every non-
-`narrative_summary` `released` ledger record. This is deliberately **storage-only**: the standard
-`CompactionWorker` does not call the reorganizer or supply records, so ordinary background
-compaction continues to publish an empty ledger. The milestone does not assert reorganization
-execution, semantic quality, Provider performance, full AstrBot compatibility, or public
-end-user release readiness.
+`narrative_summary` `released` ledger record. The ordinary Provider-bound/default AstrBot path
+remains **storage-safety-only**: it leaves `reorganization_token_budget` unset and publishes an
+empty ledger. A separate opt-in injected compiler backend exercises candidate reorganization and
+ledger persistence in fenced synthetic Gate A validation. That narrow path does not assert
+Provider integration, semantic quality, Provider performance, full AstrBot compatibility, or
+public end-user release readiness.
 
 The Technical Preview's evaluation plan, frozen evidence summary, and current/target workflow are
 documented in [Evaluation](./EVALUATION.md), [Evidence](./EVIDENCE.md), and
@@ -36,9 +37,10 @@ semantic-quality, Provider-performance, or public-release-readiness evidence.
 
 ## v0.3.x — wiring and operational evidence
 
-- Wire reorganization into the worker only with explicit source-item accounting, permanent-quality
-  validation, and focused regression evidence.
-- Exercise the wired worker, lease renewal, bounded cancellation, encrypted upgrade,
+- Extend reorganization from the fenced synthetic Gate A worker to an ordinary Provider-bound
+  runtime only with explicit source-item accounting, permanent-quality validation, focused
+  regression evidence, and approved integration review.
+- Exercise that ordinary runtime, lease renewal, bounded cancellation, encrypted upgrade,
   backup/restore, crash recovery, and long-running WAL behavior on real deployments.
 - Evaluate an optional semantic-audit Provider without blocking live hooks.
 - Provide bounded administration for retry, cancellation, and safe rollback.

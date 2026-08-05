@@ -2,9 +2,9 @@
 
 [English](./DATA_FLOW.md) | 简体中文
 
-本数据流契约把已验证的 **v0.2.1** 运行时与 **v0.3.0** storage-only 重组账本叠加说明。
-它严格区分“已持久化”与“已接线”：普通后台压缩使用 token 指标通道并发布空重组账本；只有
-显式 Repository 发布者才能在本 Technical Preview 中提供账本记录。
+本数据流契约把已验证的 **v0.2.1** 运行时与 **v0.3.0** 重组账本叠加说明。它严格区分
+“已持久化”与“已接线”：常规 Provider 绑定／默认 AstrBot 后台压缩使用 token 指标通道并发布空
+重组账本；可选的注入式 compiler backend 则可在显式预算下完成围栏合成 Gate A 重组后提供记录。
 
 ## 规范记录
 
@@ -77,9 +77,11 @@ Journal 的 wire 组合必须限制为：
 5. 编译器消费两类输入与规范计数，产出封闭 Snapshot 和封闭结构化 Capsule。机械结构、身份、
    source-event、覆盖、精确锚点、同会话 membership 和非空输出校验始终执行。Sylanne
    记忆不能作为 Capsule 来源。
-6. **v0.3.0** 增加一个可选的 Repository 发布参数，用于接收规范重组记录。标准
-   **CompactionWorker** 不调用 **reorganize_capsules()**，也不提供该参数，因此普通后台
-   工作发布空账本。这一存储路径不能被描述为安装后插件已经接线或评测过重组。
+6. **v0.3.0** 增加一个可选的 Repository 发布参数，用于接收规范重组记录。常规 Provider
+   绑定／默认 AstrBot 路径不设置 **reorganization_token_budget**，因此普通后台工作发布空账本。
+   可选的注入式 compiler backend 可设置该预算，在审计前调用 **reorganize_capsules()**，并在
+   围栏合成 Gate A 验证中提供规范记录。该路径不表示已安装插件完成 Provider 接入、语义质量评测
+   或生产就绪。
 7. 启用可选语义审计时，worker 进入 **COMPILING -> AUDITING**；否则直接进入
    **READY_TO_COMMIT**。**strict_audit=false** 只影响这一步可选审计。
 8. 处于 **READY_TO_COMMIT** 时，**candidate_snapshot_id** 指向 worker 局部、状态为

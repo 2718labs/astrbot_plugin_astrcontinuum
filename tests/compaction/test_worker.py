@@ -144,6 +144,15 @@ class RecordingCompiler:
         return ac.CompilerOutput(capsules=(capsule,), rendered_context="compiled context")
 
 
+class MergingCompiler(RecordingCompiler):
+    def _output(self, request: ac.CompilationRequest) -> ac.CompilerOutput:
+        output = super()._output(request)
+        return ac.CompilerOutput(
+            capsules=(*request.base_capsules, *output.capsules),
+            rendered_context=output.rendered_context,
+        )
+
+
 class BlockingCompiler(RecordingCompiler):
     def __init__(self) -> None:
         super().__init__()
@@ -482,6 +491,117 @@ async def test_disabled_audit_compiles_frozen_claim_and_commits(tmp_path: Path) 
     assert store.read_request_view(key).high_water_mark == 3
     assert store.read_request_view(key).snapshot == result.publication.winner
     assert tuple(event.sequence for event in store.read_request_view(key).delta) == (3,)
+    assert store.read_snapshot_reorganization_records(result.publication.winner.snapshot_id) == ()
+
+
+@pytest.mark.asyncio
+async def test_injected_worker_reorganizes_candidate_and_publishes_durable_ledger(
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    key = session_key()
+    capture(store, 1, key)
+    capture(store, 2, key)
+    raise_intent(store, key)
+
+    result = await CompactionWorker(
+        repository=store,
+        compiler_backend=RecordingCompiler(),
+        counter=RecordingCounter(),
+        config=CompactionWorkerConfig(
+            worker_id="worker-reorganization",
+            lease_duration=LEASE_DURATION,
+            token_ceiling=100,
+            segmenter_config=ac.SegmenterConfig(),
+            strict_audit=False,
+            max_attempts=2,
+            retry_delay=RETRY_DELAY,
+            reorganization_token_budget=100,
+        ),
+    ).run_once()
+
+    assert result is not None
+    assert result.publication is not None
+    assert result.publication.outcome is ac.PublishOutcome.COMMITTED
+    assert result.publication.winner.capsule_ids[0].startswith("reorg-")
+    records = store.read_snapshot_reorganization_records(result.publication.winner.snapshot_id)
+    assert records
+    assert {record.source_capsule_id for record in records} == {"compiled-2"}
+    assert all(
+        record.kind == "narrative_summary" or record.status is not ac.ReorganizationStatus.RELEASED
+        for record in records
+    )
+
+
+@pytest.mark.asyncio
+async def test_injected_worker_reorganizes_update_and_preserves_prior_claims(
+    tmp_path: Path,
+) -> None:
+    store = repository(tmp_path)
+    key = session_key()
+    capture(store, 1, key)
+    capture(store, 2, key)
+    raise_intent(store, key)
+    compiler = MergingCompiler()
+
+    def make_worker(now: datetime) -> CompactionWorker:
+        return CompactionWorker(
+            repository=store,
+            compiler_backend=compiler,
+            counter=RecordingCounter(),
+            clock=FixedClock(now),
+            config=CompactionWorkerConfig(
+                worker_id="worker-reorganization",
+                lease_duration=LEASE_DURATION,
+                token_ceiling=100,
+                segmenter_config=ac.SegmenterConfig(),
+                strict_audit=False,
+                max_attempts=2,
+                retry_delay=RETRY_DELAY,
+                reorganization_token_budget=100,
+            ),
+        )
+
+    first = await make_worker(NOW).run_once()
+
+    assert first is not None
+    assert first.publication is not None
+    prior_capsule_id = first.publication.winner.capsule_ids[0]
+    capture(store, 3, key)
+    capture(store, 4, key)
+    assert (
+        store.raise_compaction_intent(
+            job_id="job-2",
+            session_key=key,
+            target_high_water_mark=4,
+            now=NOW + timedelta(minutes=1),
+        )
+        is not None
+    )
+
+    second = await make_worker(NOW + timedelta(minutes=2)).run_once()
+
+    assert second is not None
+    assert second.publication is not None
+    assert second.publication.outcome is ac.PublishOutcome.COMMITTED
+    view = store.read_request_view(key)
+    assert view.snapshot == second.publication.winner
+    assert len(view.capsules) == 1
+    assert {claim.claim_id for claim in view.capsules[0].goals} == {"goal-2", "goal-4"}
+    records = store.read_snapshot_reorganization_records(second.publication.winner.snapshot_id)
+    assert {record.source_capsule_id for record in records} == {prior_capsule_id, "compiled-4"}
+
+
+def test_reorganization_budget_rejects_provider_bound_worker(tmp_path: Path) -> None:
+    with pytest.raises(TypeError, match="requires an injected compiler_backend"):
+        CompactionWorker(
+            repository=repository(tmp_path),
+            backend=RecordingCompiler(),
+            config=CompactionWorkerConfig(
+                token_ceiling=100,
+                reorganization_token_budget=100,
+            ),
+        )
 
 
 @pytest.mark.asyncio

@@ -3,8 +3,9 @@
 [English](./COMPACTION_PROTOCOL.md) | 简体中文
 
 本文描述 **v0.3.0** Technical Preview。它保留已启用的 **v0.2.1** 压缩通道，并在 Repository
-发布边界新增持久、可选的重组账本。本预览中的账本仅为 storage-only：标准
-**CompactionWorker** 不调用重组器，也不提供记录，因此普通后台压缩发布空账本。
+发布边界新增持久、可选的重组账本。常规 Provider 绑定／默认 AstrBot 路径不设置
+**reorganization_token_budget**，因此发布空账本。独立的注入式 compiler backend 可在围栏合成
+Gate A 验证通道中显式设置预算、重组候选并持久化记录；它不构成 Provider 或生产接入声明。
 
 ## 1. 安全目标
 
@@ -84,8 +85,9 @@ worker 读取一个已提交 base 与连续 Delta，然后：
 
 **v0.3.0** 的 Repository API 还可从显式发布者接收有序重组记录，并在发布前将其规范化。
 任何 kind 不为 **narrative_summary** 的 **released** 记录都会加入
-**QUALITY_COVERAGE_GAP**，即使 **strict_audit=false** 也会阻止发布。标准 worker 不走此
-路径，所以不得把普通后台工作表述为具备重组覆盖。
+**QUALITY_COVERAGE_GAP**，即使 **strict_audit=false** 也会阻止发布。常规 Provider 绑定／默认
+AstrBot 路径不设置重组预算，因此不走此路径；注入式 compiler backend 可在围栏合成 Gate A 中设置
+该预算。该窄通道不能让普通后台工作被表述为具备重组覆盖。
 
 ## 5. 原子发布
 
@@ -133,9 +135,10 @@ Snapshot；候选或回滚行不可见。
 Provider 选择、离线 tokenizer profile 与请求级 BYTE 回退、加密规范 token sidecar 与有界
 补齐、脱敏重试、原子发布以及不含正文的状态/检查遥测。
 
-Provider 驱动的语义审计适配器仍未绑定。**v0.3.0** 的重组账本已为显式 Repository 发布
-持久化实现，但尚未接入标准 **CompactionWorker**；后者因此继续发布空账本。本 Technical
-Preview 不构成公开 **v1.0** 兼容性、Provider 覆盖、性能或面向最终用户发布就绪声明。
+Provider 驱动的语义审计适配器仍未绑定。常规 Provider 绑定／默认 AstrBot 路径继续发布空账本。
+独立的注入式 compiler backend 可在围栏合成 Gate A 验证中以显式预算调用
+**reorganize_capsules()**，再穿过同一持久化发布边界。本 Technical Preview 不构成公开 **v1.0**
+兼容性、Provider 覆盖、语义质量、性能或面向最终用户发布就绪声明。
 
 参见[数据流](./DATA_FLOW.zh-CN.md)、[并发状态机](./CONCURRENCY_STATE_MACHINE.zh-CN.md)、
 [数据库 Schema](./DATABASE_SCHEMA.zh-CN.md)、[重组账本 ADR](./ADR-008-REORGANIZATION-LEDGER.zh-CN.md)

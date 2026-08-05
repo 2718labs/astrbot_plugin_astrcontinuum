@@ -6,11 +6,13 @@ English | [简体中文](WORKFLOW.zh-CN.md)
 
 ## Legend
 
-- **Solid ink green:** the publication chain implemented and bounded by current
-  v0.3.0 contracts.
-- **Dashed dark red:** the CRM research target. It has an isolated deterministic
-  record, but is not wired into the standard CompactionWorker and is not a
-  current runtime capability.
+- **Solid ink green:** the ordinary Provider-bound/default AstrBot publication
+  chain implemented and bounded by current v0.3.0 contracts.
+- **Warm-gray callout:** the narrow, opt-in injected/fenced Gate A validation
+  path. It may reorganize a candidate only with an explicit budget; it is
+  synthetic evidence, not a Provider or production capability.
+- **Dashed dark red:** the broader CRM research target. Gate A does not wire its
+  full path into the ordinary runtime or establish its end-to-end quality.
 - **Warm gray:** ledger, quality, and failure boundaries. They constrain state
   transitions and cannot be bypassed by optional semantic-audit settings.
 
@@ -34,11 +36,16 @@ imagery.
    ledger-integrity error propagates and rolls back the transaction without
    moving the active pointer.
 
-The standard CompactionWorker currently does **not** call
-reorganize_capsules(). Ordinary background publication passes an empty
-reorganization-record tuple. The ledger in the diagram is an implemented
-**explicit publication interface**, not a statement that automatic
-reorganization is already wired.
+The ordinary Provider-bound/default AstrBot path leaves
+`reorganization_token_budget` unset and passes an empty reorganization-record
+tuple. The ledger in the diagram remains an implemented **explicit publication
+interface** for that ordinary path.
+
+The opt-in injected/fenced Gate A path can set an explicit budget, call
+`reorganize_capsules()`, rebuild the candidate, and persist canonical ledger
+records through the same permanent validation and CAS boundary. Its synthetic
+receipt is wiring evidence only; it is not Provider integration, a semantic
+quality result, a comparison against Summary, or a production claim.
 
 ## CRM dashed research target
 
@@ -53,9 +60,9 @@ to read the new Capsule and releases consumed Delta / older material. Summary
 may be used for offline comparison only; it is not a runtime main path or
 degraded fallback.
 
-This dashed path needs its own claim → compile → audit → publish/CAS worker
-wiring, permanent validation, and release evidence before it can become a
-production capability.
+This dashed path still needs its broader method contract, ordinary Provider
+runtime integration, approved end-to-end evaluation, and release evidence
+before it can become a production capability.
 
 ## Related pages
 

@@ -53,9 +53,11 @@
 ## Evidence and release-claim boundary
 
 The preceding thresholds are future evaluation and release gates, not results claimed here. The
-current `CompactionWorker` does not call `reorganize_capsules()`; normal background publication
-supplies an empty reorganization-record tuple. No CRM, synthetic, or offline Summary record can
-replace end-to-end evidence for that production chain.
+ordinary Provider-bound/default AstrBot path leaves `reorganization_token_budget` unset and
+supplies an empty reorganization-record tuple. The opt-in injected/fenced Gate A path can call
+`reorganize_capsules()` with an explicit budget, but its synthetic receipts establish only wiring
+and durable-publication behavior. No CRM, synthetic, or offline Summary record can replace
+end-to-end evidence for the ordinary production chain or establish a comparison win.
 
 The reviewable frozen research summary is in [Evidence](EVIDENCE.md). It distinguishes synthetic
 R2 observations, deterministic CRM stress accounting, and the claims v0.3 may make. All numbers

@@ -3,10 +3,10 @@
 [English](./ASTRBOT_INTEGRATION.md) | 简体中文
 
 本文规定 `v0.3.0` Technical Preview 中 AstrContinuum 与 AstrBot 的真实边界。它保留
-`v0.2.1` 已验证的接线运行时；新增重组账本仅在显式 Repository 发布边界持久化，不改变
-AstrBot Hook 图，也不表示标准 worker 已接线重组器。它不是“计划使用的 API 清单”。凡是
-修改 Hook 职责、优先级、消息投影、请求身份或插件生命周期，都必须同步更新本文，并通过
-真实 `PluginManager` 兼容探针。
+`v0.2.1` 已验证的接线运行时；新增重组账本在显式 Repository 发布边界持久化。注入式 compiler
+backend 可在显式预算下执行围栏合成 Gate A 重组，但这不改变 AstrBot Hook 图，也不表示常规
+Provider 绑定 worker 已自动重组。它不是“计划使用的 API 清单”。凡是修改 Hook 职责、优先级、
+消息投影、请求身份或插件生命周期，都必须同步更新本文，并通过真实 `PluginManager` 兼容探针。
 
 ## 1. 组合入口
 
@@ -144,9 +144,10 @@ Provider 投影。tokenizer 构造或任一计数失败时，所有部分结果�
 阶段先取消和等待已启动的 worker，再清理服务。
 
 剩余接入限制包括可选的 Provider 语义审计适配器。逐字来源校验、机械校验、fencing、
-原子发布、离线 token profile 与规范指标 sidecar 已经启用。`v0.3.0` 的重组账本是显式
-Repository 发布时的 storage-only 记录：标准 `CompactionWorker` 不调用重组器、不传入记录，
-因此它不是 AstrBot 生命周期中已接线的重组能力。
+原子发布、离线 token profile 与规范指标 sidecar 已经启用。常规 Provider 绑定／默认 AstrBot
+路径不设置 `reorganization_token_budget`，也不传入记录。独立的注入式 compiler backend 可在
+围栏合成 Gate A 通道中调用 `reorganize_capsules()`；它仍在 AstrBot 生命周期之外，不构成
+Provider、语义质量或生产能力声明。
 
 ## 10. 修改核对
 

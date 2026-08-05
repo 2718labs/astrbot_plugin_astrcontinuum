@@ -12,6 +12,7 @@ from ..context_graph.candidate_verification import (
     verify_candidate,
 )
 from ..domain import CompactionJobEnvelope, CompactionJobState, SessionKey, SnapshotEnvelope
+from ..reorganization import ReorganizationRecord
 from ..runtime.types import TokenCounter
 from ..storage import (
     ArtifactKind,
@@ -25,7 +26,7 @@ from ..storage import (
     TokenMetric,
 )
 from .auditor import audit_semantic
-from .compiler import compile_candidate
+from .compiler import compile_candidate, reorganize_candidate
 from .rendering import render_capsule
 from .types import (
     AuditedCandidate,
@@ -61,6 +62,7 @@ class _FencedCompactionWorkerConfig:
     strict_audit: bool
     max_attempts: int
     retry_delay: timedelta
+    reorganization_token_budget: int | None
     heartbeat_interval: timedelta | None = None
 
     def __post_init__(self) -> None:
@@ -86,6 +88,13 @@ class _FencedCompactionWorkerConfig:
             raise ValueError("max_attempts must be positive")
         if not isinstance(self.retry_delay, timedelta) or self.retry_delay <= timedelta(0):
             raise ValueError("retry_delay must be positive")
+        budget = self.reorganization_token_budget
+        if budget is not None and (
+            isinstance(budget, bool) or not isinstance(budget, int) or budget < 0
+        ):
+            raise ValueError("reorganization_token_budget must be a non-negative integer or None")
+        if budget is not None and budget > self.token_ceiling:
+            raise ValueError("reorganization_token_budget must not exceed token_ceiling")
         interval = self.heartbeat_interval
         if interval is not None and (
             not isinstance(interval, timedelta)
@@ -250,6 +259,20 @@ class _FencedCompactionWorker:
                 ),
             )
 
+            reorganization_records: tuple[ReorganizationRecord, ...] = ()
+            reorganization_token_budget = self._config.reorganization_token_budget
+            if reorganization_token_budget is not None:
+                candidate, reorganization_records = reorganize_candidate(
+                    base_snapshot=request_view.snapshot,
+                    base_capsules=request_view.capsules,
+                    candidate=candidate,
+                    source_events=request_view.delta,
+                    target_high_water_mark=request_view.high_water_mark,
+                    token_ceiling=self._config.token_ceiling,
+                    token_budget=reorganization_token_budget,
+                    counter=self._counter,
+                )
+
             snapshot = candidate.snapshot
             memberships = candidate.memberships
             if self._config.strict_audit:
@@ -288,6 +311,7 @@ class _FencedCompactionWorker:
                 candidate_snapshot=snapshot,
                 memberships=memberships,
                 canonical_metrics=self._candidate_compatibility_metrics(snapshot, memberships),
+                reorganization_records=reorganization_records,
                 token_ceiling=self._config.token_ceiling,
                 now=self._now(),
             )
@@ -969,6 +993,7 @@ class CompactionWorkerConfig:
     retry_base_seconds: float = 5.0
     retry_max_seconds: float = 300.0
     metric_backfill_limit: int = 32
+    reorganization_token_budget: int | None = None
 
     def __post_init__(self) -> None:
         if (
@@ -987,6 +1012,13 @@ class CompactionWorkerConfig:
             or self.max_attempts < 1
         ):
             raise ValueError("max_attempts must be positive")
+        budget = self.reorganization_token_budget
+        if budget is not None and (
+            isinstance(budget, bool) or not isinstance(budget, int) or budget < 0
+        ):
+            raise ValueError("reorganization_token_budget must be a non-negative integer or None")
+        if budget is not None and budget > self.token_ceiling:
+            raise ValueError("reorganization_token_budget must not exceed token_ceiling")
         legacy_fields = (self.worker_id, self.lease_duration, self.retry_delay)
         if any(value is not None for value in legacy_fields) and any(
             value is None for value in legacy_fields
@@ -1006,6 +1038,7 @@ class CompactionWorkerConfig:
             strict_audit=self.strict_audit,
             max_attempts=self.max_attempts,
             retry_delay=self.retry_delay,
+            reorganization_token_budget=self.reorganization_token_budget,
             heartbeat_interval=self.heartbeat_interval,
         )
 
@@ -1063,6 +1096,8 @@ class CompactionWorker:
             )
             self._runtime: _RuntimeCompactionWorker | None = None
             return
+        if config.reorganization_token_budget is not None:
+            raise TypeError("reorganization_token_budget requires an injected compiler_backend")
         if backend is None:
             raise TypeError("provider-bound workers require backend")
         if canonical_profile_id is None or worker_id is None:

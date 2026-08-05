@@ -142,8 +142,9 @@ non-`narrative_summary` `released` record adds `QUALITY_COVERAGE_GAP` during per
 validation and prevents publication even when `strict_audit=false`. Ledger rows are
 written only after their `COMMITTED` Snapshot row exists, are ordered by `ordinal`, and
 are readable only through a committed Snapshot. Records are optional at the repository
-publication API: the standard `CompactionWorker` currently supplies none, so a committed
-Snapshot with an empty ledger is valid in v0.3.0.
+publication API: the ordinary Provider-bound/default AstrBot path supplies none, so a committed
+Snapshot with an empty ledger is valid. An opt-in injected/fenced Gate A path may supply
+canonical records after reorganization.
 
 ## `snapshots`
 

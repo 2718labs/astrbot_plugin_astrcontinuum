@@ -9,7 +9,7 @@
 
 **面向 AstrBot 的非阻塞、持久化长上下文运行时。** AstrContinuum 将权威会话事件写入 SQLite Journal，从已提交 Snapshot 加连续 Delta 构造请求上下文，仅向 Provider 请求临时投影自身上下文，并在 AstrBot 持久化完成回合前按对象身份恢复原生对象。
 
-> **v0.3.0 技术预览。** 本版本在持久化发布边界中加入不可变的重组账本。标准 `CompactionWorker` 目前不会调用重组引擎，因此常规运行发布的是空账本。CRM/重组接线、面向用户的回滚和大范围性能认证仍属于后续工作。
+> **v0.3.0 技术预览。** 本版本在持久化发布边界中加入不可变的重组账本。常规 Provider 绑定运行时及当前 AstrBot 组合配置均未设置 `reorganization_token_budget`，因此发布空账本。注入式 compiler backend 可在围栏化的合成 Gate A 验证通道中执行重组；这不构成 AstrBot Provider 接入、语义质量结果、性能比较或生产就绪声明。
 
 ## 当前可用边界
 
@@ -19,17 +19,17 @@
 | 请求链 | Snapshot 加 Delta 的读取、确定性受限组装，以及可精确恢复的 Provider 专属临时投影。 |
 | 压缩 | 持久化意图和后台 worker 生命周期；发布前执行精确来源候选校验。 |
 | Token 与存储基线 | 离线 Token profile、上下文窗口回退、加密持久化值和有界指标回填。 |
-| v0.3 账本 | 仅当显式发布器提供记录时才写入的、仅存储型不可变审计账本。 |
+| v0.3 账本 | 常规 Provider 绑定发布携带空账本；围栏化验证通道可以在新 Snapshot 的同一原子发布中持久化规范记录。 |
 
 持久化核心与 AstrBot 组合根刻意分离。核心中“已实现”不等于它已经作为 AstrBot 命令或后台运行能力对外暴露。
 
-## 隔离实验数据
+## 独立技术验证
 
-下图是**隔离、确定性的 CRM 实验**，不是生产基准、语义质量结论，也不能证明 v0.3 已接线重组功能。它被保留在文档中，是为了让发布内容拥有可追溯的可视化参考，同时不掩盖其边界。
+**v0.3 Gate A 受限接线验证**是 12 个冻结场景 × 3 次试验的确定性集成检查，实际经过注入式、围栏化的 `CompactionWorker` 更新路径。它的 36/36 只验证刻意受控的发布／账本契约，不是模型准确率结果；因此以表格和脱敏回执发布，而不在本概览中伪装成性能实验图。
 
-<img src="./docs/assets/evidence-r2-outcomes-rmb.svg" width="720" alt="隔离确定性实验的结果率；不是 v0.3 生产能力声明。">
+能够发表的 v0.3 结果图需要对比重新生成的 Summary，并让两臂使用相同的模型、评分器和历史，再沿更新深度观测当前状态 QA 准确率、陈旧事实率、上下文成本和延迟。该端到端实验仍为 `BLOCKED`，等待获准的 Provider 回执与冻结评分器。
 
-实验来源、哈希、修订、排除项及配套流程见 [Evidence](./docs/EVIDENCE.md) / [证据说明](./docs/EVIDENCE.zh-CN.md) 与 [Workflow](./docs/WORKFLOW.md) / [工作流](./docs/WORKFLOW.zh-CN.md)。
+历史冻结 R2 聚合仍作为 **v0.3 前的基线**保留于 [Evidence](./docs/EVIDENCE.md) / [证据说明](./docs/EVIDENCE.zh-CN.md)，而不是 v0.3 比较。实验来源、哈希、排除项及配套流程见该页与 [Workflow](./docs/WORKFLOW.md) / [工作流](./docs/WORKFLOW.zh-CN.md)。
 
 ## 安装
 
@@ -61,6 +61,7 @@ git clone https://github.com/2718labs/astrbot_plugin_astrcontinuum
 | 压缩与 v0.3 发布边界 | [Compaction protocol](./docs/COMPACTION_PROTOCOL.md) | [压缩协议](./docs/COMPACTION_PROTOCOL.zh-CN.md) |
 | 数据流转 | [Data flow](./docs/DATA_FLOW.md) | [数据流](./docs/DATA_FLOW.zh-CN.md) |
 | 证据边界 | [Evidence](./docs/EVIDENCE.md) | [证据说明](./docs/EVIDENCE.zh-CN.md) |
+| v0.3 分阶段更新实验 | [Protocol and gates](./experiments/v03_update/README.md) | [验证协议与阶段门](./experiments/v03_update/README.md) |
 | 发布工作流 | [Workflow](./docs/WORKFLOW.md) | [工作流](./docs/WORKFLOW.zh-CN.md) |
 | 交付边界与下一道门 | [Roadmap](./docs/ROADMAP.md) | [路线图](./docs/ROADMAP.zh-CN.md) |
 | 持久化表与事务 | [Database schema](./docs/DATABASE_SCHEMA.md) | [数据库模式](./docs/DATABASE_SCHEMA.zh-CN.md) |

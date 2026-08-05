@@ -152,8 +152,8 @@ UNIQUE (`snapshot_id`, `capsule_id`)
 `released` 是审计处置，不是绕过质量下限的许可。非 `narrative_summary` 的 `released` 记录
 会在永久验证时添加 `QUALITY_COVERAGE_GAP`，即使 `strict_audit=false` 也阻止发布。账本行
 只在其 `COMMITTED` Snapshot 行存在后写入，按 `ordinal` 排序，且只能经由已提交 Snapshot
-读取。Repository 发布 API 的记录是可选项：标准 `CompactionWorker` 当前不提供任何记录，
-所以 v0.3.0 中账本为空的已提交 Snapshot 合法。
+读取。Repository 发布 API 的记录是可选项：常规 Provider 绑定／默认 AstrBot 路径不提供记录，
+所以账本为空的已提交 Snapshot 合法；可选的注入式／围栏 Gate A 路径可在重组后提供规范记录。
 
 ## `snapshots`
 

@@ -9,7 +9,7 @@ English | [简体中文](./README.zh-CN.md)
 
 **A durable, non-blocking long-context runtime for AstrBot.** AstrContinuum keeps authoritative conversation events in a SQLite journal, reads a committed Snapshot plus a contiguous Delta, and projects only its own temporary context into the provider request before restoring AstrBot's native objects by identity.
 
-> **v0.3.0 Technical Preview.** This release adds an immutable reorganization ledger to the durable publication boundary. The normal `CompactionWorker` does not call a reorganization engine and therefore publishes an empty ledger in ordinary operation. CRM/reorganization integration, user-facing rollback, and broad performance certification remain future work.
+> **v0.3.0 Technical Preview.** This release adds an immutable reorganization ledger to the durable publication boundary. The ordinary Provider-bound runtime and current AstrBot composition leave `reorganization_token_budget` unset, so their publications carry an empty ledger. An opt-in injected compiler backend can exercise reorganization behind a fenced synthetic Gate A validation path; that is not an AstrBot Provider integration, semantic-quality result, performance comparison, or production-readiness claim.
 
 ## What is available now
 
@@ -19,17 +19,30 @@ English | [简体中文](./README.zh-CN.md)
 | Request path | Snapshot-plus-Delta reads, deterministic bounded assembly, and temporary provider-only projection with exact restoration. |
 | Compaction | Durable intent and background worker lifecycle; exact-source candidate validation before publication. |
 | Token and storage baseline | Offline token profiles, context-window fallback, encrypted durable values, and bounded metric backfill. |
-| v0.3 ledger | An immutable, storage-only audit ledger written only when an explicit publisher supplies records. |
+| v0.3 ledger | Ordinary Provider-bound publication carries an empty ledger; the opt-in fenced validation path can atomically persist canonical records with a new Snapshot. |
 
 The durable core and the AstrBot composition root are deliberately separate. “Implemented in the core” is not automatically a promise that a capability is exposed as an AstrBot command or background runtime behavior.
 
-## Experimental evidence, kept separate
+## Technical verification, kept separate
 
-The chart below is an **isolated, deterministic CRM experiment**, not a production benchmark, semantic-quality result, or evidence that reorganization is wired into v0.3. It is included so that the released documentation has a traceable visual reference without hiding its boundary.
+The **v0.3 Gate A opt-in wiring verification** is a 12 frozen-scenario ×
+3-trial deterministic integration check through an injected/fenced
+`CompactionWorker` update path. Its 36/36 result verifies a deliberately
+controlled publication/ledger contract; it is not a model-accuracy result and
+is therefore published as a table and redacted receipts, not as a performance
+figure in this overview.
 
-<img src="./docs/assets/evidence-r2-outcomes-rmb.svg" width="720" alt="Outcome rates for an isolated deterministic experiment; this is not a v0.3 production claim.">
+A publishable v0.3 outcome figure requires a paired E2E comparison against a
+freshly refreshed Summary, with the same model/scorer/history and observable
+outcomes such as current-state QA accuracy, stale-fact rate, context cost, and
+latency across update depth. That experiment remains `BLOCKED` pending approved
+Provider receipts and a frozen scorer.
 
-Source provenance, hashes, revisions, exclusions, and the companion workflow are recorded in [Evidence](./docs/EVIDENCE.md) / [证据说明](./docs/EVIDENCE.zh-CN.md) and [Workflow](./docs/WORKFLOW.md) / [工作流](./docs/WORKFLOW.zh-CN.md).
+The historical frozen R2 aggregate remains documented as a **pre-v0.3 baseline**
+in [Evidence](./docs/EVIDENCE.md) / [证据说明](./docs/EVIDENCE.zh-CN.md); it is
+not a v0.3 comparison. Source provenance, hashes, exclusions, and the companion
+workflow are recorded there and in [Workflow](./docs/WORKFLOW.md) /
+[工作流](./docs/WORKFLOW.zh-CN.md).
 
 ## Installation
 
@@ -61,6 +74,7 @@ For configuration, privacy, recovery, and failure behavior, follow the [configur
 | Compaction and v0.3 publication boundary | [Compaction protocol](./docs/COMPACTION_PROTOCOL.md) | [压缩协议](./docs/COMPACTION_PROTOCOL.zh-CN.md) |
 | Data movement | [Data flow](./docs/DATA_FLOW.md) | [数据流](./docs/DATA_FLOW.zh-CN.md) |
 | Evidence boundary | [Evidence](./docs/EVIDENCE.md) | [证据说明](./docs/EVIDENCE.zh-CN.md) |
+| v0.3 staged-update experiment | [Protocol and gates](./experiments/v03_update/README.md) | [验证协议与阶段门](./experiments/v03_update/README.md) |
 | Release workflow | [Workflow](./docs/WORKFLOW.md) | [工作流](./docs/WORKFLOW.zh-CN.md) |
 | Delivery limits and next gates | [Roadmap](./docs/ROADMAP.md) | [路线图](./docs/ROADMAP.zh-CN.md) |
 | Durable tables and transactions | [Database schema](./docs/DATABASE_SCHEMA.md) | [数据库模式](./docs/DATABASE_SCHEMA.zh-CN.md) |

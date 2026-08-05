@@ -40,8 +40,9 @@ AstrBot 宿主上启用。不得提交密钥、密钥文件位置、Provider 凭
 | `compaction_provider_id` | `string` | 空 | 成功解析时使用显式压缩 Provider；留空则跟随当前对话 Provider。若既没有显式 Provider，也没有公开的当前 Provider 能力，Provider 绑定 worker 通道保持缺席，宿主请求 fail-open。 |
 | `thinking_compat_openai_provider_ids` | `list` | `[]` | 高级 allowlist：仅填写已确认兼容 OpenAI Chat Completions 的 Provider ID。当活动模型需要临时兼容副本时使用；绝不改写宿主持久历史。 |
 
-标准 `CompactionWorker` 不调用 CRM/重组引擎。设置 Provider 不会改变 v0.3.0 的边界，也不会把
-不可变账本变成自动重组流程。
+设置 Provider 不会启用重组：常规 Provider 绑定／默认 AstrBot 路径不设置
+`reorganization_token_budget`，并发布空账本。只有注入式 compiler backend 可为围栏合成 Gate A
+验证设置显式预算；这项内部测试配置不是公开 AstrBot Provider 设置，也不构成生产能力声明。
 
 ## 运维检查
 

@@ -43,9 +43,10 @@ key reference. See [Security](../SECURITY.md) for disclosure guidance.
 | `compaction_provider_id` | `string` | empty | An explicit compaction provider when it resolves. Empty follows the current conversation provider. If neither an explicit provider nor public current-provider capability is available, the provider-bound worker lane stays absent and the host request fails open. |
 | `thinking_compat_openai_provider_ids` | `list` | `[]` | Advanced allowlist for confirmed OpenAI Chat Completions-compatible Provider IDs when the active model requires a temporary compatibility copy. It never rewrites durable host history. |
 
-The standard `CompactionWorker` does not call a CRM/reorganization engine. Setting a provider does
-not change that v0.3.0 boundary or turn the immutable ledger into an automatic reorganization
-pipeline.
+Setting a Provider does not enable reorganization: the ordinary Provider-bound/default AstrBot
+path leaves `reorganization_token_budget` unset and publishes an empty ledger. Only an injected
+compiler backend may set an explicit budget for fenced synthetic Gate A validation; that internal
+test configuration is not a public AstrBot Provider setting or a production capability claim.
 
 ## Operator checks
 

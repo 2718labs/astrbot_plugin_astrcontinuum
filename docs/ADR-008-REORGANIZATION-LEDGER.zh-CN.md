@@ -12,8 +12,10 @@ Snapshot 无法持久化展示来源项被保留、近似或释放的情况。
 
 本决定必须保持既有发布边界，同时精确记录当前范围。既有候选冲突分类器会将 Capsule/Snapshot/
 membership 插入完整性冲突和 CAS 丢失映射为 `SUPERSEDED`。v0.3.0 必须确保账本插入完整性失败
-不进入该分类器。标准 `CompactionWorker` 尚不创建或传入重组记录，因此本 ADR 定义的是 repository
-与显式发布器契约，而不是宣称常规后台发布已有非空账本覆盖。
+不进入该分类器。常规 Provider 绑定 worker 与默认 AstrBot 组合配置均不设置
+`reorganization_token_budget`，因此不传入重组记录。注入式 compiler backend 可在围栏合成 Gate A
+验证通道中显式设置该预算并调用 `reorganize_capsules()`。本 ADR 因而将 repository/发布契约与
+普通后台行为分开；Gate A 不构成 Provider 或生产声明。
 
 ## 决定
 
@@ -60,6 +62,6 @@ Snapshot 条件。在一个发布 savepoint 中，物理写入顺序为：
 
 - 既有数据库必须通过经 checksum 核验的迁移计划到达 schema version 3。
 - Schema migration 版本与 Capsule `schema_version` 是数据契约，二者都不是包的 v0.3.0 发布版本。
-- v0.3.0 建立的是仅存储安全技术预览。标准 `CompactionWorker` 当前传入空记录 tuple；把
-  `reorganize_capsules()` 接入它不属于本里程碑。该版本不主张公开 v1.0 兼容性、Provider 覆盖、
-  性能基准或终端用户发布就绪。
+- v0.3.0 对常规 Provider 绑定／默认 AstrBot 路径仍保持仅存储安全：它传入空记录 tuple。独立的
+  注入式／围栏 Gate A 通道可在显式预算下调用 `reorganize_capsules()` 并持久化规范记录。该合成
+  验证通道不主张公开 v1.0 兼容性、Provider 覆盖、语义质量、性能基准或终端用户发布就绪。
